@@ -369,7 +369,6 @@ struct WorkspaceAddParams<'a> {
 }
 
 async fn workspace_add(p: WorkspaceAddParams<'_>) -> Result<()> {
-    // Run the transaction, tagging any failure with the workspace/host context.
     match workspace_add_inner(&p).await {
         Ok(()) => Ok(()),
         Err(e) => Err(anyhow!(
@@ -392,7 +391,8 @@ async fn workspace_add_inner(p: &WorkspaceAddParams<'_>) -> Result<()> {
 
     println!("Adding workspace '{}'", p.name);
 
-    // 1-2. Reject collisions up front (fast, before touching the remote).
+    // Reject collisions before touching the remote. This is the fast path; the
+    // authoritative re-check happens under the config lock at commit time.
     let preview = NewEntry {
         name: p.name.into(),
         host: p.host.into(),
@@ -402,20 +402,25 @@ async fn workspace_add_inner(p: &WorkspaceAddParams<'_>) -> Result<()> {
         config: None,
         state_base: None,
     };
-    let existing = std::fs::read_to_string(&fleet_path).unwrap_or_default();
-    fleet::check_addable(&existing, &preview).map_err(anyhow::Error::msg)?;
+    let existing = match std::fs::read_to_string(&fleet_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(anyhow!("fleet_write_failed: read {fleet_path:?}: {e}")),
+    };
+    fleet::check_addable(&existing, &preview)?;
 
-    // 3-5. Probe SSH, remote platform, and the workspace root.
-    let platform = deploy::probe_platform(p.host).map_err(anyhow::Error::msg)?;
+    let platform = deploy::probe_platform(p.host)?;
     println!("  {:<22} connected", "SSH");
     println!("  {:<22} {}", "Remote platform", platform.label());
-    deploy::validate_root(p.host, p.root).map_err(anyhow::Error::msg)?;
+    // Record the canonical root, so later additions naming the same directory
+    // through a symlink or a trailing slash are caught as duplicates.
+    let root = deploy::validate_root(p.host, p.root)?;
     println!("  {:<22} valid", "Workspace root");
 
-    // 6-10. Resolve the server binary: user-managed (never installed) or the
-    // managed path (installed/upgraded as needed).
+    // A user-managed binary is only checked; the managed one is installed or
+    // upgraded as needed.
     let (bin, protocol) = if let Some(custom) = p.remote_bin {
-        let v = deploy::check_custom_bin(p.host, custom).map_err(anyhow::Error::msg)?;
+        let v = deploy::check_custom_bin(p.host, custom)?;
         println!(
             "  {:<22} user-managed {} (not modified)",
             "Server", v.software_version
@@ -423,9 +428,7 @@ async fn workspace_add_inner(p: &WorkspaceAddParams<'_>) -> Result<()> {
         (custom.to_string(), v.protocol_version)
     } else {
         let managed = platform.managed_bin();
-        match deploy::deploy_managed(p.host, &platform.os, &platform.arch, &managed)
-            .map_err(anyhow::Error::msg)?
-        {
+        match deploy::deploy_managed(p.host, &platform.os, &platform.arch, &managed)? {
             ServerStep::Installed(o) => {
                 let msg = match &o.previous {
                     _ if !o.installed => format!("up to date {}", o.current.software_version),
@@ -439,40 +442,37 @@ async fn workspace_add_inner(p: &WorkspaceAddParams<'_>) -> Result<()> {
                 (managed, o.current.protocol_version)
             }
             ServerStep::AlreadyCurrent(v) => {
-                println!(
-                    "  {:<22} up to date {}",
-                    "Server", v.software_version
-                );
+                println!("  {:<22} up to date {}", "Server", v.software_version);
                 (managed, v.protocol_version)
             }
         }
     };
     println!("  {:<22} {}", "Protocol", protocol);
 
-    // 11. Real protocol round-trip against the target root before committing.
+    // Prove the workspace really works before it becomes authorized. The error
+    // already carries check_workspace's own stable code.
     let endpoint = agent_remote_client::Endpoint::Ssh {
         host: p.host.into(),
         remote_bin: bin.clone(),
-        root: p.root.into(),
+        root: root.clone(),
         state_base: p.state_base.map(str::to_string),
         config: p.config.map(str::to_string),
     };
     if let Err(e) = fleet::check_workspace(&endpoint).await {
-        return Err(anyhow!("server_probe_failed: {e}"));
+        return Err(anyhow!(e));
     }
     println!("  {:<22} passed", "Workspace probe");
 
-    // 12. Commit the fleet entry atomically.
     let entry = NewEntry {
         name: p.name.into(),
         host: p.host.into(),
-        root: p.root.into(),
+        root,
         bin: Some(bin),
         label: p.label.map(str::to_string),
         config: p.config.map(str::to_string),
         state_base: p.state_base.map(str::to_string),
     };
-    fleet::add_workspace_entry(&fleet_path, &entry).map_err(anyhow::Error::msg)?;
+    fleet::add_workspace_entry(&fleet_path, &entry)?;
     println!("  {:<22} updated", "Fleet configuration");
     println!("Workspace '{}' is ready.", p.name);
     Ok(())

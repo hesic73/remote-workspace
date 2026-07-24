@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use agent_remote_client::{Client, Endpoint};
 use agent_remote_protocol::ListKind;
+use anyhow::Context;
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
@@ -16,7 +17,7 @@ pub use agent_remote_client::fleet::{check_workspace, parse_fleet, Workspace};
 
 const SERVER_NAME: &str = "agent-remote-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const AGENT_GUIDANCE: &str = include_str!("../../../AGENT_GUIDANCE.md");
+const AGENT_GUIDANCE: &str = include_str!("../AGENT_GUIDANCE.md");
 
 // ---- Helpers ----
 
@@ -274,59 +275,52 @@ fn build_snapshot(old: &Snapshot, fleet: BTreeMap<String, Workspace>) -> Snapsho
 }
 
 impl RemoteWorkspaceServer {
-    pub fn new(fleet_path: std::path::PathBuf, fleet: BTreeMap<String, Workspace>) -> Self {
-        let snapshot = build_snapshot(&BTreeMap::new(), fleet);
-        let last_seen = stamp_of(&fleet_path);
-        Self {
+    /// Reads and validates the fleet file itself, so the change stamp is taken
+    /// *before* the read it describes. Stamping after would miss a write landing
+    /// in between and serve a stale snapshot that looks current.
+    pub fn load(fleet_path: std::path::PathBuf) -> anyhow::Result<Self> {
+        let stamp = stamp_of(&fleet_path);
+        let text = std::fs::read_to_string(&fleet_path)
+            .with_context(|| format!("read fleet config {fleet_path:?}"))?;
+        let fleet =
+            parse_fleet(&text).with_context(|| format!("invalid fleet config {fleet_path:?}"))?;
+        Ok(Self {
             fleet_path,
-            snapshot: std::sync::RwLock::new(Arc::new(snapshot)),
-            last_seen: std::sync::Mutex::new(last_seen),
-        }
+            snapshot: std::sync::RwLock::new(Arc::new(build_snapshot(&BTreeMap::new(), fleet))),
+            last_seen: std::sync::Mutex::new(stamp),
+        })
     }
 
     fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot.read().unwrap().clone()
     }
 
-    /// Reload the fleet if the file changed since last checked. A no-op when the
-    /// stamp is unchanged. On an invalid new file the last known-good snapshot
-    /// is retained and `fleet_reload_failed` is returned to the triggering
-    /// operation; the (bad) stamp is still recorded, so subsequent operations
-    /// serve the last-good fleet instead of failing repeatedly until the file
-    /// changes again.
+    /// Reload the fleet if the file changed since last checked; a no-op when the
+    /// stamp is unchanged. A file that is absent, unreadable, or invalid is
+    /// never partially applied: the last known-good snapshot keeps serving and
+    /// the triggering operation gets `fleet_reload_failed`. The bad state is not
+    /// recorded as seen, so the failure keeps being reported (rather than
+    /// silently serving a stale fleet) until the file is valid again.
     fn refresh_fleet_if_changed(&self) -> Result<(), String> {
         let mut last = self.last_seen.lock().unwrap();
         let now = stamp_of(&self.fleet_path);
         if now == *last {
             return Ok(());
         }
-        if now.is_none() {
-            *last = None;
-            return Err("fleet_reload_failed: fleet config is absent or unreadable".into());
-        }
-        let text = match std::fs::read_to_string(&self.fleet_path) {
-            Ok(t) => t,
-            Err(e) => {
-                *last = now;
-                return Err(format!("fleet_reload_failed: read fleet config: {e}"));
-            }
-        };
-        match parse_fleet(&text) {
-            Ok(fleet) => {
-                let old = self.snapshot();
-                let next = build_snapshot(&old, fleet);
-                *self.snapshot.write().unwrap() = Arc::new(next);
-                *last = now;
-                Ok(())
-            }
-            Err(e) => {
-                *last = now;
-                Err(format!("fleet_reload_failed: {e}"))
-            }
-        }
+        let text = std::fs::read_to_string(&self.fleet_path)
+            .map_err(|e| format!("fleet_reload_failed: read fleet config: {e}"))?;
+        let fleet = parse_fleet(&text).map_err(|e| format!("fleet_reload_failed: {e}"))?;
+        let old = self.snapshot();
+        *self.snapshot.write().unwrap() = Arc::new(build_snapshot(&old, fleet));
+        *last = now;
+        Ok(())
     }
 
-    fn handle(&self, snapshot: &Arc<Snapshot>, workspace: &str) -> Result<Arc<WorkspaceHandle>, String> {
+    fn handle(
+        &self,
+        snapshot: &Arc<Snapshot>,
+        workspace: &str,
+    ) -> Result<Arc<WorkspaceHandle>, String> {
         snapshot.get(workspace).map(|e| e.handle.clone()).ok_or_else(|| {
             let names = snapshot
                 .keys()

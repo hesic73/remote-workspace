@@ -153,11 +153,13 @@ fn mcp_initialize_and_server_info() {
     assert_eq!(resp["result"]["serverInfo"]["name"], "agent-remote-mcp");
     assert_eq!(
         resp["result"]["instructions"],
-        include_str!("../../../AGENT_GUIDANCE.md")
+        include_str!("../AGENT_GUIDANCE.md")
     );
+    // Agent-facing conventions have one canonical source; the docs must point
+    // at it instead of restating (and drifting from) it.
     for doc in [
         include_str!("../../../README.md"),
-        include_str!("../../../DESIGN.md"),
+        include_str!("../../../docs/design.md"),
     ] {
         assert!(doc.contains("AGENT_GUIDANCE.md"));
     }
@@ -627,36 +629,52 @@ fn mcp_reloads_fleet_on_change() {
     assert!(dir_b.path().join("in-b.txt").exists());
 }
 
-// An invalid fleet edit is rejected: the triggering call reports
-// fleet_reload_failed, and the last known-good fleet keeps serving.
+// An invalid fleet edit is never partially applied. Every operation reports
+// fleet_reload_failed while the file is broken -- reporting it only once and
+// then quietly serving a stale fleet would hide a real misconfiguration -- and
+// fixing the file recovers without restarting the process.
 #[test]
-fn mcp_invalid_fleet_reload_keeps_last_good() {
+fn mcp_invalid_fleet_reload_is_reported_until_fixed() {
     let dir_a = tempfile::tempdir().unwrap();
     let fleet = dir_a.path().join(".fleet.toml");
-    std::fs::write(&fleet, fleet_entry("a", dir_a.path().to_str().unwrap())).unwrap();
+    let good = fleet_entry("a", dir_a.path().to_str().unwrap());
+    std::fs::write(&fleet, &good).unwrap();
     let mut s = McpSession::spawn_fleet(&fleet);
     s.initialize();
 
     let (e, _) = s.tool("list_workspaces", serde_json::json!({}));
     assert!(!e);
 
-    // Replace with an invalid fleet (empty declares no workspaces).
+    // Replace with an invalid fleet (declares no workspaces).
     std::fs::write(&fleet, "# broken\n").unwrap();
 
-    let (e, text) = s.tool("list_workspaces", serde_json::json!({}));
-    assert!(e, "invalid reload must be an error");
-    assert!(
-        text.contains("fleet_reload_failed"),
-        "must carry the stable code: {text}"
-    );
-
-    // Last-good fleet still serves: workspace "a" remains usable.
+    // Every operation keeps reporting it, not just the first one.
+    for attempt in 1..=2 {
+        let (e, text) = s.tool("list_workspaces", serde_json::json!({}));
+        assert!(e, "invalid reload must be an error (attempt {attempt})");
+        assert!(
+            text.contains("fleet_reload_failed"),
+            "must carry the stable code: {text}"
+        );
+    }
     let (e, text) = s.tool(
         "create_file",
-        serde_json::json!({"workspace": "a", "path": "still-works.txt", "content": "x"}),
+        serde_json::json!({"workspace": "a", "path": "nope.txt", "content": "x"}),
     );
-    assert!(!e, "last-good fleet must keep serving: {text}");
-    assert!(dir_a.path().join("still-works.txt").exists());
+    assert!(e, "tool calls must not run against a broken fleet: {text}");
+    assert!(!dir_a.path().join("nope.txt").exists());
+
+    // Restoring a valid file recovers in place.
+    std::fs::write(&fleet, format!("{good}label = \"restored\"\n")).unwrap();
+    let (e, text) = s.tool("list_workspaces", serde_json::json!({}));
+    assert!(!e, "valid fleet must load again: {text}");
+    assert!(text.contains("restored"), "reloaded content: {text}");
+    let (e, text) = s.tool(
+        "create_file",
+        serde_json::json!({"workspace": "a", "path": "works-again.txt", "content": "x"}),
+    );
+    assert!(!e, "workspace usable after recovery: {text}");
+    assert!(dir_a.path().join("works-again.txt").exists());
 }
 
 // upload_file/download_file over real MCP stdio: success round-trip, default

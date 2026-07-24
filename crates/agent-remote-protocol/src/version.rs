@@ -24,7 +24,7 @@ pub struct InstallOutcome {
 }
 
 /// What a client should do with the server currently installed on a target,
-/// given the release it wants to deploy. See DESIGN / onboarding doc section 7.
+/// given the release it wants to deploy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Preflight {
     /// Installed server is compatible and not older: use it as-is.
@@ -84,7 +84,7 @@ pub fn should_replace(installed: Option<&VersionInfo>, desired: &VersionInfo) ->
 /// if either side is not three dot-separated integers -- callers treat an
 /// unorderable pair conservatively (never a downgrade) rather than guessing.
 /// The release scheme uses plain numeric versions with no pre-release tags.
-pub fn software_cmp(a: &str, b: &str) -> Option<Ordering> {
+fn software_cmp(a: &str, b: &str) -> Option<Ordering> {
     Some(parse_triple(a)?.cmp(&parse_triple(b)?))
 }
 
@@ -124,15 +124,30 @@ mod tests {
         let desired = v("0.3.0", 3);
         assert_eq!(preflight(None, &desired), Preflight::NeedInstall);
         // older protocol -> install
-        assert_eq!(preflight(Some(&v("0.9.0", 2)), &desired), Preflight::NeedInstall);
+        assert_eq!(
+            preflight(Some(&v("0.9.0", 2)), &desired),
+            Preflight::NeedInstall
+        );
         // newer protocol -> client too old
-        assert_eq!(preflight(Some(&v("0.3.0", 4)), &desired), Preflight::ClientTooOld);
+        assert_eq!(
+            preflight(Some(&v("0.3.0", 4)), &desired),
+            Preflight::ClientTooOld
+        );
         // equal protocol, older software -> install
-        assert_eq!(preflight(Some(&v("0.2.9", 3)), &desired), Preflight::NeedInstall);
+        assert_eq!(
+            preflight(Some(&v("0.2.9", 3)), &desired),
+            Preflight::NeedInstall
+        );
         // equal protocol, equal software -> connect
-        assert_eq!(preflight(Some(&v("0.3.0", 3)), &desired), Preflight::Connect);
+        assert_eq!(
+            preflight(Some(&v("0.3.0", 3)), &desired),
+            Preflight::Connect
+        );
         // equal protocol, newer software -> connect (no downgrade)
-        assert_eq!(preflight(Some(&v("0.4.0", 3)), &desired), Preflight::Connect);
+        assert_eq!(
+            preflight(Some(&v("0.4.0", 3)), &desired),
+            Preflight::Connect
+        );
     }
 
     #[test]
@@ -144,7 +159,7 @@ mod tests {
         assert!(!should_replace(Some(&v("0.3.0", 3)), &desired)); // equal
         assert!(!should_replace(Some(&v("0.4.0", 3)), &desired)); // newer sw
         assert!(!should_replace(Some(&v("0.1.0", 4)), &desired)); // newer proto
-        // unorderable software at equal protocol: do not replace
+                                                                  // unorderable software at equal protocol: do not replace
         assert!(!should_replace(Some(&v("weird", 3)), &desired));
     }
 }

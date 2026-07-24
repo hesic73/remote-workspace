@@ -4,9 +4,6 @@ mod record;
 mod version;
 
 pub use error::{ErrorCode, ProtocolError};
-pub use version::{
-    preflight, should_replace, software_cmp, InstallOutcome, Preflight, VersionInfo,
-};
 pub use messages::{
     ExecOutput, ExecResult, ExecTermination, FileEntry, FileMode, GcResult, ListEntry, ListKind,
     ListResult, MutationResult, OperationDetails, OperationId, ReadResult, Request, RequestBody,
@@ -17,5 +14,6 @@ pub use record::{
     AbortedRecord, AnyOperationRecord, ExecDisposition, ExecOperationRecord, FsOperationRecord,
     OperationKind, PreparedRecord, TransferDirection, TransferOperationRecord,
 };
+pub use version::{preflight, should_replace, InstallOutcome, Preflight, VersionInfo};
 
 pub const PROTOCOL_VERSION: u32 = 1;

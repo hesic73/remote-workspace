@@ -124,17 +124,11 @@ impl Endpoint {
     }
 }
 
-/// Wrap a remote argv for ssh: every remote-side argument is shell-quoted into
-/// one command string, because ssh joins trailing arguments with spaces and
-/// hands the result to the remote shell. BatchMode fails fast instead of
+/// `ssh` plus this client's connection policy, up to and including the host:
+/// the single place those options are chosen. BatchMode fails fast instead of
 /// hanging on an auth prompt; ServerAlive keeps NAT'd / idle-pruning
 /// connections open across long sessions.
-fn ssh_argv(host: &str, remote: &[String]) -> Vec<String> {
-    let cmd = remote
-        .iter()
-        .map(|a| shell_quote(a))
-        .collect::<Vec<_>>()
-        .join(" ");
+pub(crate) fn ssh_prefix(host: &str) -> Vec<String> {
     vec![
         "ssh".into(),
         "-o".into(),
@@ -144,8 +138,21 @@ fn ssh_argv(host: &str, remote: &[String]) -> Vec<String> {
         "-o".into(),
         "ServerAliveCountMax=4".into(),
         host.into(),
-        cmd,
     ]
+}
+
+/// Wrap a remote argv for ssh: every remote-side argument is shell-quoted into
+/// one command string, because ssh joins trailing arguments with spaces and
+/// hands the result to the remote shell.
+fn ssh_argv(host: &str, remote: &[String]) -> Vec<String> {
+    let cmd = remote
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut argv = ssh_prefix(host);
+    argv.push(cmd);
+    argv
 }
 
 #[derive(serde::Deserialize)]

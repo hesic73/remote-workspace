@@ -100,8 +100,8 @@ pub async fn check_workspace(endpoint: &Endpoint) -> Result<(), String> {
 
 /// Default fleet file: `~/.agent-remote/workspaces.toml`.
 pub fn default_fleet_path() -> anyhow::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| anyhow::anyhow!("HOME is not set; pass --fleet"))?;
+    let home =
+        std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set; pass --fleet"))?;
     Ok(PathBuf::from(home).join(".agent-remote/workspaces.toml"))
 }
 
@@ -187,9 +187,9 @@ pub fn add_workspace_entry(fleet_path: &Path, entry: &NewEntry) -> Result<(), De
     let workspaces = doc
         .entry("workspaces")
         .or_insert_with(|| Item::Table(Table::new()));
-    let workspaces = workspaces.as_table_mut().ok_or_else(|| {
-        DeployError::new("fleet_write_failed", "`workspaces` is not a table")
-    })?;
+    let workspaces = workspaces
+        .as_table_mut()
+        .ok_or_else(|| DeployError::new("fleet_write_failed", "`workspaces` is not a table"))?;
     // Render as [workspaces.<name>] rather than an inline [workspaces] blob.
     workspaces.set_implicit(true);
 
@@ -223,18 +223,14 @@ pub fn add_workspace_entry(fleet_path: &Path, entry: &NewEntry) -> Result<(), De
 }
 
 fn parse_document(text: &str) -> Result<toml_edit::DocumentMut, DeployError> {
-    text.parse::<toml_edit::DocumentMut>().map_err(|e| {
-        DeployError::new("fleet_write_failed", format!("parse fleet config: {e}"))
-    })
+    text.parse::<toml_edit::DocumentMut>()
+        .map_err(|e| DeployError::new("fleet_write_failed", format!("parse fleet config: {e}")))
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), DeployError> {
     use std::io::Write;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(
-        ".workspaces.toml.tmp-{}",
-        std::process::id()
-    ));
+    let tmp = dir.join(format!(".workspaces.toml.tmp-{}", std::process::id()));
     let write = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents.as_bytes())?;
@@ -297,8 +293,11 @@ mod tests {
     fn add_creates_and_preserves() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workspaces.toml");
-        std::fs::write(&path, "# my fleet\n[workspaces.a]\nhost = \"h1\"\nroot = \"/r1\"\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "# my fleet\n[workspaces.a]\nhost = \"h1\"\nroot = \"/r1\"\n",
+        )
+        .unwrap();
 
         add_workspace_entry(&path, &entry("b", "h2", "/r2")).unwrap();
 

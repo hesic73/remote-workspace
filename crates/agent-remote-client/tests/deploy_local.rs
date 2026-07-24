@@ -11,7 +11,12 @@ fn server_bin() -> PathBuf {
 /// Fake `ssh` that runs the "remote" command locally, exactly as ssh would
 /// (skip `-o` option pairs and the host; join the rest for a shell). Lets the
 /// real deploy code drive a loopback "remote" without ssh key setup.
+///
+/// It deliberately prints a banner to stdout first, the way a remote
+/// `~/.bashrc` or `~/.zshenv` that echoes does on a non-interactive ssh
+/// command. Every probe must locate its result despite that noise.
 const FAKE_SSH: &str = r#"#!/usr/bin/env bash
+echo "Welcome to the lab! Please read /etc/motd"
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in

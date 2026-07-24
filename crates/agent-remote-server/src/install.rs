@@ -55,8 +55,9 @@ pub fn run_install_to(managed: &Path, expect_sha256: Option<&str>) -> Result<()>
         let _ = std::fs::remove_file(&self_path);
     }
 
-    let current = probe_installed(managed)
-        .ok_or_else(|| anyhow!("managed server {managed:?} did not report a version after install"))?;
+    let current = probe_installed(managed).ok_or_else(|| {
+        anyhow!("managed server {managed:?} did not report a version after install")
+    })?;
     let outcome = InstallOutcome {
         installed,
         previous,
@@ -66,9 +67,12 @@ pub fn run_install_to(managed: &Path, expect_sha256: Option<&str>) -> Result<()>
     Ok(())
 }
 
-/// Run `<path> --version-json` and parse it. Returns `None` for a missing path
-/// or any binary that does not produce valid version JSON (a legacy server that
-/// predates `--version-json`), which callers treat as "needs install".
+/// Run `<path> --version-json` and parse it. `None` means "no version to
+/// compare against": a missing path, a legacy server predating `--version-json`,
+/// or a binary too broken to answer. All three are deliberately replaceable --
+/// unlike the client-side probe, this runs the binary directly, so its output
+/// is not exposed to remote shell banners and unparseable really does mean
+/// broken.
 fn probe_installed(path: &Path) -> Option<VersionInfo> {
     let out = std::process::Command::new(path)
         .arg("--version-json")

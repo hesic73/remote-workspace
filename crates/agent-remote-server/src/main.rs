@@ -31,8 +31,7 @@ struct Args {
 
     /// Internal self-install: this binary, uploaded to a temporary path, takes
     /// the install lock next to <PATH> and atomically replaces the server there
-    /// only if strictly older, printing the outcome as JSON. See the onboarding
-    /// design doc, sections 11-13.
+    /// only if strictly older, printing the outcome as JSON.
     #[arg(long, hide = true, value_name = "MANAGED_PATH")]
     install_to: Option<PathBuf>,
 
@@ -100,7 +99,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(managed) = args.install_to {
-        return agent_remote_server::install::run_install_to(&managed, args.expect_sha256.as_deref());
+        return agent_remote_server::install::run_install_to(
+            &managed,
+            args.expect_sha256.as_deref(),
+        );
     }
 
     if let Some(staging) = args.transfer_receive {

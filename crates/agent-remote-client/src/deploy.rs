@@ -8,13 +8,14 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::shell_quote;
+use crate::transfer::ssh_prefix;
 
 const DEFAULT_RELEASE_REPO: &str = "https://github.com/hesic73/agent-remote/releases/download";
 const RELEASE_BASE_ENV: &str = "AGENT_REMOTE_RELEASE_BASE";
 
-/// A failure during onboarding, tagged with a stable machine-readable code (see
-/// the onboarding design doc, section 18) so the CLI can report which layer
-/// failed with an actionable message.
+/// A failure during onboarding, tagged with a stable machine-readable code so
+/// the CLI can report which layer failed with an actionable message. The codes
+/// are listed in docs/design.md ("Deployment and onboarding").
 #[derive(Debug)]
 pub struct DeployError {
     pub code: &'static str,
@@ -64,7 +65,7 @@ impl Platform {
 /// Map a probed platform to the CI artifact target label (e.g.
 /// `linux-x86_64-musl`). Only the currently supported targets resolve; anything
 /// else is a hard error rather than an approximate match.
-pub fn artifact_target(os: &str, arch: &str) -> Result<String> {
+fn artifact_target(os: &str, arch: &str) -> Result<String> {
     match (os, arch) {
         ("linux", "x86_64") => Ok("linux-x86_64-musl".into()),
         _ => Err(DeployError::new(
@@ -99,53 +100,69 @@ struct ReleaseSource {
 
 impl ReleaseSource {
     fn resolve(client_version: &str) -> Self {
-        let base = std::env::var(RELEASE_BASE_ENV).unwrap_or_else(|_| {
-            format!("{DEFAULT_RELEASE_REPO}/v{client_version}")
-        });
+        let base = std::env::var(RELEASE_BASE_ENV)
+            .unwrap_or_else(|_| format!("{DEFAULT_RELEASE_REPO}/v{client_version}"));
         Self { base }
     }
 
-    fn fetch(&self, name: &str) -> Result<Vec<u8>> {
+    /// `code` is the caller's error code, so a failure names what could not be
+    /// fetched (the manifest or the artifact) rather than always blaming the
+    /// manifest.
+    fn fetch(&self, name: &str, code: &'static str) -> Result<Vec<u8>> {
         let base = &self.base;
         if base.starts_with("http://") || base.starts_with("https://") {
             let url = format!("{}/{name}", base.trim_end_matches('/'));
-            let resp = ureq::get(&url).call().map_err(|e| {
-                DeployError::new("release_manifest_unavailable", format!("GET {url}: {e}"))
-            })?;
+            let resp = ureq::get(&url)
+                .call()
+                .map_err(|e| DeployError::new(code, format!("GET {url}: {e}")))?;
             let mut buf = Vec::new();
             resp.into_reader()
                 .read_to_end(&mut buf)
-                .map_err(|e| DeployError::new("release_manifest_unavailable", format!("read {url}: {e}")))?;
+                .map_err(|e| DeployError::new(code, format!("read {url}: {e}")))?;
             Ok(buf)
         } else {
             let dir = base.strip_prefix("file://").unwrap_or(base);
             let path = PathBuf::from(dir).join(name);
-            std::fs::read(&path).map_err(|e| {
-                DeployError::new(
-                    "release_manifest_unavailable",
-                    format!("read {path:?}: {e}"),
-                )
-            })
+            std::fs::read(&path).map_err(|e| DeployError::new(code, format!("read {path:?}: {e}")))
         }
     }
 }
 
 /// A verified server artifact in the local cache, ready to upload.
-pub struct CachedArtifact {
+struct CachedArtifact {
     pub path: PathBuf,
     pub sha256: String,
     pub desired: VersionInfo,
 }
 
 /// Resolve, download (if not already cached), and verify the server artifact
-/// for `target`, returning its local path. Reuses a cached artifact whose
-/// checksum already matches the manifest.
-pub fn resolve_artifact(client_version: &str, os: &str, arch: &str, target: &str) -> Result<CachedArtifact> {
+/// for the remote platform. Reuses a cached artifact whose checksum already
+/// matches the manifest.
+fn resolve_artifact(client_version: &str, os: &str, arch: &str) -> Result<CachedArtifact> {
+    let target = artifact_target(os, arch)?;
     let source = ReleaseSource::resolve(client_version);
-    let manifest_bytes = source.fetch("release-manifest.json")?;
+    let manifest_bytes = source.fetch("release-manifest.json", "release_manifest_unavailable")?;
     let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
-        DeployError::new("release_manifest_unavailable", format!("parse manifest: {e}"))
+        DeployError::new(
+            "release_manifest_unavailable",
+            format!("parse manifest: {e}"),
+        )
     })?;
+
+    // The release is pinned to this client's version. A manifest declaring
+    // anything else means the source is not the matching release (a stale
+    // mirror, a misdirected AGENT_REMOTE_RELEASE_BASE): the version the client
+    // decides with would differ from the one it installs, which would re-upload
+    // on every run and never converge.
+    if manifest.software_version != client_version {
+        return Err(DeployError::new(
+            "release_manifest_unavailable",
+            format!(
+                "release source {} declares version {}, but this client is {client_version}",
+                source.base, manifest.software_version
+            ),
+        ));
+    }
 
     let artifact = manifest
         .artifacts
@@ -163,13 +180,15 @@ pub fn resolve_artifact(client_version: &str, os: &str, arch: &str, target: &str
         protocol_version: manifest.protocol_version,
     };
 
-    let cache_dir = cache_dir()?.join(target);
+    let cache_dir = cache_dir()?.join(&target);
     std::fs::create_dir_all(&cache_dir).map_err(|e| {
-        DeployError::new("artifact_not_found", format!("create cache dir {cache_dir:?}: {e}"))
+        DeployError::new(
+            "artifact_cache_failed",
+            format!("create cache dir {cache_dir:?}: {e}"),
+        )
     })?;
     let cached = cache_dir.join("agent-remote-server");
 
-    // Reuse a cached artifact whose checksum already matches the manifest.
     if let Ok(bytes) = std::fs::read(&cached) {
         if hex::encode(Sha256::digest(&bytes)).eq_ignore_ascii_case(&artifact.sha256) {
             return Ok(CachedArtifact {
@@ -180,7 +199,7 @@ pub fn resolve_artifact(client_version: &str, os: &str, arch: &str, target: &str
         }
     }
 
-    let bytes = source.fetch(&artifact.file)?;
+    let bytes = source.fetch(&artifact.file, "artifact_not_found")?;
     let got = hex::encode(Sha256::digest(&bytes));
     if !got.eq_ignore_ascii_case(&artifact.sha256) {
         return Err(DeployError::new(
@@ -197,7 +216,7 @@ pub fn resolve_artifact(client_version: &str, os: &str, arch: &str, target: &str
     let tmp = cache_dir.join(format!("agent-remote-server.download-{}", unique_suffix()));
     std::fs::write(&tmp, &bytes)
         .and_then(|_| std::fs::rename(&tmp, &cached))
-        .map_err(|e| DeployError::new("artifact_not_found", format!("cache artifact: {e}")))?;
+        .map_err(|e| DeployError::new("artifact_cache_failed", format!("cache artifact: {e}")))?;
 
     Ok(CachedArtifact {
         path: cached,
@@ -210,8 +229,12 @@ fn cache_dir() -> Result<PathBuf> {
     if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
         return Ok(PathBuf::from(x).join("agent-remote").join("server"));
     }
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| DeployError::new("artifact_not_found", "HOME is not set"))?;
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        DeployError::new(
+            "artifact_cache_failed",
+            "HOME is not set; set XDG_CACHE_HOME or HOME to locate the artifact cache",
+        )
+    })?;
     Ok(PathBuf::from(home)
         .join(".cache")
         .join("agent-remote")
@@ -219,19 +242,6 @@ fn cache_dir() -> Result<PathBuf> {
 }
 
 // ---- SSH helpers ----
-
-fn ssh_prefix(host: &str) -> Vec<String> {
-    vec![
-        "ssh".into(),
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ServerAliveInterval=30".into(),
-        "-o".into(),
-        "ServerAliveCountMax=4".into(),
-        host.into(),
-    ]
-}
 
 /// Run a `sh` script on the remote host (piped via stdin, so the script itself
 /// needs no shell-quoting), returning captured stdout on success.
@@ -304,22 +314,42 @@ fn normalize_os(uname_s: &str) -> String {
     }
 }
 
+/// Marker prefixing every value this module parses out of remote output. A
+/// remote shell startup file may print a banner to stdout, so results are
+/// located by marker rather than by line position.
+const MARKER: &str = "__agent_remote__";
+
+/// The payload of the last marked line, or an error naming what was expected.
+fn marked_value(out: &str, what: &str) -> Result<String> {
+    out.lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix(MARKER).map(|v| v.trim().to_string()))
+        .ok_or_else(|| {
+            DeployError::new(
+                "remote_probe_failed",
+                format!("remote host produced no {what}; output was: {out:?}"),
+            )
+        })
+}
+
 /// Validate the workspace root on the remote host: it must exist, be a
-/// directory, and be accessible. Returns its canonical path. Never creates it.
+/// directory, and be accessible. Returns its canonical path (used as the
+/// recorded root, so path aliases collapse). Never creates it.
 pub fn validate_root(host: &str, root: &str) -> Result<String> {
     let script = format!(
         "r={q}\n\
-         if [ ! -e \"$r\" ]; then echo NOROOT; \
-         elif [ ! -d \"$r\" ]; then echo NOTDIR; \
-         elif cd \"$r\" 2>/dev/null; then printf 'OK=%s\\n' \"$(pwd -P)\"; \
-         else echo NOACCESS; fi\n",
-        q = shell_quote(root)
+         if [ ! -e \"$r\" ]; then printf '{m}NOROOT\\n'; \
+         elif [ ! -d \"$r\" ]; then printf '{m}NOTDIR\\n'; \
+         elif cd \"$r\" 2>/dev/null; then printf '{m}OK=%s\\n' \"$(pwd -P)\"; \
+         else printf '{m}NOACCESS\\n'; fi\n",
+        q = shell_quote(root),
+        m = MARKER,
     );
     let out = ssh_script(host, &script)?;
-    let line = out.lines().next().unwrap_or("").trim();
-    if let Some(canon) = line.strip_prefix("OK=") {
+    let value = marked_value(&out, "workspace root status")?;
+    if let Some(canon) = value.strip_prefix("OK=") {
         Ok(canon.to_string())
-    } else if line == "NOROOT" {
+    } else if value == "NOROOT" {
         Err(DeployError::new(
             "workspace_root_not_found",
             format!("remote workspace root {root:?} does not exist"),
@@ -327,30 +357,40 @@ pub fn validate_root(host: &str, root: &str) -> Result<String> {
     } else {
         Err(DeployError::new(
             "workspace_root_invalid",
-            format!("remote workspace root {root:?} is not an accessible directory ({line})"),
+            format!("remote workspace root {root:?} is not an accessible directory ({value})"),
         ))
     }
 }
 
-/// Probe an installed server's version. `None` means no such binary or one that
-/// predates `--version-json` (a legacy server), which callers treat as
-/// "needs install".
-pub fn probe_installed(host: &str, bin: &str) -> Result<Option<VersionInfo>> {
+/// Probe an installed server's version. `None` means there is no such binary,
+/// or one predating `--version-json` (a legacy server); both mean "needs
+/// install". A binary that answers but cannot be parsed is an error, never a
+/// silent reinstall.
+fn probe_installed(host: &str, bin: &str) -> Result<Option<VersionInfo>> {
     let script = format!(
-        "b={q}\nif [ -x \"$b\" ]; then \"$b\" --version-json 2>/dev/null || true; fi\n",
-        q = shell_quote(bin)
+        "b={q}\n\
+         if [ ! -x \"$b\" ]; then printf '{m}absent\\n'; \
+         elif v=$(\"$b\" --version-json 2>/dev/null); then printf '{m}ok %s\\n' \"$v\"; \
+         else printf '{m}legacy\\n'; fi\n",
+        q = shell_quote(bin),
+        m = MARKER,
     );
     let out = ssh_script(host, &script)?;
-    let trimmed = out.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
+    let value = marked_value(&out, "server version probe")?;
+    match value.split_once(' ') {
+        Some(("ok", json)) => serde_json::from_str(json).map(Some).map_err(|e| {
+            DeployError::new(
+                "server_probe_failed",
+                format!("{bin} answered --version-json with unparseable output {json:?}: {e}"),
+            )
+        }),
+        _ => Ok(None),
     }
-    Ok(serde_json::from_str(trimmed).ok())
 }
 
 /// Upload the artifact to a unique temp path and run its self-install under the
 /// remote lock. Returns the outcome reported by the installed binary.
-pub fn upload_and_install(
+fn upload_and_install(
     host: &str,
     artifact: &CachedArtifact,
     managed_bin: &str,
@@ -369,8 +409,12 @@ pub fn upload_and_install(
     );
     let mut argv = ssh_prefix(host);
     argv.push(upload_cmd);
-    let bytes = std::fs::read(&artifact.path)
-        .map_err(|e| DeployError::new("remote_install_failed", format!("read cached artifact: {e}")))?;
+    let bytes = std::fs::read(&artifact.path).map_err(|e| {
+        DeployError::new(
+            "remote_install_failed",
+            format!("read cached artifact: {e}"),
+        )
+    })?;
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::piped())
@@ -390,7 +434,10 @@ pub fn upload_and_install(
     if !up.status.success() {
         return Err(DeployError::new(
             "remote_install_failed",
-            format!("upload failed: {}", String::from_utf8_lossy(&up.stderr).trim()),
+            format!(
+                "upload failed: {}",
+                String::from_utf8_lossy(&up.stderr).trim()
+            ),
         ));
     }
 
@@ -411,19 +458,24 @@ pub fn upload_and_install(
         }
     }
 
-    // Locked compare-and-swap, performed by the uploaded binary itself.
+    // Locked compare-and-swap, performed by the uploaded binary itself. Its
+    // JSON is echoed behind the marker so a shell banner cannot be mistaken
+    // for the outcome.
     let install_cmd = format!(
-        "{qtmp} --install-to {qmanaged} --expect-sha256 {qsha}\n",
+        "out=$({qtmp} --install-to {qmanaged} --expect-sha256 {qsha}) && printf '{m}%s\\n' \"$out\"\n",
         qtmp = shell_quote(&tmp),
         qmanaged = shell_quote(managed_bin),
         qsha = shell_quote(&artifact.sha256),
+        m = MARKER,
     );
     let out = ssh_script(host, &install_cmd)
         .map_err(|e| DeployError::new("remote_install_failed", e.message))?;
-    let outcome: InstallOutcome = serde_json::from_str(out.trim()).map_err(|e| {
+    let json = marked_value(&out, "install outcome")
+        .map_err(|e| DeployError::new("remote_install_failed", e.message))?;
+    let outcome: InstallOutcome = serde_json::from_str(&json).map_err(|e| {
         DeployError::new(
             "remote_install_failed",
-            format!("could not parse install outcome from {out:?}: {e}"),
+            format!("could not parse install outcome from {json:?}: {e}"),
         )
     })?;
     Ok(outcome)
@@ -440,12 +492,7 @@ pub enum ServerStep {
 /// Full managed-deploy step for a default (non-custom) server path: probe,
 /// preflight, and install/upgrade only when needed. `managed_bin` is the fixed
 /// path from `Platform::managed_bin`.
-pub fn deploy_managed(
-    host: &str,
-    os: &str,
-    arch: &str,
-    managed_bin: &str,
-) -> Result<ServerStep> {
+pub fn deploy_managed(host: &str, os: &str, arch: &str, managed_bin: &str) -> Result<ServerStep> {
     let client_version = env!("CARGO_PKG_VERSION");
     let installed = probe_installed(host, managed_bin)?;
     let desired = VersionInfo {
@@ -454,11 +501,15 @@ pub fn deploy_managed(
     };
 
     match preflight(installed.as_ref(), &desired) {
-        Preflight::Connect => Ok(ServerStep::AlreadyCurrent(installed.unwrap())),
-        Preflight::ClientTooOld => Err(client_too_old(installed.as_ref(), &desired)),
+        // Connect and ClientTooOld are only reachable with a probed server.
+        Preflight::Connect => Ok(ServerStep::AlreadyCurrent(
+            installed.expect("probed server"),
+        )),
+        Preflight::ClientTooOld => {
+            Err(client_too_old(&installed.expect("probed server"), &desired))
+        }
         Preflight::NeedInstall => {
-            let target = artifact_target(os, arch)?;
-            let artifact = resolve_artifact(client_version, os, arch, &target)?;
+            let artifact = resolve_artifact(client_version, os, arch)?;
             let outcome = upload_and_install(host, &artifact, managed_bin)?;
             Ok(ServerStep::Installed(outcome))
         }
@@ -481,7 +532,7 @@ pub fn check_custom_bin(host: &str, bin: &str) -> Result<VersionInfo> {
     })?;
     match preflight(Some(&installed), &desired) {
         Preflight::Connect => Ok(installed),
-        Preflight::ClientTooOld => Err(client_too_old(Some(&installed), &desired)),
+        Preflight::ClientTooOld => Err(client_too_old(&installed, &desired)),
         Preflight::NeedInstall => Err(DeployError::new(
             "server_probe_failed",
             format!(
@@ -496,16 +547,16 @@ pub fn check_custom_bin(host: &str, bin: &str) -> Result<VersionInfo> {
     }
 }
 
-fn client_too_old(installed: Option<&VersionInfo>, desired: &VersionInfo) -> DeployError {
-    let (sw, proto) = installed
-        .map(|v| (v.software_version.clone(), v.protocol_version))
-        .unwrap_or_else(|| ("?".into(), 0));
+fn client_too_old(installed: &VersionInfo, desired: &VersionInfo) -> DeployError {
     DeployError::new(
         "client_too_old",
         format!(
-            "the remote server is {sw} (protocol {proto}), newer than this client {} (protocol {}); \
+            "the remote server is {} (protocol {}), newer than this client {} (protocol {}); \
              update the local agent-remote client and retry (the remote server was not modified)",
-            desired.software_version, desired.protocol_version
+            installed.software_version,
+            installed.protocol_version,
+            desired.software_version,
+            desired.protocol_version
         ),
     )
 }
@@ -527,7 +578,10 @@ mod tests {
 
     #[test]
     fn artifact_target_supported_and_not() {
-        assert_eq!(artifact_target("linux", "x86_64").unwrap(), "linux-x86_64-musl");
+        assert_eq!(
+            artifact_target("linux", "x86_64").unwrap(),
+            "linux-x86_64-musl"
+        );
         let e = artifact_target("linux", "aarch64").unwrap_err();
         assert_eq!(e.code, "unsupported_remote_platform");
         let e = artifact_target("darwin", "arm64").unwrap_err();

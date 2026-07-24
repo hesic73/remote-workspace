@@ -1,12 +1,8 @@
-# agent-remote
+# Design
 
-A lightweight remote-workspace protocol for coding agents. Code and the
-execution environment stay on a remote server; the agent's machine runs only a
-client, which reaches the remote side over an existing SSH channel and invokes
-a small set of atomic operations.
-
-> One-line definition: a persistent SSH connection plus a small set of
-> reliable remote filesystem and command primitives for coding agents.
+Why agent-remote works the way it does, and what the protocol guarantees.
+For installation and usage see the [README](../README.md); this document is
+the rationale and the reference for behavior that callers depend on.
 
 ## Motivation
 
@@ -339,16 +335,20 @@ names and duplicate `(host, root)` pairs under it, validates the complete
 result, and installs it via temp file + fsync + rename. Failure at any earlier
 step leaves the fleet unchanged: a workspace becomes authorized only when that
 final write lands. Errors carry stable codes naming the failing layer --
-`ssh_connect_failed`, `unsupported_remote_platform`, `workspace_root_not_found`,
-`artifact_checksum_mismatch`, `remote_install_failed`, `client_too_old`,
-`fleet_write_failed`, and so on.
+`ssh_connect_failed`, `remote_probe_failed`, `unsupported_remote_platform`,
+`workspace_root_not_found`, `workspace_root_invalid`,
+`release_manifest_unavailable`, `artifact_not_found`,
+`artifact_checksum_mismatch`, `artifact_cache_failed`, `remote_install_failed`,
+`server_probe_failed`, `client_too_old`, `workspace_already_exists`,
+`duplicate_workspace_target`, `fleet_write_failed`.
 
 ## MCP integration
 
 Operational conventions for agents live only in
-[`AGENT_GUIDANCE.md`](AGENT_GUIDANCE.md); the MCP server embeds that file in
-`ServerInfo.instructions`. This section documents protocol behavior rather
-than duplicating those instructions.
+[`AGENT_GUIDANCE.md`](../crates/agent-remote-mcp/AGENT_GUIDANCE.md), which the
+MCP server embeds verbatim in `ServerInfo.instructions` -- it is a shipped
+asset of that crate, not prose about it. This section documents protocol
+behavior rather than duplicating those instructions.
 
 `agent-remote-mcp` wraps the client library in an MCP stdio server that
 multiplexes a fleet of named workspaces, declared in a single TOML file
@@ -389,10 +389,13 @@ no server-side coordination at all -- there is no cross-workspace operation
   unchanged keep their existing connection slot, so an edit elsewhere in the
   file never drops a live SSH session; new entries get slots, removed or
   materially changed ones lose theirs. An invalid file is never partially
-  applied: the last known-good snapshot keeps serving and the triggering call
-  returns `fleet_reload_failed`. Because `workspace add` writes only fully
-  validated configuration atomically, a new workspace simply appears on the
-  next call -- without restarting Claude Code, Codex, or the MCP process.
+  applied: the last known-good snapshot is retained and every operation returns
+  `fleet_reload_failed` until the file parses again. Reporting the breakage once
+  and then quietly serving a stale fleet would turn a real misconfiguration into
+  a silent one, so the failure is deliberately persistent rather than a
+  one-shot warning. Because `workspace add` writes only fully validated
+  configuration atomically, a new workspace simply appears on the next call --
+  without restarting Claude Code, Codex, or the MCP process.
 * Connections are rebuilt on demand: a dead link is replaced on the next
   tool call (retries with backoff, probed with a real round-trip), while a
   call that dies mid-flight surfaces as an error and is never auto-retried.
@@ -424,54 +427,9 @@ Tests live inside each crate: protocol round-trips, in-process server tests,
 end-to-end tests that spawn the real server binary over stdio, and MCP tests
 that drive the real `agent-remote-mcp` binary.
 
-## Status
+## Non-goals
 
-Post-MVP additions, all implemented and tested:
-
-* [x] Workspace onboarding and managed deployment: `agent-remote workspace
-  add` probes the target, installs or upgrades one managed server per SSH
-  identity from checksum-verified CI artifacts (locked, atomic, never a
-  downgrade), runs a real workspace probe, and commits the fleet entry
-  atomically; `--version-json` reports `software_version`/`protocol_version`
-* [x] Runtime fleet refresh: the MCP reloads a changed fleet file on demand,
-  preserving connections for unchanged workspaces and keeping the last-good
-  config when an edit is invalid; no administrative MCP tools
-* [x] Canonical editing surface: `create` (new files only) and `edit` (exact
-  text replacement with `NO_MATCH`/`AMBIGUOUS_MATCH`/`replace_all`) replace
-  `write`/`patch`; one tool per intent, old logs still load
-* [x] Bounded exec lifecycle: `setsid` failure aborts the spawn; after the
-  child exits a 2 s drain grace bounds pipe collection, leftover
-  pipe-holding descendants are killed, and `drain_timed_out` reports early
-  cutoff -- with process-tree regression tests
-* [x] Conservative stale-upload-staging cleanup (exact
-  `.agent-remote-upload.*.part` convention, 24 h threshold, prepare-time and
-  `gc` sweeps)
-* [x] Raw streaming file transfer (`upload_file`/`download_file`): dedicated
-  per-transfer data plane, atomic install, SHA-256 verified both ways,
-  metadata-only records
-* [x] Fleet MCP: one server process multiplexes named workspaces across
-  machines, required `workspace` argument, `list_workspaces`
-* [x] `--check` diagnostics and stable connection error codes
-  (`unknown_workspace` / `connect_failed` / `probe_failed`)
-* [x] Profiles choose their shell (`shell = ["zsh", "-lic"]`),
-  `default_profile`, strict config parsing; no profile means direct spawn
-
-The original MVP criteria, all implemented and tested:
-
-* [x] Persistent SSH stdio session from client to server
-* [x] `list`, `stat`, `read`, `delete`, `exec`, plus single-file mutations
-  (originally `write`/`patch`, since replaced by `create`/`edit`)
-* [x] All-or-nothing single-file mutations
-* [x] `read` returns hash; mutations check `base_hash`
-* [x] `exec` returns bounded stdout/stderr previews and termination details
-* [x] Operation IDs and fsync'd JSONL log with crash recovery
-* [x] Client interaction log
-* [x] `history` and `operation.get`
-* [x] Safe single-file undo, including undo of creation
-* [x] Request status queryable and replayable by `request_id` after reconnect
-* [x] State outside the workspace, single-writer locked, with bounded growth
-  and on-demand `gc`
-
-Non-goals: workspace sync/clone, resident daemons, undo of `exec`,
-multi-file transactions, multi-agent merging, job scheduling, interactive
-PTYs.
+Deliberately out of scope, so the primitives stay small and predictable:
+workspace sync or cloning, resident daemons, undo of `exec`, multi-file
+transactions, multi-agent merging, job scheduling, and interactive PTYs
+(REPLs, persistent shells).

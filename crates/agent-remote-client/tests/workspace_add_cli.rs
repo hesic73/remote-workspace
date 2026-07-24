@@ -7,7 +7,9 @@ fn server_bin() -> PathBuf {
     p
 }
 
+/// Fake ssh, with a banner on stdout like a remote rc file that echoes.
 const FAKE_SSH: &str = r#"#!/usr/bin/env bash
+echo "MOTD: reboot scheduled Sunday"
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -66,10 +68,17 @@ fn setup() -> Option<Env> {
         "protocol_version": v["protocol_version"],
         "artifacts": [{"os":"linux","arch":"x86_64","file":artifact,"sha256":sha}],
     });
-    std::fs::write(release.join("release-manifest.json"), serde_json::to_vec(&manifest).unwrap())
-        .unwrap();
+    std::fs::write(
+        release.join("release-manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
 
-    let path = format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        fakebin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let fleet = home.join("workspaces.toml");
     Some(Env {
         _tmp: tmp,
@@ -83,7 +92,16 @@ fn setup() -> Option<Env> {
 impl Env {
     fn add(&self, name: &str, root: &str) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_agent-remote"))
-            .args(["workspace", "add", name, "--host", "robot@ws", "--root", root, "--fleet"])
+            .args([
+                "workspace",
+                "add",
+                name,
+                "--host",
+                "robot@ws",
+                "--root",
+                root,
+                "--fleet",
+            ])
             .arg(&self.fleet)
             .env("HOME", &self.home)
             .env("PATH", &self.path)
@@ -108,7 +126,10 @@ fn add_installs_probes_and_records() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Server                 installed"), "{stdout}");
+    assert!(
+        stdout.contains("Server                 installed"),
+        "{stdout}"
+    );
     assert!(stdout.contains("Workspace probe        passed"), "{stdout}");
     assert!(stdout.contains("is ready"), "{stdout}");
 
@@ -131,6 +152,22 @@ fn add_installs_probes_and_records() {
     let dup_target = env.add("other", &proj);
     assert!(!dup_target.status.success());
     assert!(String::from_utf8_lossy(&dup_target.stderr).contains("duplicate_workspace_target"));
+
+    // The same directory named differently (trailing slash, `/.`) must also be
+    // caught: entries are recorded canonically, so path aliases cannot smuggle
+    // in a second workspace contending for one server state lock.
+    for alias in [format!("{proj}/"), format!("{proj}/."), format!("{proj}//")] {
+        let dup_alias = env.add("aliased", &alias);
+        assert!(
+            !dup_alias.status.success(),
+            "alias {alias} must not be addable"
+        );
+        assert!(
+            String::from_utf8_lossy(&dup_alias.stderr).contains("duplicate_workspace_target"),
+            "alias {alias} stderr: {}",
+            String::from_utf8_lossy(&dup_alias.stderr)
+        );
+    }
 
     // Missing root fails after the platform probe.
     let missing = env.home.join("nope").to_string_lossy().to_string();

@@ -88,12 +88,12 @@ async fn main() -> Result<()> {
             PathBuf::from(home).join(".agent-remote/workspaces.toml")
         }
     };
-    let text = std::fs::read_to_string(&fleet_path)
-        .with_context(|| format!("read fleet config {fleet_path:?}; create it or pass --fleet"))?;
-    let fleet = agent_remote_mcp::parse_fleet(&text)
-        .with_context(|| format!("invalid fleet config {fleet_path:?}"))?;
-
     if cli.check {
+        let text = std::fs::read_to_string(&fleet_path).with_context(|| {
+            format!("read fleet config {fleet_path:?}; create it or pass --fleet")
+        })?;
+        let fleet = agent_remote_mcp::parse_fleet(&text)
+            .with_context(|| format!("invalid fleet config {fleet_path:?}"))?;
         println!(
             "fleet config {} ok: {} workspace(s)",
             fleet_path.display(),
@@ -123,7 +123,8 @@ async fn main() -> Result<()> {
     // loop here makes the MCP host time the server out, e.g. when a session
     // being resumed briefly overlaps its predecessor on the same state lock).
     // The first tool call to each workspace connects on demand.
-    let server = RemoteWorkspaceServer::new(fleet_path, fleet);
+    let server = RemoteWorkspaceServer::load(fleet_path)
+        .context("fleet config unusable; create it or pass --fleet")?;
     let service = server
         .serve(RejectUnknownMethods(
             AsyncRwTransport::<RoleServer, _, _>::new(tokio::io::stdin(), tokio::io::stdout()),
