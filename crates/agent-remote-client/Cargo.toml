@@ -18,6 +18,9 @@ anyhow.workspace = true
 sha2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
+toml.workspace = true
+ureq = { version = "2", default-features = false, features = ["tls"] }
+toml_edit = "0.22"
 
 [dev-dependencies]
 agent-remote-server = { path = "../agent-remote-server" }

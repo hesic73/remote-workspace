@@ -11,6 +11,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, warn};
 
+pub mod deploy;
+pub mod fleet;
 mod log_writer;
 mod transfer;
 

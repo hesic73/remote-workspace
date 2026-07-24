@@ -10,103 +10,13 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+// Fleet configuration lives in the client crate (shared with the `workspace
+// add` CLI); re-exported here so existing callers keep working.
+pub use agent_remote_client::fleet::{check_workspace, parse_fleet, Workspace};
+
 const SERVER_NAME: &str = "agent-remote-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const AGENT_GUIDANCE: &str = include_str!("../../../AGENT_GUIDANCE.md");
-
-// ---- Fleet configuration ----
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FleetFile {
-    workspaces: BTreeMap<String, WorkspaceEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkspaceEntry {
-    /// SSH host (resolvable via ~/.ssh/config); omit to run the server on the
-    /// local machine.
-    host: Option<String>,
-    root: String,
-    /// Server binary path on that machine. Defaults to `agent-remote-server`
-    /// on PATH.
-    bin: Option<String>,
-    config: Option<String>,
-    state_base: Option<String>,
-    /// Human-readable description shown by list_workspaces, for telling apart
-    /// entries whose names alone are ambiguous.
-    label: Option<String>,
-}
-
-/// A configured workspace: where its server runs, plus display metadata.
-pub struct Workspace {
-    pub endpoint: Endpoint,
-    pub label: Option<String>,
-}
-
-/// Parse and validate a fleet config. Rejects an empty fleet and two
-/// workspaces addressing the same (host, root): they would contend for the
-/// same server-side state lock and one of them would always fail.
-pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Workspace>> {
-    let file: FleetFile = toml::from_str(text)?;
-    if file.workspaces.is_empty() {
-        anyhow::bail!("fleet config declares no workspaces");
-    }
-    let mut seen: BTreeMap<(Option<String>, String), String> = BTreeMap::new();
-    let mut out = BTreeMap::new();
-    for (name, entry) in file.workspaces {
-        if let Some(prev) = seen.insert((entry.host.clone(), entry.root.clone()), name.clone()) {
-            anyhow::bail!(
-                "workspaces '{prev}' and '{name}' address the same host and root; \
-                 they would contend for the same server state lock"
-            );
-        }
-        let bin = entry.bin.unwrap_or_else(|| "agent-remote-server".into());
-        let endpoint = match entry.host {
-            Some(host) => Endpoint::Ssh {
-                host,
-                remote_bin: bin,
-                root: entry.root,
-                state_base: entry.state_base,
-                config: entry.config,
-            },
-            None => Endpoint::Local {
-                server_bin: bin,
-                root: entry.root,
-                state_base: entry.state_base,
-                config: entry.config,
-            },
-        };
-        out.insert(
-            name,
-            Workspace {
-                endpoint,
-                label: entry.label,
-            },
-        );
-    }
-    Ok(out)
-}
-
-/// One-shot health probe of a workspace: spawn its server and do a real
-/// round-trip. Single attempt, no retries -- this is a diagnostic, not the
-/// resilient tool-call path. The error text starts with a stable code:
-/// `connect_failed` (transport/spawn) or `probe_failed` (server reached but
-/// the round-trip failed, e.g. bad root or a locked state directory -- see
-/// the server's stderr above for its own explanation).
-pub async fn check_workspace(endpoint: &Endpoint) -> Result<(), String> {
-    let transport = agent_remote_client::ArgvTransport {
-        argv: endpoint.control_argv(),
-    };
-    match Client::connect(transport, None).await {
-        Err(e) => Err(format!("connect_failed: {e}")),
-        Ok(c) => match c.stat(".").await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("probe_failed: {e}")),
-        },
-    }
-}
 
 // ---- Helpers ----
 
@@ -288,48 +198,137 @@ pub struct DownloadFileInput {
 
 // ---- MCP server ----
 
-/// One configured workspace: its endpoint plus an independent connection
-/// slot, so an unreachable machine's connect retries never block calls to the
-/// other workspaces.
+/// One configured workspace's connection state: its endpoint plus an
+/// independent connection slot, so an unreachable machine's connect retries
+/// never block calls to the other workspaces. Shared behind an `Arc` and reused
+/// across fleet reloads while its endpoint is unchanged, so an open SSH
+/// connection survives edits to unrelated workspaces.
 struct WorkspaceHandle {
     endpoint: Endpoint,
-    label: Option<String>,
     /// Current connection. A Client never recovers once its transport dies
     /// (e.g. sshd resetting the connection), so tool calls fetch it through
     /// `client()`, which reconnects on demand.
     slot: tokio::sync::Mutex<Option<Arc<Client>>>,
 }
 
+/// A workspace in the current fleet snapshot: its connection handle plus the
+/// display label (which, unlike the endpoint, can change without dropping the
+/// connection).
+struct Entry {
+    handle: Arc<WorkspaceHandle>,
+    label: Option<String>,
+}
+
+type Snapshot = BTreeMap<String, Entry>;
+
+/// File change stamp used to skip re-parsing an unchanged fleet file.
+#[derive(Clone, PartialEq, Eq)]
+struct FleetStamp {
+    modified: std::time::SystemTime,
+    len: u64,
+}
+
 pub struct RemoteWorkspaceServer {
-    /// Immutable after startup: the fleet is fixed for the process lifetime.
-    workspaces: BTreeMap<String, WorkspaceHandle>,
+    fleet_path: std::path::PathBuf,
+    /// Current fleet, swapped atomically when the fleet file changes on disk.
+    /// Reads clone the `Arc` and never block on I/O.
+    snapshot: std::sync::RwLock<Arc<Snapshot>>,
+    /// Serializes reload attempts and remembers the last-seen file stamp
+    /// (`None` = the file was absent or unreadable when last checked).
+    last_seen: std::sync::Mutex<Option<FleetStamp>>,
 }
 
 const CONNECT_ATTEMPTS: u32 = 4;
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
+fn stamp_of(path: &std::path::Path) -> Option<FleetStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FleetStamp {
+        modified: meta.modified().ok()?,
+        len: meta.len(),
+    })
+}
+
+/// Build a new snapshot from a parsed fleet, reusing the previous handle (and
+/// its live connection) for any workspace whose endpoint is unchanged.
+fn build_snapshot(old: &Snapshot, fleet: BTreeMap<String, Workspace>) -> Snapshot {
+    fleet
+        .into_iter()
+        .map(|(name, ws)| {
+            let handle = match old.get(&name) {
+                Some(e) if e.handle.endpoint == ws.endpoint => e.handle.clone(),
+                _ => Arc::new(WorkspaceHandle {
+                    endpoint: ws.endpoint,
+                    slot: tokio::sync::Mutex::new(None),
+                }),
+            };
+            (
+                name,
+                Entry {
+                    handle,
+                    label: ws.label,
+                },
+            )
+        })
+        .collect()
+}
+
 impl RemoteWorkspaceServer {
-    pub fn new(fleet: BTreeMap<String, Workspace>) -> Self {
-        let workspaces = fleet
-            .into_iter()
-            .map(|(name, ws)| {
-                (
-                    name,
-                    WorkspaceHandle {
-                        endpoint: ws.endpoint,
-                        label: ws.label,
-                        slot: tokio::sync::Mutex::new(None),
-                    },
-                )
-            })
-            .collect();
-        Self { workspaces }
+    pub fn new(fleet_path: std::path::PathBuf, fleet: BTreeMap<String, Workspace>) -> Self {
+        let snapshot = build_snapshot(&BTreeMap::new(), fleet);
+        let last_seen = stamp_of(&fleet_path);
+        Self {
+            fleet_path,
+            snapshot: std::sync::RwLock::new(Arc::new(snapshot)),
+            last_seen: std::sync::Mutex::new(last_seen),
+        }
     }
 
-    fn handle(&self, workspace: &str) -> Result<&WorkspaceHandle, String> {
-        self.workspaces.get(workspace).ok_or_else(|| {
-            let names = self
-                .workspaces
+    fn snapshot(&self) -> Arc<Snapshot> {
+        self.snapshot.read().unwrap().clone()
+    }
+
+    /// Reload the fleet if the file changed since last checked. A no-op when the
+    /// stamp is unchanged. On an invalid new file the last known-good snapshot
+    /// is retained and `fleet_reload_failed` is returned to the triggering
+    /// operation; the (bad) stamp is still recorded, so subsequent operations
+    /// serve the last-good fleet instead of failing repeatedly until the file
+    /// changes again.
+    fn refresh_fleet_if_changed(&self) -> Result<(), String> {
+        let mut last = self.last_seen.lock().unwrap();
+        let now = stamp_of(&self.fleet_path);
+        if now == *last {
+            return Ok(());
+        }
+        if now.is_none() {
+            *last = None;
+            return Err("fleet_reload_failed: fleet config is absent or unreadable".into());
+        }
+        let text = match std::fs::read_to_string(&self.fleet_path) {
+            Ok(t) => t,
+            Err(e) => {
+                *last = now;
+                return Err(format!("fleet_reload_failed: read fleet config: {e}"));
+            }
+        };
+        match parse_fleet(&text) {
+            Ok(fleet) => {
+                let old = self.snapshot();
+                let next = build_snapshot(&old, fleet);
+                *self.snapshot.write().unwrap() = Arc::new(next);
+                *last = now;
+                Ok(())
+            }
+            Err(e) => {
+                *last = now;
+                Err(format!("fleet_reload_failed: {e}"))
+            }
+        }
+    }
+
+    fn handle(&self, snapshot: &Arc<Snapshot>, workspace: &str) -> Result<Arc<WorkspaceHandle>, String> {
+        snapshot.get(workspace).map(|e| e.handle.clone()).ok_or_else(|| {
+            let names = snapshot
                 .keys()
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>()
@@ -342,12 +341,16 @@ impl RemoteWorkspaceServer {
     /// there is none or the previous connection died. A fresh connection is
     /// probed with a real round-trip, because a transport can spawn fine and
     /// die immediately (e.g. sshd resetting rapid successive connections).
-    async fn client(&self, workspace: &str) -> Result<(Arc<Client>, &WorkspaceHandle), String> {
-        let handle = self.handle(workspace)?;
+    /// Reloads the fleet first, so a workspace added by `workspace add` becomes
+    /// reachable without restarting the MCP process.
+    async fn client(&self, workspace: &str) -> Result<(Arc<Client>, Arc<WorkspaceHandle>), String> {
+        self.refresh_fleet_if_changed()?;
+        let snapshot = self.snapshot();
+        let handle = self.handle(&snapshot, workspace)?;
         let mut slot = handle.slot.lock().await;
         if let Some(c) = slot.as_ref() {
             if !c.is_closed() {
-                return Ok((c.clone(), handle));
+                return Ok((c.clone(), handle.clone()));
             }
         }
         // `code` is a stable keyword so agents can tell transport failures
@@ -367,7 +370,7 @@ impl RemoteWorkspaceServer {
                     Ok(_) => {
                         let c = Arc::new(c);
                         *slot = Some(c.clone());
-                        return Ok((c, handle));
+                        return Ok((c, handle.clone()));
                     }
                     Err(e) => {
                         code = "probe_failed";
@@ -392,16 +395,19 @@ impl RemoteWorkspaceServer {
         description = "List the configured workspaces: name, host, and root directory. Every other tool requires one of these names as its workspace argument."
     )]
     async fn list_workspaces(&self) -> CallToolResult {
-        let rows: Vec<serde_json::Value> = self
-            .workspaces
+        if let Err(e) = self.refresh_fleet_if_changed() {
+            return err(e);
+        }
+        let snapshot = self.snapshot();
+        let rows: Vec<serde_json::Value> = snapshot
             .iter()
-            .map(|(name, h)| {
-                let (host, root) = match &h.endpoint {
+            .map(|(name, entry)| {
+                let (host, root) = match &entry.handle.endpoint {
                     Endpoint::Ssh { host, root, .. } => (host.as_str(), root.as_str()),
                     Endpoint::Local { root, .. } => ("(local)", root.as_str()),
                 };
                 let mut row = serde_json::json!({"name": name, "host": host, "root": root});
-                if let Some(label) = &h.label {
+                if let Some(label) = &entry.label {
                     row["label"] = serde_json::Value::String(label.clone());
                 }
                 row

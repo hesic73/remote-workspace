@@ -12,7 +12,7 @@ const TRANSFER_BUF_SIZE: usize = 64 * 1024;
 
 /// Where the server runs. The single source of every argv this client spawns:
 /// the resident JSONL control plane and the per-transfer raw data plane.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
     Local {
         server_bin: String,

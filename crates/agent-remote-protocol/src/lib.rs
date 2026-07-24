@@ -1,8 +1,12 @@
 mod error;
 mod messages;
 mod record;
+mod version;
 
 pub use error::{ErrorCode, ProtocolError};
+pub use version::{
+    preflight, should_replace, software_cmp, InstallOutcome, Preflight, VersionInfo,
+};
 pub use messages::{
     ExecOutput, ExecResult, ExecTermination, FileEntry, FileMode, GcResult, ListEntry, ListKind,
     ListResult, MutationResult, OperationDetails, OperationId, ReadResult, Request, RequestBody,

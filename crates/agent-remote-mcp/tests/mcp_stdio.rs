@@ -577,6 +577,88 @@ fn mcp_reconnects_after_server_death() {
     assert!(!e, "call after server death must reconnect, got: {text}");
 }
 
+// A workspace added to the fleet file while the MCP is running becomes visible
+// and usable on the next call, without restarting the process (the behaviour
+// `agent-remote workspace add` relies on).
+#[test]
+fn mcp_reloads_fleet_on_change() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let fleet = dir_a.path().join(".fleet.toml");
+    std::fs::write(&fleet, fleet_entry("a", dir_a.path().to_str().unwrap())).unwrap();
+    let mut s = McpSession::spawn_fleet(&fleet);
+    s.initialize();
+
+    let (e, text) = s.tool("list_workspaces", serde_json::json!({}));
+    assert!(!e);
+    let names = |t: &str| -> Vec<String> {
+        serde_json::from_str::<serde_json::Value>(t)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names(&text), vec!["a"]);
+
+    // Append a second workspace to the fleet file (length change guarantees the
+    // stamp differs even within one second).
+    std::fs::write(
+        &fleet,
+        format!(
+            "{}{}",
+            fleet_entry("a", dir_a.path().to_str().unwrap()),
+            fleet_entry("b", dir_b.path().to_str().unwrap())
+        ),
+    )
+    .unwrap();
+
+    let (e, text) = s.tool("list_workspaces", serde_json::json!({}));
+    assert!(!e, "reload failed: {text}");
+    assert_eq!(names(&text), vec!["a", "b"], "new workspace not visible");
+
+    // The newly added workspace is immediately usable.
+    let (e, text) = s.tool(
+        "create_file",
+        serde_json::json!({"workspace": "b", "path": "in-b.txt", "content": "x"}),
+    );
+    assert!(!e, "new workspace unusable: {text}");
+    assert!(dir_b.path().join("in-b.txt").exists());
+}
+
+// An invalid fleet edit is rejected: the triggering call reports
+// fleet_reload_failed, and the last known-good fleet keeps serving.
+#[test]
+fn mcp_invalid_fleet_reload_keeps_last_good() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let fleet = dir_a.path().join(".fleet.toml");
+    std::fs::write(&fleet, fleet_entry("a", dir_a.path().to_str().unwrap())).unwrap();
+    let mut s = McpSession::spawn_fleet(&fleet);
+    s.initialize();
+
+    let (e, _) = s.tool("list_workspaces", serde_json::json!({}));
+    assert!(!e);
+
+    // Replace with an invalid fleet (empty declares no workspaces).
+    std::fs::write(&fleet, "# broken\n").unwrap();
+
+    let (e, text) = s.tool("list_workspaces", serde_json::json!({}));
+    assert!(e, "invalid reload must be an error");
+    assert!(
+        text.contains("fleet_reload_failed"),
+        "must carry the stable code: {text}"
+    );
+
+    // Last-good fleet still serves: workspace "a" remains usable.
+    let (e, text) = s.tool(
+        "create_file",
+        serde_json::json!({"workspace": "a", "path": "still-works.txt", "content": "x"}),
+    );
+    assert!(!e, "last-good fleet must keep serving: {text}");
+    assert!(dir_a.path().join("still-works.txt").exists());
+}
+
 // upload_file/download_file over real MCP stdio: success round-trip, default
 // no-overwrite failure, and a failing upload all with correct isError.
 #[test]

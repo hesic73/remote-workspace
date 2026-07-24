@@ -274,6 +274,75 @@ symlinked parent). This guards against accidents, not adversaries -- `exec`
 can still reach anything the remote user can. Real isolation belongs to
 containers or user permissions.
 
+## Deployment and onboarding
+
+Adding a workspace is one local command, which probes the target, installs or
+upgrades the server, proves the workspace works, and records it:
+
+```bash
+agent-remote workspace add robot --host robot@workstation --root /home/robot/project
+```
+
+This is a **local CLI operation and never an MCP tool**. It expands the set of
+machines and directories an agent may reach, so it belongs on the trusted side
+of the boundary: the CLI adds and removes workspaces and installs binaries;
+the MCP exposes only already-configured workspaces; the agent chooses among
+them. There is no `add_workspace`, `install_server`, or reload tool.
+
+Two version fields are reported by `agent-remote-server --version-json`, a
+stable probe that mutates nothing, needs no config, and never starts the JSONL
+server:
+
+```json
+{"software_version": "0.2.0", "protocol_version": 1}
+```
+
+`software_version` identifies the release and its CI artifact;
+`protocol_version` is an integer bumped only when client/server compatibility
+changes, so a bug-fix release does not force a redeployment. The rule is
+one-directional: **a newer client may upgrade an older server; an older client
+never downgrades a newer one.** A missing or legacy server (one that does not
+understand `--version-json`) is installed; an older protocol or, at equal
+protocol, older software is upgraded; equal or newer software is left alone; a
+newer protocol is refused with `client_too_old` and the remote is untouched.
+
+Each SSH identity has exactly one active managed binary at
+`~/.local/lib/agent-remote/agent-remote-server`, shared by every workspace on
+that host -- installation is a property of the identity, not the workspace.
+There is no multi-version layout: GitHub Releases is the historical archive.
+The client never builds the server; CI publishes static musl artifacts plus a
+machine-readable `release-manifest.json` and `SHA256SUMS`, and the client
+downloads the artifact pinned to *its own* release (never an unpinned
+`latest`), verifies its SHA-256, and caches it under
+`~/.cache/agent-remote/server/`. The remote host needs no internet access.
+Passing an explicit `--remote-bin` marks the server user-managed: checked for
+compatibility, never installed or overwritten.
+
+Installation is atomic and downgrade-proof. The artifact is uploaded to a
+unique temporary path, and the *uploaded binary installs itself*: it verifies
+its own SHA-256, takes an advisory `flock` on
+`~/.local/lib/agent-remote/install.lock`, re-probes what is installed **inside
+the lock** (a version observed before acquiring it is not authoritative), and
+renames itself into place only if the installed server is strictly older.
+Doing the compare-and-swap inside one locked process is what makes concurrent
+installers safe; an equal or newer server is kept and the upload deleted.
+Replacing an executable path does not disturb processes already running from
+the old inode, so live sessions continue unaffected and no session registry is
+needed -- the workspace state lock already prevents two servers from sharing a
+root.
+
+The fleet file is only written after remote installation and a real protocol
+round-trip against the target root both succeed (reusing the `--check` probe
+rather than adding a second health path). The write preserves comments and
+unrelated entries (`toml_edit`), holds a local lock, re-checks for duplicate
+names and duplicate `(host, root)` pairs under it, validates the complete
+result, and installs it via temp file + fsync + rename. Failure at any earlier
+step leaves the fleet unchanged: a workspace becomes authorized only when that
+final write lands. Errors carry stable codes naming the failing layer --
+`ssh_connect_failed`, `unsupported_remote_platform`, `workspace_root_not_found`,
+`artifact_checksum_mismatch`, `remote_install_failed`, `client_too_old`,
+`fleet_write_failed`, and so on.
+
 ## MCP integration
 
 Operational conventions for agents live only in
@@ -313,6 +382,17 @@ no server-side coordination at all -- there is no cross-workspace operation
   rejects limits above 100, and omits exec preview text.
 * In SSH mode the remote command line is shell-quoted per argument, because
   `ssh` re-parses its trailing arguments through the remote shell.
+* The fleet file is reloadable configuration, not startup-only state. Before
+  listing workspaces or resolving one for a tool call, the MCP compares a
+  cheap file stamp and, if it changed, parses and validates the whole file and
+  swaps the in-memory snapshot atomically. Workspaces whose endpoint is
+  unchanged keep their existing connection slot, so an edit elsewhere in the
+  file never drops a live SSH session; new entries get slots, removed or
+  materially changed ones lose theirs. An invalid file is never partially
+  applied: the last known-good snapshot keeps serving and the triggering call
+  returns `fleet_reload_failed`. Because `workspace add` writes only fully
+  validated configuration atomically, a new workspace simply appears on the
+  next call -- without restarting Claude Code, Codex, or the MCP process.
 * Connections are rebuilt on demand: a dead link is replaced on the next
   tool call (retries with backoff, probed with a real round-trip), while a
   call that dies mid-flight surfaces as an error and is never auto-retried.
@@ -348,6 +428,14 @@ that drive the real `agent-remote-mcp` binary.
 
 Post-MVP additions, all implemented and tested:
 
+* [x] Workspace onboarding and managed deployment: `agent-remote workspace
+  add` probes the target, installs or upgrades one managed server per SSH
+  identity from checksum-verified CI artifacts (locked, atomic, never a
+  downgrade), runs a real workspace probe, and commits the fleet entry
+  atomically; `--version-json` reports `software_version`/`protocol_version`
+* [x] Runtime fleet refresh: the MCP reloads a changed fleet file on demand,
+  preserving connections for unchanged workspaces and keeping the last-good
+  config when an edit is invalid; no administrative MCP tools
 * [x] Canonical editing surface: `create` (new files only) and `edit` (exact
   text replacement with `NO_MATCH`/`AMBIGUOUS_MATCH`/`replace_all`) replace
   `write`/`patch`; one tool per intent, old logs still load

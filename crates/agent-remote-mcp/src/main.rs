@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
     // loop here makes the MCP host time the server out, e.g. when a session
     // being resumed briefly overlaps its predecessor on the same state lock).
     // The first tool call to each workspace connects on demand.
-    let server = RemoteWorkspaceServer::new(fleet);
+    let server = RemoteWorkspaceServer::new(fleet_path, fleet);
     let service = server
         .serve(RejectUnknownMethods(
             AsyncRwTransport::<RoleServer, _, _>::new(tokio::io::stdin(), tokio::io::stdout()),

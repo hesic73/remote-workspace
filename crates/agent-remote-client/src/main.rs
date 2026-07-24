@@ -23,9 +23,10 @@ struct Cli {
     #[arg(long, default_value = "agent-remote-server")]
     remote_bin: String,
 
-    /// Workspace root on the remote host.
+    /// Workspace root on the remote host. Required for the connect-based
+    /// commands; not used by `workspace add`, which takes its own --root.
     #[arg(long)]
-    root: String,
+    root: Option<String>,
 
     /// Optional remote config TOML path passed to the server.
     #[arg(long)]
@@ -121,6 +122,44 @@ enum Command {
         #[arg(long)]
         keep: Option<usize>,
     },
+    /// Manage the local workspace fleet. Trusted local admin operations, not
+    /// exposed to the agent through MCP.
+    Workspace {
+        #[command(subcommand)]
+        cmd: WorkspaceCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCmd {
+    /// Onboard a remote workspace: probe it, install or upgrade the managed
+    /// server binary, run a real protocol probe, and record it in the fleet.
+    Add {
+        /// Name the agent will use to select this workspace.
+        name: String,
+        /// SSH host, resolvable via ~/.ssh/config (e.g. robot@workstation).
+        #[arg(long)]
+        host: String,
+        /// Existing workspace root directory on the remote host.
+        #[arg(long)]
+        root: String,
+        /// Human-readable description shown by list_workspaces.
+        #[arg(long)]
+        label: Option<String>,
+        /// Remote server config TOML path (profiles).
+        #[arg(long)]
+        config: Option<String>,
+        /// Base directory for remote server state.
+        #[arg(long)]
+        state_base: Option<String>,
+        /// Use this server binary as-is (user-managed): verify compatibility
+        /// but never install or overwrite it. Omit to use the managed binary.
+        #[arg(long)]
+        remote_bin: Option<String>,
+        /// Fleet config file to update. Defaults to ~/.agent-remote/workspaces.toml.
+        #[arg(long)]
+        fleet: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -137,6 +176,13 @@ fn main() -> Result<()> {
 
 async fn async_main_real() -> Result<()> {
     let cli = Cli::parse();
+
+    // Admin commands do not connect to a server; handle them before the
+    // connect-based dispatch that requires --host/--root.
+    if let Command::Workspace { cmd } = &cli.command {
+        return handle_workspace(cmd).await;
+    }
+
     let log = match &cli.log {
         Some(p) => Some(
             ClientLog::open(p.clone())
@@ -146,10 +192,14 @@ async fn async_main_real() -> Result<()> {
         None => None,
     };
 
+    let root = cli
+        .root
+        .clone()
+        .ok_or_else(|| anyhow!("--root is required"))?;
     let endpoint = if cli.local {
         agent_remote_client::Endpoint::Local {
             server_bin: cli.remote_bin.clone(),
-            root: cli.root.clone(),
+            root,
             state_base: cli.state_base.clone(),
             config: cli.config.clone(),
         }
@@ -160,7 +210,7 @@ async fn async_main_real() -> Result<()> {
         agent_remote_client::Endpoint::Ssh {
             host,
             remote_bin: cli.remote_bin.clone(),
-            root: cli.root.clone(),
+            root,
             state_base: cli.state_base.clone(),
             config: cli.config.clone(),
         }
@@ -274,7 +324,157 @@ async fn async_main_real() -> Result<()> {
             let r = client.gc(keep).await?;
             println!("{}", serde_json::to_string_pretty(&r)?);
         }
+        // Handled before the connect path.
+        Command::Workspace { .. } => unreachable!(),
     }
+    Ok(())
+}
+
+async fn handle_workspace(cmd: &WorkspaceCmd) -> Result<()> {
+    match cmd {
+        WorkspaceCmd::Add {
+            name,
+            host,
+            root,
+            label,
+            config,
+            state_base,
+            remote_bin,
+            fleet,
+        } => {
+            workspace_add(WorkspaceAddParams {
+                name,
+                host,
+                root,
+                label: label.as_deref(),
+                config: config.as_deref(),
+                state_base: state_base.as_deref(),
+                remote_bin: remote_bin.as_deref(),
+                fleet: fleet.clone(),
+            })
+            .await
+        }
+    }
+}
+
+struct WorkspaceAddParams<'a> {
+    name: &'a str,
+    host: &'a str,
+    root: &'a str,
+    label: Option<&'a str>,
+    config: Option<&'a str>,
+    state_base: Option<&'a str>,
+    remote_bin: Option<&'a str>,
+    fleet: Option<PathBuf>,
+}
+
+async fn workspace_add(p: WorkspaceAddParams<'_>) -> Result<()> {
+    // Run the transaction, tagging any failure with the workspace/host context.
+    match workspace_add_inner(&p).await {
+        Ok(()) => Ok(()),
+        Err(e) => Err(anyhow!(
+            "Cannot add workspace '{}' ({}): {}",
+            p.name,
+            p.host,
+            e
+        )),
+    }
+}
+
+async fn workspace_add_inner(p: &WorkspaceAddParams<'_>) -> Result<()> {
+    use agent_remote_client::deploy::{self, ServerStep};
+    use agent_remote_client::fleet::{self, NewEntry};
+
+    let fleet_path = match &p.fleet {
+        Some(path) => path.clone(),
+        None => fleet::default_fleet_path()?,
+    };
+
+    println!("Adding workspace '{}'", p.name);
+
+    // 1-2. Reject collisions up front (fast, before touching the remote).
+    let preview = NewEntry {
+        name: p.name.into(),
+        host: p.host.into(),
+        root: p.root.into(),
+        bin: None,
+        label: None,
+        config: None,
+        state_base: None,
+    };
+    let existing = std::fs::read_to_string(&fleet_path).unwrap_or_default();
+    fleet::check_addable(&existing, &preview).map_err(anyhow::Error::msg)?;
+
+    // 3-5. Probe SSH, remote platform, and the workspace root.
+    let platform = deploy::probe_platform(p.host).map_err(anyhow::Error::msg)?;
+    println!("  {:<22} connected", "SSH");
+    println!("  {:<22} {}", "Remote platform", platform.label());
+    deploy::validate_root(p.host, p.root).map_err(anyhow::Error::msg)?;
+    println!("  {:<22} valid", "Workspace root");
+
+    // 6-10. Resolve the server binary: user-managed (never installed) or the
+    // managed path (installed/upgraded as needed).
+    let (bin, protocol) = if let Some(custom) = p.remote_bin {
+        let v = deploy::check_custom_bin(p.host, custom).map_err(anyhow::Error::msg)?;
+        println!(
+            "  {:<22} user-managed {} (not modified)",
+            "Server", v.software_version
+        );
+        (custom.to_string(), v.protocol_version)
+    } else {
+        let managed = platform.managed_bin();
+        match deploy::deploy_managed(p.host, &platform.os, &platform.arch, &managed)
+            .map_err(anyhow::Error::msg)?
+        {
+            ServerStep::Installed(o) => {
+                let msg = match &o.previous {
+                    _ if !o.installed => format!("up to date {}", o.current.software_version),
+                    None => format!("installed {}", o.current.software_version),
+                    Some(prev) => format!(
+                        "upgraded {} -> {}",
+                        prev.software_version, o.current.software_version
+                    ),
+                };
+                println!("  {:<22} {}", "Server", msg);
+                (managed, o.current.protocol_version)
+            }
+            ServerStep::AlreadyCurrent(v) => {
+                println!(
+                    "  {:<22} up to date {}",
+                    "Server", v.software_version
+                );
+                (managed, v.protocol_version)
+            }
+        }
+    };
+    println!("  {:<22} {}", "Protocol", protocol);
+
+    // 11. Real protocol round-trip against the target root before committing.
+    let endpoint = agent_remote_client::Endpoint::Ssh {
+        host: p.host.into(),
+        remote_bin: bin.clone(),
+        root: p.root.into(),
+        state_base: p.state_base.map(str::to_string),
+        config: p.config.map(str::to_string),
+    };
+    if let Err(e) = fleet::check_workspace(&endpoint).await {
+        return Err(anyhow!("server_probe_failed: {e}"));
+    }
+    println!("  {:<22} passed", "Workspace probe");
+
+    // 12. Commit the fleet entry atomically.
+    let entry = NewEntry {
+        name: p.name.into(),
+        host: p.host.into(),
+        root: p.root.into(),
+        bin: Some(bin),
+        label: p.label.map(str::to_string),
+        config: p.config.map(str::to_string),
+        state_base: p.state_base.map(str::to_string),
+    };
+    fleet::add_workspace_entry(&fleet_path, &entry).map_err(anyhow::Error::msg)?;
+    println!("  {:<22} updated", "Fleet configuration");
+    println!("Workspace '{}' is ready.", p.name);
     Ok(())
 }
 

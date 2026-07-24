@@ -23,18 +23,85 @@ cargo build --release
 #   target/release/agent-remote-mcp    (MCP server for coding agents)
 ```
 
-Copy `agent-remote-server` onto the remote host: anywhere on `PATH`, or
-point at its full path (the CLI's `--remote-bin` flag; the fleet config's
-`bin` field for the MCP).
+You do not normally copy the server yourself: `agent-remote workspace add`
+installs it (see [Adding a workspace](#adding-a-workspace)). Manual placement
+is still supported — anywhere on the remote `PATH`, or point at its full path
+(the CLI's `--remote-bin` flag; the fleet config's `bin` field for the MCP).
 
 If the remote's glibc is older than your build machine's, build the server as
 a fully static musl binary instead — it runs anywhere on the same
-architecture:
+architecture. This is what CI publishes, so released artifacts have no glibc
+constraint:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl -p agent-remote-server
 # -> target/x86_64-unknown-linux-musl/release/agent-remote-server
+```
+
+## Adding a workspace
+
+One command onboards a remote workspace: it probes the host, installs or
+upgrades the server binary, runs a real protocol round-trip, and records the
+workspace in the fleet config.
+
+```bash
+agent-remote workspace add robot \
+  --host robot@workstation \
+  --root /home/robot/project
+```
+
+```text
+Adding workspace 'robot'
+  SSH                    connected
+  Remote platform        linux-x86_64
+  Workspace root         valid
+  Server                 upgraded 0.1.0 -> 0.2.0
+  Protocol               1
+  Workspace probe        passed
+  Fleet configuration    updated
+Workspace 'robot' is ready.
+```
+
+Optional flags mirror the fleet fields: `--label`, `--config`, `--state-base`,
+and `--fleet` (which file to update). A running MCP server picks the new
+workspace up on its next call — no restart.
+
+`workspace add` is deliberately a **local CLI operation only**, never an MCP
+tool: it expands the set of machines an agent may reach, so it stays on the
+trusted side of the boundary. The agent sees `list_workspaces` and can use
+what is already configured; it cannot add hosts.
+
+### Managed vs user-managed servers
+
+Omitting `--remote-bin` selects the **managed** binary: one active server per
+SSH identity at `~/.local/lib/agent-remote/agent-remote-server`, shared by
+every workspace on that host. The client downloads the artifact matching its
+own release from GitHub Releases, verifies its SHA-256 locally, uploads it to
+a temporary path, and lets the uploaded binary install itself under a remote
+`flock` — replacing the old one only if strictly older, then atomically
+renaming into place. Running sessions keep their old inode and are unaffected.
+
+Passing `--remote-bin /path/to/server` marks the server **user-managed**: it
+is checked for compatibility but never installed, upgraded, or overwritten.
+Use this for development builds.
+
+Two version fields drive the decision. `software_version` is the release
+(`0.2.0`), `protocol_version` an integer bumped only on incompatible wire or
+state changes. A newer client upgrades an older server; an older client never
+downgrades a newer one; a server with a newer protocol is refused with a clear
+"update your client" error and left untouched. Both are reported by:
+
+```bash
+agent-remote-server --version-json
+# {"software_version":"0.2.0","protocol_version":1}
+```
+
+Air-gapped or testing setups can point the client at a different artifact
+source (an `https://` base, a local directory, or a `file://` URL):
+
+```bash
+AGENT_REMOTE_RELEASE_BASE=/path/to/dist agent-remote workspace add ...
 ```
 
 ## Quick start
@@ -110,10 +177,12 @@ environment.
 | `op <operation_id>` | Details of one operation |
 | `status <request_id>` | Status of a previously-issued request |
 | `gc [--keep N]` | Prune stored history down to the newest N operations |
+| `workspace add <name> --host H --root R` | Onboard a workspace: install/upgrade the server and record it in the fleet |
 
 Shared flags: `--host`, `--remote-bin` (default `agent-remote-server`),
 `--root`, `--config`, `--local`, `--log <file>` (client interaction log),
-`--state-base` (relocate server state, see below).
+`--state-base` (relocate server state, see below). `workspace add` takes its
+own `--host`/`--root` and does not connect through these.
 
 ## Server state
 
@@ -179,6 +248,19 @@ label = "ROS workspace"           # optional, shown by list_workspaces
 host = "lab-gpu-1"
 root = "/data/experiments"
 ```
+
+Write these entries with `agent-remote workspace add` rather than by hand; it
+validates the target, installs the server, and updates the file atomically
+while preserving your comments and other entries.
+
+The fleet file is reloadable configuration: before listing workspaces or
+resolving one for a tool call, the MCP re-reads it if it changed on disk, so a
+workspace added mid-session is visible immediately without restarting the MCP
+host. Unchanged workspaces keep their open connections across a reload. An
+invalid edit is never partially applied: the last known-good fleet keeps
+serving and the triggering call returns `fleet_reload_failed`. Administrative
+operations are deliberately absent from the tool surface -- there is no
+`add_workspace`, `install_server`, or reload tool.
 
 `agent-remote-mcp --check` diagnoses the fleet without starting the MCP:
 it validates the config, probes every workspace once (spawns its server,

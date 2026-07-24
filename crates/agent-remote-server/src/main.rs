@@ -22,6 +22,24 @@ struct Args {
     #[arg(long)]
     state_base: Option<PathBuf>,
 
+    /// Print `{software_version, protocol_version}` as JSON and exit, without
+    /// touching the workspace, config, or state directory. Stable across
+    /// releases; used by the client to decide whether to install/upgrade the
+    /// managed server binary.
+    #[arg(long)]
+    version_json: bool,
+
+    /// Internal self-install: this binary, uploaded to a temporary path, takes
+    /// the install lock next to <PATH> and atomically replaces the server there
+    /// only if strictly older, printing the outcome as JSON. See the onboarding
+    /// design doc, sections 11-13.
+    #[arg(long, hide = true, value_name = "MANAGED_PATH")]
+    install_to: Option<PathBuf>,
+
+    /// Expected SHA-256 (hex) of this uploaded binary, verified before install.
+    #[arg(long, hide = true, requires = "install_to")]
+    expect_sha256: Option<String>,
+
     /// Path to a TOML config file with profile setup scripts.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -71,6 +89,19 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if args.version_json {
+        let info = agent_remote_protocol::VersionInfo {
+            software_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: agent_remote_protocol::PROTOCOL_VERSION,
+        };
+        println!("{}", serde_json::to_string(&info)?);
+        return Ok(());
+    }
+
+    if let Some(managed) = args.install_to {
+        return agent_remote_server::install::run_install_to(&managed, args.expect_sha256.as_deref());
+    }
 
     if let Some(staging) = args.transfer_receive {
         let expect_size = args
