@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-remote-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-remote-protocol",
  "agent-remote-server",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "agent-remote-mcp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-remote-client",
  "agent-remote-protocol",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "agent-remote-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "agent-remote-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-remote-protocol",
  "anyhow",

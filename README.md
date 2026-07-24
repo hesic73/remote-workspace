@@ -167,7 +167,8 @@ state directory is always safe. Growth is bounded by `--history-limit`
 
 | Command | Purpose |
 |---------|---------|
-| `workspace add <name> --host H --root R` | Onboard a workspace: install/upgrade the server, record it in the fleet |
+| `workspace add <name> --host H --root R` | Onboard a new workspace: install the server, record it in the fleet |
+| `workspace upgrade [<name>]` | Install/upgrade the managed server for workspaces already in the fleet |
 | `ls <path>` | List a directory |
 | `stat <path>` | Stat a file or directory |
 | `cat <path>` | Read a file |
@@ -190,8 +191,19 @@ administrative command with its own `--host`/`--root` and does not use them.
 `agent-remote-server --version-json` reports two fields: `software_version`
 (the release) and `protocol_version` (bumped only on incompatible changes).
 A newer client upgrades an older server; an older client never downgrades a
-newer one. Re-run `workspace add` to upgrade a host; an already-current host
-reports `up to date` and transfers nothing.
+newer one.
+
+Update the local client, then pick up the new server everywhere:
+
+```bash
+agent-remote workspace upgrade            # every workspace in the fleet
+agent-remote workspace upgrade robot      # or just one
+```
+
+`upgrade` installs once per SSH identity however many workspaces share it,
+reports `up to date` and transfers nothing when a host is already current, and
+never edits the fleet file. (`add` is for new workspaces only; it refuses a
+name already in the fleet.)
 
 Each SSH identity holds one managed server at
 `~/.local/lib/agent-remote/agent-remote-server`, shared by every workspace on

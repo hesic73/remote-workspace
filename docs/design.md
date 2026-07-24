@@ -285,6 +285,17 @@ of the boundary: the CLI adds and removes workspaces and installs binaries;
 the MCP exposes only already-configured workspaces; the agent chooses among
 them. There is no `add_workspace`, `install_server`, or reload tool.
 
+`add` is onboarding only and refuses a name already in the fleet, so picking up
+a new release is a separate verb:
+
+```bash
+agent-remote workspace upgrade [<name>]
+```
+
+It installs once per SSH identity however many workspaces share it, leaves
+user-managed binaries alone, and never edits the fleet file -- upgrading a
+server changes no authorization, so it needs none of `add`'s transaction.
+
 Two version fields are reported by `agent-remote-server --version-json`, a
 stable probe that mutates nothing, needs no config, and never starts the JSONL
 server:

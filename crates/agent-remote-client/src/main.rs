@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use agent_remote_client::{ArgvTransport, Client, ClientLog};
@@ -157,6 +158,16 @@ enum WorkspaceCmd {
         #[arg(long)]
         remote_bin: Option<String>,
         /// Fleet config file to update. Defaults to ~/.agent-remote/workspaces.toml.
+        #[arg(long)]
+        fleet: Option<PathBuf>,
+    },
+    /// Install or upgrade the managed server for workspaces already in the
+    /// fleet. One install per SSH identity, however many workspaces share it.
+    /// Never touches a user-managed binary and never edits the fleet file.
+    Upgrade {
+        /// Workspace to upgrade. Omit to upgrade every workspace in the fleet.
+        name: Option<String>,
+        /// Fleet config file to read. Defaults to ~/.agent-remote/workspaces.toml.
         #[arg(long)]
         fleet: Option<PathBuf>,
     },
@@ -354,6 +365,96 @@ async fn handle_workspace(cmd: &WorkspaceCmd) -> Result<()> {
             })
             .await
         }
+        WorkspaceCmd::Upgrade { name, fleet } => {
+            workspace_upgrade(name.as_deref(), fleet.clone()).await
+        }
+    }
+}
+
+/// Upgrade the managed server behind already-registered workspaces. `add`
+/// deliberately refuses a workspace that already exists, so this is the path
+/// for picking up a new release. The fleet file is never modified.
+async fn workspace_upgrade(name: Option<&str>, fleet: Option<PathBuf>) -> Result<()> {
+    use agent_remote_client::fleet;
+
+    let fleet_path = match fleet {
+        Some(path) => path,
+        None => fleet::default_fleet_path()?,
+    };
+    let text = std::fs::read_to_string(&fleet_path)
+        .with_context(|| format!("read fleet config {fleet_path:?}"))?;
+    let workspaces = fleet::parse_fleet(&text)
+        .with_context(|| format!("invalid fleet config {fleet_path:?}"))?;
+
+    let selected: Vec<(&String, &fleet::Workspace)> = match name {
+        Some(n) => {
+            let ws = workspaces.get(n).ok_or_else(|| {
+                anyhow!(
+                    "unknown_workspace: '{n}' is not in {fleet_path:?}; available: {}",
+                    workspaces.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })?;
+            vec![(workspaces.get_key_value(n).unwrap().0, ws)]
+        }
+        None => workspaces.iter().collect(),
+    };
+
+    // Installation belongs to an SSH identity, not a workspace: several
+    // workspaces on one host share a single binary, so each host is done once.
+    let mut done: BTreeSet<String> = BTreeSet::new();
+    let mut failures = 0;
+    for (ws_name, ws) in selected {
+        let (host, bin) = match &ws.endpoint {
+            agent_remote_client::Endpoint::Ssh {
+                host, remote_bin, ..
+            } => (host, remote_bin),
+            agent_remote_client::Endpoint::Local { .. } => {
+                println!("{ws_name}: local workspace, nothing to install");
+                continue;
+            }
+        };
+        if !done.insert(host.clone()) {
+            println!("{ws_name}: shares {host}, already handled");
+            continue;
+        }
+        match upgrade_host(host, bin).await {
+            Ok(msg) => println!("{ws_name} [{host}]: {msg}"),
+            Err(e) => {
+                failures += 1;
+                println!("{ws_name} [{host}]: {e}");
+            }
+        }
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} workspace(s) failed to upgrade");
+    }
+    Ok(())
+}
+
+/// Upgrade one SSH identity's managed server. A binary at any path other than
+/// the managed one is user-managed and is only reported, never replaced.
+async fn upgrade_host(host: &str, bin: &str) -> Result<String> {
+    use agent_remote_client::deploy::{self, ServerStep};
+
+    let platform = deploy::probe_platform(host)?;
+    let managed = platform.managed_bin();
+    if bin != managed {
+        let v = deploy::check_custom_bin(host, bin)?;
+        return Ok(format!(
+            "user-managed {bin} at {} (not modified)",
+            v.software_version
+        ));
+    }
+    match deploy::deploy_managed(host, &platform.os, &platform.arch, &managed)? {
+        ServerStep::AlreadyCurrent(v) => Ok(format!("up to date {}", v.software_version)),
+        ServerStep::Installed(o) => Ok(match (&o.previous, o.installed) {
+            (_, false) => format!("up to date {}", o.current.software_version),
+            (None, _) => format!("installed {}", o.current.software_version),
+            (Some(prev), _) => format!(
+                "upgraded {} -> {}",
+                prev.software_version, o.current.software_version
+            ),
+        }),
     }
 }
 

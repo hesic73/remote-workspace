@@ -110,6 +110,67 @@ impl Env {
             .output()
             .unwrap()
     }
+
+    fn upgrade(&self, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_agent-remote"))
+            .args(["workspace", "upgrade"])
+            .args(args)
+            .args(["--fleet"])
+            .arg(&self.fleet)
+            .env("HOME", &self.home)
+            .env("PATH", &self.path)
+            .env("AGENT_REMOTE_RELEASE_BASE", &self.release)
+            .env_remove("XDG_CACHE_HOME")
+            .output()
+            .unwrap()
+    }
+}
+
+// `add` refuses an existing workspace, so `upgrade` is the path for picking up
+// a new release on hosts already in the fleet.
+#[test]
+fn upgrade_covers_registered_workspaces() {
+    let Some(env) = setup() else { return };
+    for dir in ["p1", "p2"] {
+        std::fs::create_dir_all(env.home.join(dir)).unwrap();
+    }
+    let p1 = env.home.join("p1").to_string_lossy().to_string();
+    let p2 = env.home.join("p2").to_string_lossy().to_string();
+    assert!(env.add("a", &p1).status.success());
+    assert!(env.add("b", &p2).status.success());
+
+    let before = std::fs::read_to_string(&env.fleet).unwrap();
+
+    // Both workspaces share one SSH identity, so the binary is handled once.
+    let out = env.upgrade(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "upgrade failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("up to date"), "{stdout}");
+    assert!(
+        stdout.contains("already handled"),
+        "second workspace on the same host must not reinstall: {stdout}"
+    );
+    // Upgrading never rewrites the fleet.
+    assert_eq!(std::fs::read_to_string(&env.fleet).unwrap(), before);
+
+    // A single workspace can be targeted by name.
+    let one = env.upgrade(&["a"]);
+    assert!(one.status.success());
+    let one_out = String::from_utf8_lossy(&one.stdout);
+    assert!(one_out.contains("a ["), "{one_out}");
+    assert!(
+        !one_out.contains("b ["),
+        "only 'a' was requested: {one_out}"
+    );
+
+    // An unknown name is a clear error, not a silent no-op.
+    let bad = env.upgrade(&["nope"]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("unknown_workspace"));
 }
 
 #[test]
