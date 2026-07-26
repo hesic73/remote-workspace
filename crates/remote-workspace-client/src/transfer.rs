@@ -10,6 +10,71 @@ use crate::{shell_quote, Client, ClientError};
 
 const TRANSFER_BUF_SIZE: usize = 64 * 1024;
 
+/// How long a transfer may move zero bytes before it is called stalled. This is
+/// deliberately NOT a total timeout: a large file over a slow link legitimately
+/// takes hours, and capping the total would kill healthy transfers. What can be
+/// judged is whether anything is still flowing.
+const TRANSFER_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const STALL_TIMEOUT_ENV: &str = "REMOTE_WORKSPACE_STALL_TIMEOUT_MS";
+
+/// The stall window, overridable for tests and for links so slow that a single
+/// 64 KiB chunk cannot cross in two minutes. A malformed value is rejected
+/// rather than silently ignored.
+fn stall_timeout() -> std::time::Duration {
+    match std::env::var(STALL_TIMEOUT_ENV) {
+        Err(_) => TRANSFER_STALL_TIMEOUT,
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(ms) if ms > 0 => std::time::Duration::from_millis(ms),
+            _ => {
+                panic!("{STALL_TIMEOUT_ENV} must be a positive number of milliseconds, got {raw:?}")
+            }
+        },
+    }
+}
+
+/// Progress as an error-message fragment, so a failure says whether the
+/// transfer was moving and how fast rather than only that it broke.
+fn progress_note(done: u64, total: u64, elapsed: std::time::Duration) -> String {
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let rate_kib = done as f64 / elapsed.as_secs_f64().max(0.001) / 1024.0;
+    format!(
+        "{:.1}/{:.1} MiB after {:.0}s, averaging {:.0} KiB/s",
+        mib(done),
+        mib(total),
+        elapsed.as_secs_f64(),
+        rate_kib
+    )
+}
+
+/// Await one step of a transfer, distinguishing three outcomes that all used to
+/// look the same from outside: it worked, it failed, or nothing moved at all.
+async fn transfer_step<T, E, F>(
+    fut: F,
+    what: &str,
+    done: u64,
+    total: u64,
+    started: std::time::Instant,
+) -> Result<T, ClientError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let window = stall_timeout();
+    match tokio::time::timeout(window, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(transfer_err(format!(
+            "{what} failed at {}: {e}",
+            progress_note(done, total, started.elapsed())
+        ))),
+        Err(_) => Err(transfer_err(format!(
+            "transfer_stalled: nothing moved for {:.0}s while {what}, at {}. \
+             The connection is open but no bytes are flowing; retry, or check the remote host.",
+            window.as_secs_f64(),
+            progress_note(done, total, started.elapsed())
+        ))),
+    }
+}
+
 /// Where the server runs. The single source of every argv this client spawns:
 /// the resident JSONL control plane and the per-transfer raw data plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +319,7 @@ async fn stream_to_receiver(
     let mut buf = vec![0u8; TRANSFER_BUF_SIZE];
     let mut hasher = Sha256::new();
     let mut sent: u64 = 0;
+    let started = std::time::Instant::now();
     let stream_result: Result<(), ClientError> = async {
         loop {
             let n = file
@@ -264,10 +330,14 @@ async fn stream_to_receiver(
                 break;
             }
             hasher.update(&buf[..n]);
-            child_stdin
-                .write_all(&buf[..n])
-                .await
-                .map_err(|e| transfer_err(format!("write to receiver: {e}")))?;
+            transfer_step(
+                child_stdin.write_all(&buf[..n]),
+                "sending bytes to the receiver",
+                sent,
+                size,
+                started,
+            )
+            .await?;
             sent += n as u64;
         }
         if sent != size {
@@ -275,10 +345,14 @@ async fn stream_to_receiver(
                 "local file changed size during upload: sent {sent} bytes, expected {size}"
             )));
         }
-        child_stdin
-            .shutdown()
-            .await
-            .map_err(|e| transfer_err(format!("close receiver stdin: {e}")))?;
+        transfer_step(
+            child_stdin.shutdown(),
+            "closing the receiver stream",
+            sent,
+            size,
+            started,
+        )
+        .await?;
         Ok(())
     }
     .await;
@@ -289,12 +363,19 @@ async fn stream_to_receiver(
         return Err(e);
     }
 
+    // The receiver reports {size, sha256} once it has the whole file. Guard it
+    // too: a remote that accepted every byte and then wedged would otherwise
+    // hang here forever, with all the bytes already sent.
     let mut out = String::new();
     let mut reader = BufReader::new(child_stdout);
-    reader
-        .read_to_string(&mut out)
-        .await
-        .map_err(|e| transfer_err(format!("read receiver metadata: {e}")))?;
+    transfer_step(
+        reader.read_to_string(&mut out),
+        "waiting for the receiver to confirm the upload",
+        sent,
+        size,
+        started,
+    )
+    .await?;
     let status = child
         .wait()
         .await
@@ -377,6 +458,12 @@ pub async fn download_file(
     let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
 
     let received = receive_stream(&mut reader, tmp.as_file()).await;
+    if received.is_err() {
+        // A sender that stalled will never exit on its own, so waiting for it
+        // would hang exactly where the stall was supposed to be caught. Killing
+        // it first is what turns a detected stall into a returned error.
+        let _ = child.kill().await;
+    }
     let status = child
         .wait()
         .await
@@ -428,11 +515,16 @@ async fn receive_stream(
 ) -> Result<(u64, String), ClientError> {
     use std::io::Write;
 
+    let started = std::time::Instant::now();
     let mut header = String::new();
-    reader
-        .read_line(&mut header)
-        .await
-        .map_err(|e| transfer_err(format!("read sender header: {e}")))?;
+    transfer_step(
+        reader.read_line(&mut header),
+        "waiting for the sender's header",
+        0,
+        0,
+        started,
+    )
+    .await?;
     if header.trim().is_empty() {
         return Err(transfer_err("sender produced no header"));
     }
@@ -445,13 +537,19 @@ async fn receive_stream(
     let mut out = out;
     while remaining > 0 {
         let want = (remaining as usize).min(buf.len());
-        let n = reader
-            .read(&mut buf[..want])
-            .await
-            .map_err(|e| transfer_err(format!("read file bytes: {e}")))?;
+        let received = header.size - remaining;
+        let n = transfer_step(
+            reader.read(&mut buf[..want]),
+            "receiving bytes from the sender",
+            received,
+            header.size,
+            started,
+        )
+        .await?;
         if n == 0 {
             return Err(transfer_err(format!(
-                "sender stream ended early: {remaining} of {} bytes missing",
+                "sender stream ended early at {}: {remaining} of {} bytes missing",
+                progress_note(received, header.size, started.elapsed()),
                 header.size
             )));
         }
@@ -462,10 +560,14 @@ async fn receive_stream(
     }
 
     let mut trailer = String::new();
-    reader
-        .read_line(&mut trailer)
-        .await
-        .map_err(|e| transfer_err(format!("read sender trailer: {e}")))?;
+    transfer_step(
+        reader.read_line(&mut trailer),
+        "waiting for the sender's trailer",
+        header.size,
+        header.size,
+        started,
+    )
+    .await?;
     let trailer: SendTrailer = serde_json::from_str(trailer.trim())
         .map_err(|e| transfer_err(format!("invalid sender trailer {trailer:?}: {e}")))?;
     let local_sha = format!("sha256:{}", hex::encode(hasher.finalize()));

@@ -203,6 +203,18 @@ are synchronous, cannot be undone, and have no resume/job machinery: a
 dropped connection fails the call, the destination is never left
 half-written, and the caller just retries.
 
+A stalled transfer is not the same as a slow one, and the difference is what a
+caller actually needs to know. There is deliberately **no total timeout**: a
+large file over a slow link legitimately takes hours, and any ceiling would
+kill healthy transfers. Instead each step is bounded by a stall window
+(`REMOTE_WORKSPACE_STALL_TIMEOUT_MS`, default 120 s) measuring only whether
+*anything* is still moving; crossing it fails with `transfer_stalled` and the
+byte position, so a transfer that died at 42 of 100 MiB says so. Every other
+transfer error carries the same position and average rate. Detecting the stall
+is not sufficient on its own: a sender that has stopped producing will also
+never exit, so the child is killed before it is reaped -- otherwise the call
+hangs at the reap, precisely where the stall was supposed to surface.
+
 ## Undo
 
 Applies only to recorded file mutations (`create`, `edit`, `delete`). Each

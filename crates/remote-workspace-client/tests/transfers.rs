@@ -570,3 +570,61 @@ async fn large_file_roundtrip_uses_bounded_memory() {
         "client peak RSS grew by {grown_kib} KiB during a 256 MiB roundtrip"
     );
 }
+
+// A sender that announces bytes, delivers some, then goes silent without
+// closing the stream. Before stall detection this hung forever and was
+// indistinguishable from a slow link; it must now fail with a stalled-transfer
+// error that reports how far it got.
+#[tokio::test]
+async fn a_silent_sender_is_reported_as_stalled_not_hung() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let remote = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let ep = endpoint(remote.path());
+    let client = connect(&ep).await;
+
+    // 1 MiB announced, 64 KiB delivered, then silence past the stall window.
+    // `exec` matters: the sleep must REPLACE the shell rather than be its
+    // child, so killing the transfer child actually releases the pipe instead
+    // of leaving an orphan holding stdout open.
+    let stub = local.path().join("silent.sh");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\necho '{\"size\":1048576}'\nhead -c 65536 /dev/zero\nexec sleep 600\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let silent_ep = Endpoint::Local {
+        server_bin: stub.to_string_lossy().into_owned(),
+        root: remote.path().to_string_lossy().into_owned(),
+        state_base: None,
+        config: None,
+    };
+
+    std::env::set_var("REMOTE_WORKSPACE_STALL_TIMEOUT_MS", "1500");
+    let dest = local.path().join("stalled.bin");
+    let started = std::time::Instant::now();
+    let err = download_file(&client, &silent_ep, "whatever.bin", &dest, false)
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    std::env::remove_var("REMOTE_WORKSPACE_STALL_TIMEOUT_MS");
+
+    let text = err.to_string();
+    assert!(
+        text.contains("transfer_stalled"),
+        "must carry the stable code: {text}"
+    );
+    // The whole point: the message says it *was* moving, and how far it got.
+    assert!(
+        text.contains("0.1/1.0 MiB"),
+        "must report progress so a stall is distinguishable from a dead link: {text}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "must give up on the stall window, not hang: took {elapsed:?}"
+    );
+    assert!(!dest.exists(), "no partial target may be left behind");
+    assert!(part_files(local.path()).is_empty());
+}
