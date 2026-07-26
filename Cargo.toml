@@ -1,20 +1,20 @@
 [workspace]
 members = [
-    "crates/agent-remote-protocol",
-    "crates/agent-remote-server",
-    "crates/agent-remote-client",
-    "crates/agent-remote-mcp",
+    "crates/remote-workspace-protocol",
+    "crates/remote-workspace-server",
+    "crates/remote-workspace-client",
+    "crates/remote-workspace-mcp",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-agent-remote-protocol = { path = "crates/agent-remote-protocol" }
-agent-remote-client = { path = "crates/agent-remote-client" }
+remote-workspace-protocol = { path = "crates/remote-workspace-protocol" }
+remote-workspace-client = { path = "crates/remote-workspace-client" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

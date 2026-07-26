@@ -23,6 +23,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/agent-remote-server-linux-x86_64-musl
+            dist/remote-workspace-server-linux-x86_64-musl
             dist/release-manifest.json
             dist/SHA256SUMS

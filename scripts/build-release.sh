@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build a static server artifact and emit the release manifest + checksums that
-# `agent-remote workspace add` consumes. Used by CI (.github/workflows/release.yml)
+# `remote-workspace workspace add` consumes. Used by CI (.github/workflows/release.yml)
 # and locally to produce a testable release base:
 #
 #   scripts/build-release.sh                 # -> dist/ for the host musl target
@@ -15,15 +15,15 @@ TARGET="${1:-x86_64-unknown-linux-musl}"
 OUT_DIR="${2:-dist}"
 
 case "$TARGET" in
-  x86_64-unknown-linux-musl)  OS=linux; ARCH=x86_64;  FILE=agent-remote-server-linux-x86_64-musl ;;
-  aarch64-unknown-linux-musl) OS=linux; ARCH=aarch64; FILE=agent-remote-server-linux-aarch64-musl ;;
+  x86_64-unknown-linux-musl)  OS=linux; ARCH=x86_64;  FILE=remote-workspace-server-linux-x86_64-musl ;;
+  aarch64-unknown-linux-musl) OS=linux; ARCH=aarch64; FILE=remote-workspace-server-linux-aarch64-musl ;;
   *) echo "unsupported target: $TARGET" >&2; exit 1 ;;
 esac
 
-echo "Building agent-remote-server for $TARGET" >&2
-cargo build --release --target "$TARGET" -p agent-remote-server
+echo "Building remote-workspace-server for $TARGET" >&2
+cargo build --release --target "$TARGET" -p remote-workspace-server
 
-BIN="target/$TARGET/release/agent-remote-server"
+BIN="target/$TARGET/release/remote-workspace-server"
 mkdir -p "$OUT_DIR"
 cp "$BIN" "$OUT_DIR/$FILE"
 chmod +x "$OUT_DIR/$FILE"

@@ -1,6 +1,6 @@
 # Design
 
-Why agent-remote works the way it does, and what the protocol guarantees.
+Why remote-workspace works the way it does, and what the protocol guarantees.
 For installation and usage see the [README](../README.md); this document is
 the rationale and the reference for behavior that callers depend on.
 
@@ -23,20 +23,20 @@ agent can reach many heterogeneous environments through one interface.
 coding agent
     |
     v
-agent-remote (CLI)  or  agent-remote-mcp (MCP server)
+remote-workspace (CLI)  or  remote-workspace-mcp (MCP server)
     |
     v
-agent-remote client library
+remote-workspace client library
     |
     | persistent SSH stdio connection
     v
-agent-remote-server  --  fs ops, exec, operation log, workspace root
+remote-workspace-server  --  fs ops, exec, operation log, workspace root
 ```
 
 The client starts the remote process itself:
 
 ```bash
-ssh <host> agent-remote-server --root /path/to/project
+ssh <host> remote-workspace-server --root /path/to/project
 ```
 
 SSH stdin/stdout is the transport: no public IP, no extra port, no daemon. If
@@ -159,8 +159,8 @@ a separate short-lived process per transfer, spawned over the same SSH
 configuration:
 
 ```text
-agent-remote-server --transfer-receive <staging> --expect-size N   # stdin -> staging file
-agent-remote-server --transfer-send <path> --root R [--state-base B]  # header JSON, raw bytes, trailer JSON -> stdout
+remote-workspace-server --transfer-receive <staging> --expect-size N   # stdin -> staging file
+remote-workspace-server --transfer-send <path> --root R [--state-base B]  # header JSON, raw bytes, trailer JSON -> stdout
 ```
 
 These raw modes never open the operation store, so they cannot conflict with
@@ -169,7 +169,7 @@ the same workspace/`@scratch` boundary rules as every other operation.
 
 Uploads are three-phase on the control plane: `upload_prepare` validates the
 target (parent must exist; existing targets refused unless `overwrite`) and
-creates a staging file named `.agent-remote-upload.<name>.<random>.part` in
+creates a staging file named `.remote-workspace-upload.<name>.<random>.part` in
 the target's directory; `upload_commit` verifies the staged size, installs
 atomically (rename for overwrite, hard-link-then-unlink for race-free
 no-replace), fsyncs, and appends the operation record; `upload_abort` deletes
@@ -188,7 +188,7 @@ documented trust model).
 
 A hard-killed or interrupted upload can leave its staging file behind.
 Cleanup is conservative and best-effort: only files matching the exact
-`.agent-remote-upload.*.part` convention, older than 24 hours by mtime (an
+`.remote-workspace-upload.*.part` convention, older than 24 hours by mtime (an
 active upload keeps its mtime fresh), and not registered as in-flight are
 deleted. The sweep runs where staging files accumulate -- the target
 directory on each `upload_prepare` -- and over the whole workspace and
@@ -217,7 +217,7 @@ All server state lives **outside the workspace**, on the remote host, keyed by
 the canonical root path:
 
 ```text
-~/.agent-remote/state/<rootname>-<hash>/
+~/.remote-workspace/state/<rootname>-<hash>/
 |-- operations.jsonl   one record per operation (fs + exec)
 |-- requests.jsonl     request idempotency table
 |-- blobs/             before-content for undo
@@ -276,7 +276,7 @@ Adding a workspace is one local command, which probes the target, installs or
 upgrades the server, proves the workspace works, and records it:
 
 ```bash
-agent-remote workspace add robot --host robot@workstation --root /home/robot/project
+remote-workspace workspace add robot --host robot@workstation --root /home/robot/project
 ```
 
 This is a **local CLI operation and never an MCP tool**. It expands the set of
@@ -289,14 +289,14 @@ them. There is no `add_workspace`, `install_server`, or reload tool.
 a new release is a separate verb:
 
 ```bash
-agent-remote workspace upgrade [<name>]
+remote-workspace workspace upgrade [<name>]
 ```
 
 It installs once per SSH identity however many workspaces share it, leaves
 user-managed binaries alone, and never edits the fleet file -- upgrading a
 server changes no authorization, so it needs none of `add`'s transaction.
 
-Two version fields are reported by `agent-remote-server --version-json`, a
+Two version fields are reported by `remote-workspace-server --version-json`, a
 stable probe that mutates nothing, needs no config, and never starts the JSONL
 server:
 
@@ -314,21 +314,21 @@ protocol, older software is upgraded; equal or newer software is left alone; a
 newer protocol is refused with `client_too_old` and the remote is untouched.
 
 Each SSH identity has exactly one active managed binary at
-`~/.local/lib/agent-remote/agent-remote-server`, shared by every workspace on
+`~/.local/lib/remote-workspace/remote-workspace-server`, shared by every workspace on
 that host -- installation is a property of the identity, not the workspace.
 There is no multi-version layout: GitHub Releases is the historical archive.
 The client never builds the server; CI publishes static musl artifacts plus a
 machine-readable `release-manifest.json` and `SHA256SUMS`, and the client
 downloads the artifact pinned to *its own* release (never an unpinned
 `latest`), verifies its SHA-256, and caches it under
-`~/.cache/agent-remote/server/`. The remote host needs no internet access.
+`~/.cache/remote-workspace/server/`. The remote host needs no internet access.
 Passing an explicit `--remote-bin` marks the server user-managed: checked for
 compatibility, never installed or overwritten.
 
 Installation is atomic and downgrade-proof. The artifact is uploaded to a
 unique temporary path, and the *uploaded binary installs itself*: it verifies
 its own SHA-256, takes an advisory `flock` on
-`~/.local/lib/agent-remote/install.lock`, re-probes what is installed **inside
+`~/.local/lib/remote-workspace/install.lock`, re-probes what is installed **inside
 the lock** (a version observed before acquiring it is not authoritative), and
 renames itself into place only if the installed server is strictly older.
 Doing the compare-and-swap inside one locked process is what makes concurrent
@@ -356,14 +356,14 @@ final write lands. Errors carry stable codes naming the failing layer --
 ## MCP integration
 
 Operational conventions for agents live only in
-[`AGENT_GUIDANCE.md`](../crates/agent-remote-mcp/AGENT_GUIDANCE.md), which the
+[`AGENT_GUIDANCE.md`](../crates/remote-workspace-mcp/AGENT_GUIDANCE.md), which the
 MCP server embeds verbatim in `ServerInfo.instructions` -- it is a shipped
 asset of that crate, not prose about it. This section documents protocol
 behavior rather than duplicating those instructions.
 
-`agent-remote-mcp` wraps the client library in an MCP stdio server that
+`remote-workspace-mcp` wraps the client library in an MCP stdio server that
 multiplexes a fleet of named workspaces, declared in a single TOML file
-(`~/.agent-remote/workspaces.toml` by convention). A workspace is a `(machine,
+(`~/.remote-workspace/workspaces.toml` by convention). A workspace is a `(machine,
 root)` pair; "two roots on one machine" and "one root each on two machines"
 are the same concept, because all server-side state is already keyed per
 root. The agent sees tools: `list_workspaces`, `list_directory`,
@@ -428,15 +428,15 @@ through a shell), and RPC frameworks.
 
 ```text
 crates/
-  agent-remote-protocol/  # pure serde types: messages, errors, records
-  agent-remote-server/    # workspace boundary, fs ops, exec, operation store
-  agent-remote-client/    # transport, typed API, client log, CLI
-  agent-remote-mcp/       # MCP stdio server on top of the client
+  remote-workspace-protocol/  # pure serde types: messages, errors, records
+  remote-workspace-server/    # workspace boundary, fs ops, exec, operation store
+  remote-workspace-client/    # transport, typed API, client log, CLI
+  remote-workspace-mcp/       # MCP stdio server on top of the client
 ```
 
 Tests live inside each crate: protocol round-trips, in-process server tests,
 end-to-end tests that spawn the real server binary over stdio, and MCP tests
-that drive the real `agent-remote-mcp` binary.
+that drive the real `remote-workspace-mcp` binary.
 
 ## Non-goals
 

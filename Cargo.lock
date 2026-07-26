@@ -3,79 +3,6 @@
 version = 4
 
 [[package]]
-name = "agent-remote-client"
-version = "0.2.1"
-dependencies = [
- "agent-remote-protocol",
- "agent-remote-server",
- "anyhow",
- "clap",
- "hex",
- "libc",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "toml",
- "toml_edit",
- "tracing",
- "tracing-subscriber",
- "ureq",
-]
-
-[[package]]
-name = "agent-remote-mcp"
-version = "0.2.1"
-dependencies = [
- "agent-remote-client",
- "agent-remote-protocol",
- "agent-remote-server",
- "anyhow",
- "clap",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "agent-remote-protocol"
-version = "0.2.1"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "agent-remote-server"
-version = "0.2.1"
-dependencies = [
- "agent-remote-protocol",
- "anyhow",
- "clap",
- "hex",
- "libc",
- "parking_lot",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -914,6 +841,79 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "remote-workspace-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "libc",
+ "remote-workspace-protocol",
+ "remote-workspace-server",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+]
+
+[[package]]
+name = "remote-workspace-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "remote-workspace-client",
+ "remote-workspace-protocol",
+ "remote-workspace-server",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "remote-workspace-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "remote-workspace-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "libc",
+ "parking_lot",
+ "remote-workspace-protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "ring"

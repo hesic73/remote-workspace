@@ -1,4 +1,4 @@
-# agent-remote
+# remote-workspace
 
 **Remote workspaces for coding agents, over plain SSH.**
 
@@ -8,7 +8,7 @@ runs one small binary exposing atomic file operations, bounded command
 execution, undo, and a durable operation log.
 
 ```
-coding agent  ->  agent-remote (CLI) or agent-remote-mcp (MCP)  ->  ssh stdio  ->  agent-remote-server  ->  workspace
+coding agent  ->  remote-workspace (CLI) or remote-workspace-mcp (MCP)  ->  ssh stdio  ->  remote-workspace-server  ->  workspace
 ```
 
 The transport is JSON Lines over an SSH process's stdin/stdout: no daemon, no
@@ -21,13 +21,13 @@ Design rationale and protocol details: [`docs/design.md`](docs/design.md).
 ## Install
 
 Download the server artifact from a
-[release](https://github.com/hesic73/agent-remote/releases) or build locally:
+[release](https://github.com/hesic73/remote-workspace/releases) or build locally:
 
 ```bash
 cargo build --release
-# target/release/agent-remote         client + CLI
-# target/release/agent-remote-server  server (runs on the remote host)
-# target/release/agent-remote-mcp     MCP server for coding agents
+# target/release/remote-workspace         client + CLI
+# target/release/remote-workspace-server  server (runs on the remote host)
+# target/release/remote-workspace-mcp     MCP server for coding agents
 ```
 
 You do not need to copy the server to the remote host yourself -- `workspace
@@ -40,7 +40,7 @@ Onboard a workspace once. This probes the host, installs or upgrades the
 server, runs a real protocol round-trip, and records the workspace:
 
 ```bash
-agent-remote workspace add robot --host robot@workstation --root /home/robot/project
+remote-workspace workspace add robot --host robot@workstation --root /home/robot/project
 ```
 
 ```text
@@ -48,7 +48,7 @@ Adding workspace 'robot'
   SSH                    connected
   Remote platform        linux-x86_64
   Workspace root         valid
-  Server                 installed 0.2.0
+  Server                 installed 0.1.0
   Protocol               1
   Workspace probe        passed
   Fleet configuration    updated
@@ -58,8 +58,8 @@ Workspace 'robot' is ready.
 Then use it, from an agent through MCP or directly from the CLI:
 
 ```bash
-agent-remote --host robot@workstation --root /home/robot/project ls .
-agent-remote --host robot@workstation --root /home/robot/project exec -- pytest -q
+remote-workspace --host robot@workstation --root /home/robot/project ls .
+remote-workspace --host robot@workstation --root /home/robot/project exec -- pytest -q
 ```
 
 `--local` runs the server as a subprocess instead of over SSH, which is handy
@@ -68,10 +68,10 @@ for trying things out on one machine.
 ## Use from a coding agent (MCP)
 
 ```bash
-claude mcp add agent-remote -- agent-remote-mcp     # one entry serves every workspace
+claude mcp add remote-workspace -- remote-workspace-mcp     # one entry serves every workspace
 ```
 
-`agent-remote-mcp` multiplexes the whole fleet over stdio. Tools:
+`remote-workspace-mcp` multiplexes the whole fleet over stdio. Tools:
 `list_workspaces`, `list_directory`, `read_file`, `create_file`, `edit_file`,
 `delete_file`, `run_command`, `upload_file`, `download_file`, `undo`,
 `history`, `operation_get`, `request_status`.
@@ -82,13 +82,13 @@ tool except `list_workspaces` takes a **required** `workspace` argument, so a
 call can never land on the wrong machine because a default filled itself in.
 
 Conventions for the agent itself live in one canonical place,
-[`AGENT_GUIDANCE.md`](crates/agent-remote-mcp/AGENT_GUIDANCE.md), which the MCP
+[`AGENT_GUIDANCE.md`](crates/remote-workspace-mcp/AGENT_GUIDANCE.md), which the MCP
 server embeds verbatim in its initialization instructions.
 
 Diagnose the fleet without starting the MCP:
 
 ```bash
-agent-remote-mcp --check
+remote-workspace-mcp --check
 ```
 
 It validates the config and probes every workspace once, printing per-workspace
@@ -100,7 +100,7 @@ failure says which layer broke.
 
 ### Fleet
 
-Workspaces live in `~/.agent-remote/workspaces.toml` (override with
+Workspaces live in `~/.remote-workspace/workspaces.toml` (override with
 `--fleet`). A workspace is a `(machine, root)` pair; two roots on one machine
 and one root each on two machines are the same concept.
 
@@ -108,7 +108,7 @@ and one root each on two machines are the same concept.
 [workspaces.robot]
 host = "robot@workstation"   # omit to run on the local machine
 root = "/home/robot/project"
-bin = "/home/robot/.local/lib/agent-remote/agent-remote-server"
+bin = "/home/robot/.local/lib/remote-workspace/remote-workspace-server"
 label = "ROS workspace"      # optional, shown by list_workspaces
 # config / state_base optional, same meaning as the server flags
 ```
@@ -154,7 +154,7 @@ Server state (history, undo blobs, idempotency table, scratch) lives **outside
 the workspace**, on the remote host, keyed by canonical root path:
 
 ```
-~/.agent-remote/state/<rootname>-<hash>/
+~/.remote-workspace/state/<rootname>-<hash>/
 ```
 
 So the workspace has no dotdir, nothing shows up in `git status`, and a
@@ -188,7 +188,7 @@ administrative command with its own `--host`/`--root` and does not use them.
 
 ## Upgrades
 
-`agent-remote-server --version-json` reports two fields: `software_version`
+`remote-workspace-server --version-json` reports two fields: `software_version`
 (the release) and `protocol_version` (bumped only on incompatible changes).
 A newer client upgrades an older server; an older client never downgrades a
 newer one.
@@ -196,8 +196,8 @@ newer one.
 Update the local client, then pick up the new server everywhere:
 
 ```bash
-agent-remote workspace upgrade            # every workspace in the fleet
-agent-remote workspace upgrade robot      # or just one
+remote-workspace workspace upgrade            # every workspace in the fleet
+remote-workspace workspace upgrade robot      # or just one
 ```
 
 `upgrade` installs once per SSH identity however many workspaces share it,
@@ -206,7 +206,7 @@ never edits the fleet file. (`add` is for new workspaces only; it refuses a
 name already in the fleet.)
 
 Each SSH identity holds one managed server at
-`~/.local/lib/agent-remote/agent-remote-server`, shared by every workspace on
+`~/.local/lib/remote-workspace/remote-workspace-server`, shared by every workspace on
 that host. Passing `--remote-bin` marks a server user-managed: checked for
 compatibility, never installed or overwritten. Releases are cut by pushing a
 tag (`git tag -a vX.Y.Z && git push origin vX.Y.Z`), the only event that runs
@@ -217,10 +217,10 @@ checksums.
 
 ```
 crates/
-  agent-remote-protocol/  # pure serde types: messages, errors, records
-  agent-remote-server/    # workspace, fs ops, exec, operation store (binary)
-  agent-remote-client/    # transport, typed API, deploy, fleet, CLI (binary `agent-remote`)
-  agent-remote-mcp/       # MCP stdio server on top of the client (binary)
+  remote-workspace-protocol/  # pure serde types: messages, errors, records
+  remote-workspace-server/    # workspace, fs ops, exec, operation store (binary)
+  remote-workspace-client/    # transport, typed API, deploy, fleet, CLI (binary `remote-workspace`)
+  remote-workspace-mcp/       # MCP stdio server on top of the client (binary)
 ```
 
 ```bash
