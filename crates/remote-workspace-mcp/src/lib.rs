@@ -55,9 +55,14 @@ pub struct ListDirectoryInput {
         description = "Directory path relative to workspace, or @scratch/... for server-managed scratch"
     )]
     pub path: String,
-    #[schemars(description = "Entry offset to start at (default: 0)")]
+    #[serde(default)]
+    #[schemars(with = "usize", description = "Entry offset to start at (default: 0)")]
     pub offset: Option<usize>,
-    #[schemars(description = "Maximum entries to return (default and maximum: 1000)")]
+    #[serde(default)]
+    #[schemars(
+        with = "usize",
+        description = "Maximum entries to return (default and maximum: 1000)"
+    )]
     pub limit: Option<usize>,
 }
 
@@ -69,9 +74,17 @@ pub struct ReadFileInput {
         description = "File path relative to workspace, or @scratch/... for server-managed scratch"
     )]
     pub path: String,
-    #[schemars(description = "Byte offset to start reading from (default 0)")]
+    #[serde(default)]
+    #[schemars(
+        with = "u64",
+        description = "Byte offset to start reading from (default 0)"
+    )]
     pub offset: Option<u64>,
-    #[schemars(description = "Maximum bytes to read (default and hard maximum: 65536)")]
+    #[serde(default)]
+    #[schemars(
+        with = "u64",
+        description = "Maximum bytes to read (default and hard maximum: 65536)"
+    )]
     pub limit: Option<u64>,
 }
 
@@ -103,7 +116,9 @@ pub struct EditFileInput {
     pub old_text: String,
     #[schemars(description = "Replacement text; empty string deletes old_text")]
     pub new_text: String,
+    #[serde(default)]
     #[schemars(
+        with = "bool",
         description = "Replace every occurrence instead of failing when old_text is not unique (default: false)"
     )]
     pub replace_all: Option<bool>,
@@ -125,13 +140,23 @@ pub struct RunCommandInput {
     pub workspace: String,
     #[schemars(description = "Command and arguments, e.g. [\"pytest\", \"-q\"]")]
     pub argv: Vec<String>,
+    #[serde(default)]
     #[schemars(
+        with = "String",
         description = "Working directory relative to workspace, or @scratch/... (default: workspace root)"
     )]
     pub cwd: Option<String>,
-    #[schemars(description = "Environment profile name (configured server-side)")]
+    #[serde(default)]
+    #[schemars(
+        with = "String",
+        description = "Environment profile name (configured server-side)"
+    )]
     pub profile: Option<String>,
-    #[schemars(description = "Timeout in milliseconds (default: 300000; maximum: 3600000)")]
+    #[serde(default)]
+    #[schemars(
+        with = "u64",
+        description = "Timeout in milliseconds (default: 300000; maximum: 3600000)"
+    )]
     pub timeout_ms: Option<u64>,
 }
 
@@ -149,7 +174,11 @@ pub struct UndoInput {
 pub struct HistoryInput {
     #[schemars(description = "Workspace name (see list_workspaces)")]
     pub workspace: String,
-    #[schemars(description = "Maximum operations to return (default: 50; maximum: 100)")]
+    #[serde(default)]
+    #[schemars(
+        with = "usize",
+        description = "Maximum operations to return (default: 50; maximum: 100)"
+    )]
     pub limit: Option<usize>,
 }
 
@@ -179,7 +208,11 @@ pub struct UploadFileInput {
         description = "Destination path relative to workspace, or @scratch/... for server-managed scratch"
     )]
     pub remote_path: String,
-    #[schemars(description = "Replace an existing destination file (default: false)")]
+    #[serde(default)]
+    #[schemars(
+        with = "bool",
+        description = "Replace an existing destination file (default: false)"
+    )]
     pub overwrite: Option<bool>,
 }
 
@@ -193,7 +226,11 @@ pub struct DownloadFileInput {
     pub remote_path: String,
     #[schemars(description = "Absolute or relative path of the local destination file")]
     pub local_path: String,
-    #[schemars(description = "Replace an existing destination file (default: false)")]
+    #[serde(default)]
+    #[schemars(
+        with = "bool",
+        description = "Replace an existing destination file (default: false)"
+    )]
     pub overwrite: Option<bool>,
 }
 

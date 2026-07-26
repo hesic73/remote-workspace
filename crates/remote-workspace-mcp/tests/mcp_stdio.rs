@@ -296,7 +296,92 @@ fn mcp_tools_list_has_expected_tools() {
                 "{name} must require workspace, requires {required:?}"
             );
         }
+
+        // Every parameter must advertise one concrete type and a description.
+        // An optional field left as `Option<T>` publishes `["integer","null"]`,
+        // which some MCP hosts collapse to an untyped schema and then send the
+        // value as a string -- the server rightly rejects it, and the tool
+        // becomes unusable from that host. Optional params are omitted rather
+        // than sent as null, so the non-nullable type is also the honest one.
+        let props = t["inputSchema"]["properties"].as_object().unwrap();
+        for (param, spec) in props {
+            let ty = &spec["type"];
+            assert!(
+                ty.is_string(),
+                "{name}.{param} must publish a single concrete type, got {ty}"
+            );
+            assert!(
+                spec["description"].is_string(),
+                "{name}.{param} has no description"
+            );
+        }
+        // ... and an optional one must not have become required in the process.
+        for opt in [
+            "offset",
+            "limit",
+            "cwd",
+            "profile",
+            "timeout_ms",
+            "replace_all",
+            "overwrite",
+        ] {
+            assert!(
+                !required.contains(&opt),
+                "{name}.{opt} is optional but was marked required"
+            );
+        }
     }
+}
+
+// Optional parameters must work both ways round: omitted entirely, and passed
+// as their declared JSON type.
+#[test]
+fn mcp_optional_parameters_are_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = McpSession::spawn(dir.path().to_str().unwrap());
+    s.initialize();
+
+    let (e, _) = s.tool(
+        "create_file",
+        serde_json::json!({"workspace": "test", "path": "a.txt", "content": "x\ny\n"}),
+    );
+    assert!(!e);
+
+    // Omitted.
+    let (e, text) = s.tool("history", serde_json::json!({"workspace": "test"}));
+    assert!(!e, "history without limit: {text}");
+    let (e, text) = s.tool(
+        "run_command",
+        serde_json::json!({"workspace": "test", "argv": ["true"]}),
+    );
+    assert!(!e, "run_command without optionals: {text}");
+
+    // Supplied, with the declared types.
+    let (e, text) = s.tool(
+        "history",
+        serde_json::json!({"workspace": "test", "limit": 1}),
+    );
+    assert!(!e, "history with integer limit: {text}");
+    assert_eq!(text.lines().filter(|l| !l.trim().is_empty()).count(), 1);
+
+    let (e, text) = s.tool(
+        "run_command",
+        serde_json::json!({"workspace": "test", "argv": ["pwd"], "cwd": ".", "timeout_ms": 30000}),
+    );
+    assert!(!e, "run_command with cwd/timeout_ms: {text}");
+
+    let (e, text) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "a.txt", "offset": 2, "limit": 2}),
+    );
+    assert!(!e, "read_file with offset/limit: {text}");
+    assert!(text.starts_with('y'), "offset/limit not applied: {text}");
+
+    let (e, text) = s.tool(
+        "list_directory",
+        serde_json::json!({"workspace": "test", "path": ".", "offset": 0, "limit": 1}),
+    );
+    assert!(!e, "list_directory with offset/limit: {text}");
 }
 
 #[test]
