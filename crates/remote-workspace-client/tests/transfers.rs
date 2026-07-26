@@ -50,6 +50,32 @@ fn sha256_of(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
 }
 
+/// The stall window is read from a process-wide environment variable, so the
+/// tests that shorten it must not overlap: one clearing the variable while the
+/// other is mid-transfer would silently restore the two-minute default and
+/// leave that test waiting on it.
+static STALL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Shorten the stall window for the duration of the guard. The lock is held,
+/// never read: it exists to keep these tests from overlapping.
+struct ShortStallWindow {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ShortStallWindow {
+    fn ms(ms: u64) -> Self {
+        let lock = STALL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("REMOTE_WORKSPACE_STALL_TIMEOUT_MS", ms.to_string());
+        Self { _lock: lock }
+    }
+}
+
+impl Drop for ShortStallWindow {
+    fn drop(&mut self) {
+        std::env::remove_var("REMOTE_WORKSPACE_STALL_TIMEOUT_MS");
+    }
+}
+
 #[tokio::test]
 async fn upload_download_small_text_roundtrip() {
     let remote = tempfile::tempdir().unwrap();
@@ -388,6 +414,13 @@ async fn child_death_mid_transfer_leaves_no_target_or_temp_files() {
         .await
         .unwrap_err();
     assert!(matches!(err, ClientError::Transfer(_)));
+    // A broken transfer must say how far it got, so "died immediately" and
+    // "died near the end" are distinguishable without a second connection.
+    let text = err.to_string();
+    assert!(
+        text.contains("ended early") && text.contains("MiB"),
+        "a truncated download must report its byte position: {text}"
+    );
     assert!(!dest.exists(), "target must not appear after a dead sender");
     assert!(part_files(local.path()).is_empty());
 
@@ -399,6 +432,11 @@ async fn child_death_mid_transfer_leaves_no_target_or_temp_files() {
         .await
         .unwrap_err();
     assert!(matches!(err, ClientError::Transfer(_)));
+    let text = err.to_string();
+    assert!(
+        text.contains("MiB") && text.contains("KiB/s"),
+        "a failed upload must report position and rate: {text}"
+    );
     assert!(!remote.path().join("u.bin").exists());
     assert!(part_files(remote.path()).is_empty());
 }
@@ -602,14 +640,13 @@ async fn a_silent_sender_is_reported_as_stalled_not_hung() {
         config: None,
     };
 
-    std::env::set_var("REMOTE_WORKSPACE_STALL_TIMEOUT_MS", "1500");
+    let _window = ShortStallWindow::ms(1500);
     let dest = local.path().join("stalled.bin");
     let started = std::time::Instant::now();
     let err = download_file(&client, &silent_ep, "whatever.bin", &dest, false)
         .await
         .unwrap_err();
     let elapsed = started.elapsed();
-    std::env::remove_var("REMOTE_WORKSPACE_STALL_TIMEOUT_MS");
 
     let text = err.to_string();
     assert!(
@@ -627,4 +664,57 @@ async fn a_silent_sender_is_reported_as_stalled_not_hung() {
     );
     assert!(!dest.exists(), "no partial target may be left behind");
     assert!(part_files(local.path()).is_empty());
+}
+
+// The upload direction needs the same guarantee: a receiver that stops reading
+// wedges the write once the pipe buffer fills. Without a stall window this
+// blocks forever with the staging file still reserved on the remote.
+#[tokio::test]
+async fn a_receiver_that_stops_reading_is_reported_as_stalled() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let remote = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let ep = endpoint(remote.path());
+    let client = connect(&ep).await;
+
+    // Never reads stdin and never exits; `exec` so killing the child really
+    // releases the pipe instead of orphaning a sleep that still holds it.
+    let stub = local.path().join("deaf.sh");
+    std::fs::write(&stub, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let deaf_ep = Endpoint::Local {
+        server_bin: stub.to_string_lossy().into_owned(),
+        root: remote.path().to_string_lossy().into_owned(),
+        state_base: None,
+        config: None,
+    };
+
+    // Comfortably larger than a pipe buffer, so the write blocks part-way.
+    let src = local.path().join("big.bin");
+    std::fs::write(&src, vec![3u8; 4 * 1024 * 1024]).unwrap();
+
+    let _window = ShortStallWindow::ms(1500);
+    let started = std::time::Instant::now();
+    let err = upload_file(&client, &deaf_ep, &src, "u.bin", false)
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    let text = err.to_string();
+    assert!(
+        text.contains("transfer_stalled"),
+        "must carry the stable code: {text}"
+    );
+    assert!(
+        text.contains("MiB") && text.contains("KiB/s"),
+        "must report how far it got: {text}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "must give up on the stall window, not hang: took {elapsed:?}"
+    );
+    // The reserved staging file must still be cleaned up via upload_abort.
+    assert!(!remote.path().join("u.bin").exists());
+    assert!(part_files(remote.path()).is_empty());
 }
