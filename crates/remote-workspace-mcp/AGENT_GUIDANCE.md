@@ -4,7 +4,7 @@ This server manages one or more named workspaces, each a directory on a configur
 
 The normal workflow:
 
-1. Call `list_workspaces` when the workspace name is unknown.
+1. Call `list_workspaces` when the workspace name is unknown. Its `connection` field is only what this process last observed (`connected`, `not_connected`, `disconnected`, `in_use`) -- a hint about which workspaces are warm, never a guarantee that one is reachable now. Do not check it before acting; act, and read the error if there is one.
 2. Inspect with `list_directory` and `read_file`; follow the returned offsets to page through large results.
 3. Use `create_file` only for new text files; it refuses existing paths.
 4. Use `edit_file` for every modification to an existing text file: pass the hash from `read_file` as `base_hash` and copy `old_text` exactly from the current content.

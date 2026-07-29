@@ -278,7 +278,7 @@ async fn end_to_end_gc_prunes_history() {
             .unwrap()
             .new_hash;
     }
-    let g = client.gc(Some(1)).await.unwrap();
+    let g = client.gc(Some(1), None).await.unwrap();
     assert_eq!(g.removed_operations, 2);
     assert_eq!(g.retained_operations, 1);
 

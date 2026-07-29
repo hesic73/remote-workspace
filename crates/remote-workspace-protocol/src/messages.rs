@@ -108,6 +108,12 @@ pub enum RequestBody {
     Gc {
         #[serde(default)]
         keep: Option<usize>,
+        /// Delete scratch files untouched for this many days. Absent means
+        /// report scratch usage without deleting anything: scratch holds
+        /// agent-produced artifacts, so there is deliberately no default
+        /// retention that could quietly discard them.
+        #[serde(default)]
+        scratch_older_than_days: Option<u32>,
     },
 }
 
@@ -276,7 +282,7 @@ pub struct UndoResult {
     pub new_hash: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcResult {
     pub removed_operations: usize,
     pub removed_requests: usize,
@@ -284,6 +290,26 @@ pub struct GcResult {
     /// Stale upload staging files (interrupted uploads) deleted by this gc.
     #[serde(default)]
     pub removed_stale_staging: usize,
+    /// Scratch usage. Always reported, because nothing else bounds this
+    /// directory: unlike operations, blobs and the request table it has no
+    /// retention of its own, so growth is invisible until the disk fills.
+    #[serde(default)]
+    pub scratch: ScratchUsage,
+}
+
+/// What scratch holds, and what this gc removed from it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScratchUsage {
+    pub files: usize,
+    pub bytes: u64,
+    /// Age in days of the least recently modified file, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_days: Option<u32>,
+    /// Non-zero only when `scratch_older_than_days` asked for a deletion.
+    #[serde(default)]
+    pub removed_files: usize,
+    #[serde(default)]
+    pub removed_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

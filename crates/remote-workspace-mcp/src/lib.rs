@@ -249,6 +249,26 @@ struct WorkspaceHandle {
     slot: tokio::sync::Mutex<Option<Arc<Client>>>,
 }
 
+impl WorkspaceHandle {
+    /// What this process last observed about the connection, without touching
+    /// the network. Deliberately not a health check: probing every workspace
+    /// would open an SSH session and take each server's state lock, which is
+    /// itself a way to break a workspace someone is using. A real tool call
+    /// still reports `connect_failed` / `probe_failed` at the moment it
+    /// matters -- this is only a hint about which workspaces are warm.
+    fn last_seen(&self) -> &'static str {
+        match self.slot.try_lock() {
+            // Held means a call is connecting or in flight right now.
+            Err(_) => "in_use",
+            Ok(slot) => match slot.as_deref() {
+                None => "not_connected",
+                Some(c) if c.is_closed() => "disconnected",
+                Some(_) => "connected",
+            },
+        }
+    }
+}
+
 /// A workspace in the current fleet snapshot: its connection handle plus the
 /// display label (which, unlike the endpoint, can change without dropping the
 /// connection).
@@ -437,7 +457,12 @@ impl RemoteWorkspaceServer {
                     Endpoint::Ssh { host, root, .. } => (host.as_str(), root.as_str()),
                     Endpoint::Local { root, .. } => ("(local)", root.as_str()),
                 };
-                let mut row = serde_json::json!({"name": name, "host": host, "root": root});
+                let mut row = serde_json::json!({
+                    "name": name,
+                    "host": host,
+                    "root": root,
+                    "connection": entry.handle.last_seen(),
+                });
                 if let Some(label) = &entry.label {
                     row["label"] = serde_json::Value::String(label.clone());
                 }

@@ -497,11 +497,19 @@ impl Client {
         }
     }
 
+    /// `scratch_older_than_days` is opt-in: without it scratch is measured and
+    /// reported but nothing in it is deleted.
     pub async fn gc(
         &self,
         keep: Option<usize>,
+        scratch_older_than_days: Option<u32>,
     ) -> Result<remote_workspace_protocol::GcResult, ClientError> {
-        let (_, msg) = self.send_request(RequestBody::Gc { keep }).await?;
+        let (_, msg) = self
+            .send_request(RequestBody::Gc {
+                keep,
+                scratch_older_than_days,
+            })
+            .await?;
         match Self::unpack(msg)? {
             remote_workspace_protocol::ResultBody::Gc(g) => Ok(g),
             _ => Err(ClientError::Server(ProtocolError::new(
