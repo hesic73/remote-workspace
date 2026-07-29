@@ -257,6 +257,24 @@ replay after reconnect) are exactly the reason the state must outlive them.
   records, their blobs, and request entries no longer referenced. The `gc`
   operation does the same on demand. Undo of a pruned operation returns
   `OPERATION_NOT_FOUND`; pruned ids are never reallocated.
+* **Scratch expires.** Files idle -- neither written nor read -- beyond
+  `--scratch-max-age-days` (default 7; 0 disables) are deleted, and `gc`
+  reports what scratch holds either way. *Idle* counts reads deliberately:
+  under `relatime` an agent paging through a large log leaves mtime untouched,
+  so evicting on mtime alone would delete the file mid-read. There is no
+  daemon; the sweep rides on server startup and a marker file limits it to
+  once a day per workspace, so a reconnect normally costs one stat. Growth and
+  cleanup are therefore driven by the same event -- use -- and a workspace
+  nobody touches is never swept because it is not growing either.
+
+  Age is the only criterion. A size ceiling was considered and rejected twice
+  over: a total cap deletes the wrong file (something perfectly good goes
+  because something else was just written, which makes the same workflow
+  succeed or fail depending on unrelated activity), and a per-file cap cannot
+  express the distinction that matters -- in real usage here the legitimate
+  logs are *larger* than the checkpoints that do not belong. What scratch is
+  for is a question of kind, not bytes, so it is stated in the agent guidance
+  instead: working material yes, results no.
 * **Single writer.** The state directory is protected by an exclusive flock
   held for the server's lifetime (auto-released by the kernel on death). A
   second server on the same root fails fast with a clear error; reconnects

@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::config::ServerConfig;
 use crate::exec;
 use crate::fs_ops;
+use crate::scratch;
 use crate::store::{OperationStore, StoredResult};
 use crate::transfer;
 use crate::undo;
@@ -22,6 +23,7 @@ pub struct Server {
     pub store: OperationStore,
     pub config: Arc<ServerConfig>,
     history_limit: Option<usize>,
+    scratch_max_age: Option<std::time::Duration>,
     /// Pending uploads (staging file created, commit not yet received).
     /// In-memory only: staging paths must never be persisted, and the staging
     /// files die with the connection anyway.
@@ -42,10 +44,14 @@ pub struct ServerOptions {
     /// Keep only this many recent operations; pruned automatically at startup
     /// and on `gc`. `None` disables automatic pruning.
     pub history_limit: Option<usize>,
+    /// Evict scratch files idle beyond this, on `gc` and at most once a day at
+    /// startup. `None` disables sweeping.
+    pub scratch_max_age: Option<std::time::Duration>,
 }
 
 impl Server {
     pub fn new(opts: ServerOptions) -> anyhow::Result<Self> {
+        let state_dir = opts.state_dir.clone();
         let workspace = Arc::new(Workspace::new(opts.root, opts.state_dir.join("scratch"))?);
         let store = OperationStore::new(opts.state_dir).map_err(|e| anyhow::anyhow!(e))?;
         // Run WAL recovery before serving: reconcile any prepared markers left
@@ -74,6 +80,20 @@ impl Server {
                 );
             }
         }
+        // Rate-limited inside: a server starts on every reconnect, so the
+        // common path here must be a single stat.
+        if let Some(u) = opts
+            .scratch_max_age
+            .and_then(|age| scratch::sweep_if_due(&state_dir, &workspace.scratch_root, age))
+        {
+            if u.removed_files > 0 {
+                tracing::info!(
+                    removed_files = u.removed_files,
+                    removed_bytes = u.removed_bytes,
+                    "swept scratch at startup"
+                );
+            }
+        }
         let config = match opts.config_path {
             Some(p) => {
                 let text = std::fs::read_to_string(&p)
@@ -87,6 +107,7 @@ impl Server {
             store,
             config,
             history_limit: opts.history_limit,
+            scratch_max_age: opts.scratch_max_age,
             uploads: transfer::UploadRegistry::default(),
         })
     }
@@ -478,11 +499,14 @@ impl Server {
                             &in_flight,
                             transfer::STALE_STAGING_MAX_AGE,
                         );
+                        let scratch =
+                            scratch::enforce(&self.workspace.scratch_root, self.scratch_max_age);
                         ResultBody::Gc(remote_workspace_protocol::GcResult {
                             removed_operations: s.removed_operations,
                             removed_requests: s.removed_requests,
                             retained_operations: s.retained_operations,
                             removed_stale_staging,
+                            scratch,
                         })
                     }),
                     None => Err(remote_workspace_protocol::ProtocolError::new(

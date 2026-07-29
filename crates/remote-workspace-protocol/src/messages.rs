@@ -276,7 +276,7 @@ pub struct UndoResult {
     pub new_hash: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcResult {
     pub removed_operations: usize,
     pub removed_requests: usize,
@@ -284,6 +284,22 @@ pub struct GcResult {
     /// Stale upload staging files (interrupted uploads) deleted by this gc.
     #[serde(default)]
     pub removed_stale_staging: usize,
+    #[serde(default)]
+    pub scratch: ScratchUsage,
+}
+
+/// What scratch holds after this gc, and what it removed to get there.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScratchUsage {
+    pub files: usize,
+    pub bytes: u64,
+    /// Days since the least recently used surviving file was written or read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_days: Option<u32>,
+    #[serde(default)]
+    pub removed_files: usize,
+    #[serde(default)]
+    pub removed_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

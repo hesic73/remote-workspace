@@ -48,6 +48,13 @@ struct Args {
     #[arg(long, default_value_t = 1000)]
     history_limit: usize,
 
+    /// Evict scratch files idle (neither written nor read) for this many days,
+    /// on gc and at most once a day at startup. 0 disables sweeping. Scratch is
+    /// a staging area, not storage: anything worth keeping belongs in the
+    /// workspace or on the local machine.
+    #[arg(long, default_value_t = 7)]
+    scratch_max_age_days: u64,
+
     /// Internal raw data plane: stream stdin into this staging file (created
     /// by upload_prepare on the resident server). Does not open the state
     /// directory, so it cannot conflict with the resident server's lock.
@@ -131,6 +138,8 @@ async fn main() -> anyhow::Result<()> {
         state_dir,
         config_path: args.config,
         history_limit: (args.history_limit > 0).then_some(args.history_limit),
+        scratch_max_age: (args.scratch_max_age_days > 0)
+            .then(|| std::time::Duration::from_secs(args.scratch_max_age_days * 86_400)),
     };
 
     Server::new(opts)?.run_stdio().await?;

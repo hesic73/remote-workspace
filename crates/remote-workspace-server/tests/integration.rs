@@ -73,6 +73,7 @@ async fn harness_at_with_owned(
         state_dir: log_dir,
         config_path,
         history_limit: None,
+        scratch_max_age: None,
     })
     .unwrap();
 
@@ -2475,6 +2476,7 @@ async fn corrupted_middle_log_line_fails_startup() {
         state_dir: log_dir,
         config_path: None,
         history_limit: None,
+        scratch_max_age: None,
     });
     assert!(
         result.is_err(),
@@ -2516,6 +2518,7 @@ async fn corrupted_trailing_log_line_tolerated() {
         state_dir: log_dir,
         config_path: None,
         history_limit: None,
+        scratch_max_age: None,
     });
     assert!(
         server.is_ok(),
@@ -2840,6 +2843,7 @@ async fn crash_mid_utf8_codepoint_tail_recovered() {
         state_dir: log_dir.clone(),
         config_path: None,
         history_limit: None,
+        scratch_max_age: None,
     });
     assert!(
         server.is_ok(),
@@ -3059,6 +3063,7 @@ async fn startup_prune_respects_history_limit() {
         state_dir: log_dir,
         config_path: None,
         history_limit: Some(1),
+        scratch_max_age: None,
     })
     .unwrap();
     let ops = server.store.history(None);
@@ -3312,6 +3317,7 @@ async fn server_startup_rejects_config_with_unknown_fields() {
             state_dir: root.path().join(".remote-workspace"),
             config_path: Some(config_path),
             history_limit: None,
+            scratch_max_age: None,
         });
         assert!(result.is_err(), "config must be rejected at startup: {bad}");
     }

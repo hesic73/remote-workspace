@@ -14,7 +14,9 @@ The normal workflow:
 8. Use `undo` only for recorded file mutations (create/edit/delete), and only while the file is unchanged since.
 9. Never automatically retry `run_command` after an uncertain transport failure, because the command may already have produced side effects.
 
-Normal relative paths address the workspace. Paths beginning with `@scratch/` address the workspace's server-managed scratch area; commands receive its physical path in `$REMOTE_WORKSPACE_SCRATCH`. Use scratch for logs and other runtime artifacts.
+Normal relative paths address the workspace. Paths beginning with `@scratch/` address the workspace's server-managed scratch area; commands receive its physical path in `$REMOTE_WORKSPACE_SCRATCH`.
+
+Scratch is transient and shared by every session using that workspace. It is the right place for your own working material -- analysis scripts you wrote, intermediate output, command logs -- which would otherwise clutter the user's project. It is not storage: files idle for a week are deleted without warning. Anything meant to last belongs in the workspace, or on the local machine via `download_file`. Do not park results there -- trained weights, recordings, datasets -- and do not treat a file you left in scratch last week as still being there.
 
 `run_command` is synchronous and owns its process tree. The result contains the termination reason, duration, and a bounded preview of each stream (first 4 KiB, last 12 KiB); redirect full output to `$REMOTE_WORKSPACE_SCRATCH` and read the `@scratch/...` file incrementally. After the command exits, output collection waits briefly for the pipes to close, then kills leftover descendants and sets `drain_timed_out` in the result. For work that must outlive one call, use a remote-native supervisor such as tmux and write its logs to scratch; a successful launcher exit does not confirm the detached workload succeeded.
 
