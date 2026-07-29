@@ -116,18 +116,12 @@ enum Command {
     Op { operation_id: String },
     /// Query the status of a previously-issued request.
     Status { request_id: String },
-    /// Prune stored history down to the most recent operations, and report
-    /// scratch usage.
+    /// Prune stored history down to the most recent operations.
     Gc {
         /// How many operations to keep. Defaults to the server's
         /// --history-limit.
         #[arg(long)]
         keep: Option<usize>,
-        /// Also delete scratch files untouched for this many days. Omit to
-        /// only measure scratch: it holds agent-produced artifacts, so nothing
-        /// there is discarded unless you name an age.
-        #[arg(long, value_name = "DAYS")]
-        scratch_older_than: Option<u32>,
     },
     /// Manage the local workspace fleet. Trusted local admin operations, not
     /// exposed to the agent through MCP.
@@ -337,11 +331,8 @@ async fn async_main_real() -> Result<()> {
             let r = client.request_status(&request_id).await?;
             println!("{}", serde_json::to_string_pretty(&r)?);
         }
-        Command::Gc {
-            keep,
-            scratch_older_than,
-        } => {
-            let r = client.gc(keep, scratch_older_than).await?;
+        Command::Gc { keep } => {
+            let r = client.gc(keep).await?;
             println!("{}", serde_json::to_string_pretty(&r)?);
         }
         // Handled before the connect path.

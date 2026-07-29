@@ -464,10 +464,7 @@ impl Server {
                     .with_stdout(&stdout)
                     .await;
             }
-            RequestBody::Gc {
-                keep,
-                scratch_older_than_days,
-            } => {
+            RequestBody::Gc { keep } => {
                 let guard = self.store.write_guard().await;
                 let result = match keep.or(self.history_limit) {
                     Some(k) => self.store.prune(k).map(|s| {
@@ -481,17 +478,11 @@ impl Server {
                             &in_flight,
                             transfer::STALE_STAGING_MAX_AGE,
                         );
-                        let scratch = transfer::scratch_usage(
-                            &self.workspace.scratch_root,
-                            scratch_older_than_days
-                                .map(|d| std::time::Duration::from_secs(d as u64 * 86_400)),
-                        );
                         ResultBody::Gc(remote_workspace_protocol::GcResult {
                             removed_operations: s.removed_operations,
                             removed_requests: s.removed_requests,
                             retained_operations: s.retained_operations,
                             removed_stale_staging,
-                            scratch,
                         })
                     }),
                     None => Err(remote_workspace_protocol::ProtocolError::new(

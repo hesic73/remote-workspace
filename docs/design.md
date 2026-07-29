@@ -257,14 +257,6 @@ replay after reconnect) are exactly the reason the state must outlive them.
   records, their blobs, and request entries no longer referenced. The `gc`
   operation does the same on demand. Undo of a pruned operation returns
   `OPERATION_NOT_FOUND`; pruned ids are never reallocated.
-* **Scratch is the exception, deliberately.** Operations, blobs and the request
-  table are all bounded; scratch is not, because it holds what the agent
-  produced -- logs, but also weights and recordings -- and a retention default
-  would eventually discard them without being asked. `gc` therefore always
-  *reports* scratch (files, bytes, age of the oldest) so growth is visible, and
-  deletes only when given an explicit `scratch_older_than_days`. Like the stale
-  staging sweep, this runs on `gc` alone and never at startup: a server starts
-  on every reconnect, and walking the tree there would tax large workspaces.
 * **Single writer.** The state directory is protected by an exclusive flock
   held for the server's lifetime (auto-released by the kernel on death). A
   second server on the same root fails fast with a clear error; reconnects

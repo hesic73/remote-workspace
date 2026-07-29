@@ -180,7 +180,7 @@ state directory is always safe. Growth is bounded by `--history-limit`
 | `history [--limit N]` | List recorded operations |
 | `op <operation_id>` | Details of one operation |
 | `status <request_id>` | Status of a previously-issued request |
-| `gc [--keep N] [--scratch-older-than DAYS]` | Prune stored history; always reports scratch usage, deletes from it only if given an age |
+| `gc [--keep N]` | Prune stored history |
 
 Connection flags: `--host`, `--root`, `--remote-bin`, `--config`,
 `--state-base`, `--local`, `--log <file>`. `workspace add` is an

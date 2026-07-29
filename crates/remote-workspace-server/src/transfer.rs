@@ -455,64 +455,6 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Measure scratch, and optionally delete files untouched for `max_age`.
-///
-/// Scratch is the one state directory with no retention of its own: operations,
-/// blobs and the request table are all bounded by `--history-limit`, while
-/// scratch only ever grows. Reporting is therefore unconditional, but deleting
-/// is not -- scratch holds agent-produced artifacts (logs, but also weights and
-/// recordings), so a caller must name an age rather than inherit a default that
-/// could quietly discard them. Does not follow symlinks.
-pub fn scratch_usage(
-    root: &Path,
-    max_age: Option<std::time::Duration>,
-) -> remote_workspace_protocol::ScratchUsage {
-    let mut usage = remote_workspace_protocol::ScratchUsage::default();
-    let now = std::time::SystemTime::now();
-    let mut oldest = std::time::Duration::ZERO;
-    scan_scratch(root, max_age, now, &mut oldest, &mut usage);
-    if usage.files > 0 {
-        usage.oldest_days = Some((oldest.as_secs() / 86_400) as u32);
-    }
-    usage
-}
-
-fn scan_scratch(
-    dir: &Path,
-    max_age: Option<std::time::Duration>,
-    now: std::time::SystemTime,
-    oldest: &mut std::time::Duration,
-    usage: &mut remote_workspace_protocol::ScratchUsage,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            scan_scratch(&entry.path(), max_age, now, oldest, usage);
-            continue;
-        }
-        if !ft.is_file() {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        let age = meta
-            .modified()
-            .ok()
-            .and_then(|m| now.duration_since(m).ok())
-            .unwrap_or_default();
-        if max_age.is_some_and(|limit| age > limit) && std::fs::remove_file(entry.path()).is_ok() {
-            usage.removed_files += 1;
-            usage.removed_bytes += meta.len();
-            continue;
-        }
-        usage.files += 1;
-        usage.bytes += meta.len();
-        *oldest = (*oldest).max(age);
-    }
-}
-
 #[cfg(test)]
 mod sweep_tests {
     use super::*;

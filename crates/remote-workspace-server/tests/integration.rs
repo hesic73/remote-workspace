@@ -2951,13 +2951,7 @@ async fn gc_prunes_operations_blobs_and_requests() {
         }
         assert!(log_dir.join("blobs/op-2.before").exists());
 
-        h.send(&req(
-            "gc",
-            RequestBody::Gc {
-                keep: Some(1),
-                scratch_older_than_days: None,
-            },
-        ));
+        h.send(&req("gc", RequestBody::Gc { keep: Some(1) }));
         match h.recv().await {
             ServerMessage::Result {
                 result: ResultBody::Gc(g),
@@ -3076,13 +3070,7 @@ async fn startup_prune_respects_history_limit() {
 #[tokio::test]
 async fn gc_without_keep_or_limit_rejected() {
     let mut h = harness().await;
-    h.send(&req(
-        "gc",
-        RequestBody::Gc {
-            keep: None,
-            scratch_older_than_days: None,
-        },
-    ));
+    h.send(&req("gc", RequestBody::Gc { keep: None }));
     match h.recv().await {
         ServerMessage::Error { error, .. } => assert_eq!(error.code, ErrorCode::InvalidRequest),
         other => panic!("unexpected: {other:?}"),
@@ -3327,68 +3315,4 @@ async fn server_startup_rejects_config_with_unknown_fields() {
         });
         assert!(result.is_err(), "config must be rejected at startup: {bad}");
     }
-}
-
-/// The typed GcResult from one gc request, matching the style used above.
-async fn gc_result(h: &mut Harness, rid: &str, keep: usize, days: Option<u32>) -> GcResult {
-    h.send(&req(
-        rid,
-        RequestBody::Gc {
-            keep: Some(keep),
-            scratch_older_than_days: days,
-        },
-    ));
-    match h.recv().await {
-        ServerMessage::Result {
-            result: ResultBody::Gc(g),
-            ..
-        } => g,
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-// scratch is the one state directory with no retention of its own, so gc must
-// at least make its size visible. Deleting from it is opt-in: it holds
-// agent-produced artifacts, and a default retention could discard them.
-#[tokio::test]
-async fn gc_reports_scratch_and_deletes_only_when_asked() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    std::fs::create_dir_all(&log_dir).unwrap();
-    let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-
-    let scratch = log_dir.join("scratch");
-    std::fs::create_dir_all(scratch.join("nested")).unwrap();
-    std::fs::write(scratch.join("fresh.log"), "fresh").unwrap();
-    std::fs::write(scratch.join("nested/old.log"), "0123456789").unwrap();
-
-    // Age the nested file well past any window used below.
-    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
-    std::fs::File::options()
-        .write(true)
-        .open(scratch.join("nested/old.log"))
-        .unwrap()
-        .set_modified(old)
-        .unwrap();
-
-    // Reporting only: nothing may be deleted without an explicit age.
-    let g = gc_result(&mut h, "g0", 100, None).await;
-    assert_eq!(g.scratch.files, 2);
-    assert_eq!(g.scratch.bytes, 15);
-    assert!(g.scratch.oldest_days.unwrap() >= 9);
-    assert_eq!(g.scratch.removed_files, 0);
-    assert!(scratch.join("nested/old.log").exists());
-
-    // A window that covers nothing still deletes nothing.
-    let g = gc_result(&mut h, "g1", 100, Some(30)).await;
-    assert_eq!(g.scratch.removed_files, 0);
-    assert!(scratch.join("nested/old.log").exists());
-
-    // Explicit window: only the aged file goes, and it is reported.
-    let g = gc_result(&mut h, "g2", 100, Some(7)).await;
-    assert_eq!(g.scratch.removed_files, 1);
-    assert_eq!(g.scratch.removed_bytes, 10);
-    assert_eq!(g.scratch.files, 1, "the fresh file must survive");
-    assert!(!scratch.join("nested/old.log").exists());
-    assert!(scratch.join("fresh.log").exists());
 }
