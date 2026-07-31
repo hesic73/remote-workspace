@@ -3,6 +3,9 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Build-only dry run, so the artifacts can be verified before a tag exists.
+  # Publishing is gated on the ref actually being a tag.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,16 +16,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl target
-        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        # The client links rustls, whose crypto backend ships C code, so a
+        # static build needs a musl C compiler as well as the Rust target.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
 
-      - name: Build static artifact and manifest
+      - name: Build static artifacts and manifest
         run: scripts/build-release.sh x86_64-unknown-linux-musl dist
 
+      - name: Check artifacts run and self-report
+        run: |
+          set -e
+          for b in remote-workspace remote-workspace-mcp; do
+            dist/$b-linux-x86_64-musl --version
+          done
+          dist/remote-workspace-server-linux-x86_64-musl --version-json
+          file dist/remote-workspace-linux-x86_64-musl | grep -q "statically linked" \
+            || { echo "client is not statically linked"; exit 1; }
+
       - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            dist/remote-workspace-linux-x86_64-musl
             dist/remote-workspace-server-linux-x86_64-musl
+            dist/remote-workspace-mcp-linux-x86_64-musl
             dist/release-manifest.json
             dist/SHA256SUMS
