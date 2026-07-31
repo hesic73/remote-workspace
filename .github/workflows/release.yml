@@ -34,8 +34,12 @@ jobs:
             dist/$b-linux-x86_64-musl --version
           done
           dist/remote-workspace-server-linux-x86_64-musl --version-json
-          file dist/remote-workspace-linux-x86_64-musl | grep -q "statically linked" \
-            || { echo "client is not statically linked"; exit 1; }
+          # Matches both "statically linked" and the "static-pie linked" that
+          # current musl toolchains produce.
+          for b in remote-workspace remote-workspace-server remote-workspace-mcp; do
+            file "dist/$b-linux-x86_64-musl" | grep -q "static" \
+              || { echo "$b is not statically linked"; exit 1; }
+          done
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
