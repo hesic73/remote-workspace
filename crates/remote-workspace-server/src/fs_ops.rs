@@ -1,3 +1,4 @@
+use std::io::{Read, Seek};
 use std::path::Path;
 
 use remote_workspace_protocol::{
@@ -89,7 +90,7 @@ pub fn read(
     limit: Option<u64>,
 ) -> Result<ResultBody, ProtocolError> {
     let abs = ws.resolve(path)?;
-    let meta = std::fs::symlink_metadata(&abs).map_err(|e| {
+    let meta = std::fs::metadata(&abs).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ProtocolError::new(ErrorCode::NotFound, format!("not found: {path}"))
         } else {
@@ -102,69 +103,91 @@ pub fn read(
             format!("is a directory: {path}"),
         ));
     }
-    let bytes = std::fs::read(&abs)
-        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("read failed: {e}")))?;
-    // Hash the raw bytes so the returned hash matches what mutations compute
-    // (they hash raw bytes too). Reject non-UTF-8 content rather than silently
-    // returning a lossy conversion: a coding agent should not edit a binary
-    // file through a text-oriented API.
-    let full_content = String::from_utf8(bytes.clone()).map_err(|_| {
-        ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            "file is not valid UTF-8; binary reads are not supported",
-        )
-    })?;
-    let full_hash = crate::hash::hash_bytes(&bytes);
-    // offset/limit are BYTE positions but must land on UTF-8 char boundaries,
-    // otherwise indexing panics. Reject (not truncate) a non-boundary offset so
-    // a bad request can never crash the handler. Use checked arithmetic so huge
-    // values cannot overflow.
-    let offset_u64 = offset.unwrap_or(0);
-    let limit_u64 = limit.unwrap_or(READ_DEFAULT_LIMIT);
-    if limit_u64 == 0 || limit_u64 > READ_MAX_LIMIT {
+    let file_len = meta.len();
+    let limit = limit.unwrap_or(READ_DEFAULT_LIMIT);
+    if limit == 0 || limit > READ_MAX_LIMIT {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
             format!("read limit must be between 1 and {READ_MAX_LIMIT} bytes"),
         ));
     }
-    if offset_u64 > full_content.len() as u64 {
+    let start = offset.unwrap_or(0);
+    if start > file_len {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
-            format!(
-                "offset {offset_u64} is past end of file ({} bytes)",
-                full_content.len()
-            ),
+            format!("offset {start} is past end of file ({file_len} bytes)"),
         ));
     }
-    let start = offset_u64 as usize;
-    if !full_content.is_char_boundary(start) {
+
+    // Read only the requested window (plus enough slack to finish a codepoint
+    // straddling its end), never the whole file: paging through a multi-GB exec
+    // log is the documented way to read large output, so cost per page must
+    // depend on the page, not on the file.
+    let mut file = std::fs::File::open(&abs).map_err(io_read_error)?;
+    file.seek(std::io::SeekFrom::Start(start))
+        .map_err(io_read_error)?;
+    let mut window = Vec::new();
+    file.take(limit + UTF8_TAIL_SLACK)
+        .read_to_end(&mut window)
+        .map_err(io_read_error)?;
+
+    // offset/limit are BYTE positions but must land on UTF-8 char boundaries.
+    // In valid UTF-8 a boundary is any byte that is not a continuation byte;
+    // content that is not valid UTF-8 is rejected below. Reject (not truncate)
+    // a non-boundary offset so a bad request cannot yield mojibake.
+    if window.first().is_some_and(|b| is_continuation(*b)) {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
             format!("offset {start} is not on a UTF-8 character boundary"),
         ));
     }
-    let end = match start.checked_add(limit_u64 as usize) {
-        Some(e) => e.min(full_content.len()),
-        None => full_content.len(),
-    };
-    // Walk FORWARD to the next char boundary at or after `end`. If we instead
-    // rounded down, a multi-byte first codepoint with a tiny limit would
-    // produce an empty page with truncated=true forever (the caller could never
-    // make progress). Rounding up guarantees at least one codepoint is returned
-    // whenever data remains and limit > 0.
-    let end = if end >= full_content.len() {
-        full_content.len()
+    // Cut at `limit`, then walk FORWARD to the next char boundary. If we
+    // instead rounded down, a multi-byte first codepoint with a tiny limit
+    // would produce an empty page with truncated=true forever (the caller could
+    // never make progress). Rounding up guarantees at least one codepoint is
+    // returned whenever data remains and limit > 0.
+    let mut end = window.len().min(limit as usize);
+    while end < window.len() && is_continuation(window[end]) {
+        end += 1;
+    }
+    window.truncate(end);
+    // Reject non-UTF-8 content rather than silently returning a lossy
+    // conversion: a coding agent should not edit a binary file through a
+    // text-oriented API.
+    let content = String::from_utf8(window).map_err(|_| {
+        ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "file is not valid UTF-8; binary reads are not supported",
+        )
+    })?;
+    let next_offset = start + end as u64;
+    let truncated = next_offset < file_len;
+    // The hash exists to be passed back as `edit`'s base_hash, and `edit`
+    // refuses files above MAX_TEXT_BYTES. Hashing a larger file would re-read
+    // it in full on every page for a value nothing can consume.
+    let hash = if file_len <= MAX_TEXT_BYTES as u64 {
+        crate::hash::hash_file(&abs).map_err(io_read_error)?
     } else {
-        nearest_char_boundary_at_or_after(&full_content, end)
+        None
     };
-    let truncated = end < full_content.len();
-    let content = full_content[start..end].to_string();
     Ok(ResultBody::Read(ReadResult {
         content,
-        hash: Some(full_hash),
+        hash,
         truncated,
-        next_offset: truncated.then_some(end as u64),
+        next_offset: truncated.then_some(next_offset),
     }))
+}
+
+/// Extra bytes read past `limit` so a page ending mid-codepoint can be
+/// extended to the next boundary; a UTF-8 sequence is at most 4 bytes.
+const UTF8_TAIL_SLACK: u64 = 3;
+
+fn is_continuation(byte: u8) -> bool {
+    byte & 0xC0 == 0x80
+}
+
+fn io_read_error(e: std::io::Error) -> ProtocolError {
+    ProtocolError::new(ErrorCode::IoError, format!("read failed: {e}"))
 }
 
 pub const READ_DEFAULT_LIMIT: u64 = 65536;
@@ -313,7 +336,6 @@ pub fn create(
         path,
         None,
         new_hash.clone(),
-        None,
     )?;
     // WAL step 2: exclusive atomic install.
     atomic_create_bytes(&abs, content.as_bytes(), path)?;
@@ -367,22 +389,31 @@ pub fn edit(
         ));
     }
     let abs = ws.resolve(path)?;
-    if !abs.exists() {
-        return Err(ProtocolError::new(
-            ErrorCode::NotFound,
-            format!("not found: {path}; new files are created with create, not edit"),
-        ));
+    // Enforce the size cap from metadata, before hashing or reading: a file
+    // above the cap is rejected either way, and reading it first is precisely
+    // the cost the cap exists to avoid.
+    match std::fs::metadata(&abs) {
+        Ok(meta) if meta.len() > MAX_TEXT_BYTES as u64 => {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "file exceeds {MAX_TEXT_BYTES} bytes; edit does not support files this large"
+                ),
+            ))
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("not found: {path}; new files are created with create, not edit"),
+            ))
+        }
+        Err(e) => return Err(ProtocolError::new(ErrorCode::IoError, format!("{e}"))),
     }
     let current = check_base_hash(&abs, &Some(base_hash.to_string()))?;
     let original = std::fs::read(&abs)
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("read failed: {e}")))?;
-    if original.len() > MAX_TEXT_BYTES {
-        return Err(ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            format!("file exceeds {MAX_TEXT_BYTES} bytes; edit does not support files this large"),
-        ));
-    }
-    let original_str = String::from_utf8(original.clone()).map_err(|_| {
+    let original_str = String::from_utf8(original).map_err(|_| {
         ProtocolError::new(
             ErrorCode::InvalidRequest,
             "file is not valid UTF-8; editing binary files is unsupported",
@@ -424,7 +455,6 @@ pub fn edit(
         path,
         current.clone(),
         new_hash.clone(),
-        Some(&original),
     )?;
     let old_hash = current.clone();
     atomic_write_bytes(&abs, new_content.as_bytes())?;
@@ -458,7 +488,6 @@ pub fn delete(
             format!("not a file: {path}"),
         ));
     }
-    let before_blob = std::fs::read(&abs).ok();
     let before_hash = hash_file(&abs)?;
     if before_hash.is_none() {
         return Err(ProtocolError::new(
@@ -474,7 +503,6 @@ pub fn delete(
         path,
         before_hash.clone(),
         "sha256:".into(),
-        before_blob.as_deref(),
     )?;
     std::fs::remove_file(&abs)
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("remove failed: {e}")))?;
@@ -537,18 +565,6 @@ fn entry_for(client_path: &str, abs: &Path, meta: &std::fs::Metadata) -> FileEnt
             executable: mode & 0o111 != 0,
         }),
     }
-}
-
-/// Smallest index >= `target` (and <= `s.len()`) that is a UTF-8 char
-/// boundary. Used so a byte-based limit that lands inside a codepoint still
-/// returns at least one codepoint, guaranteeing pagination makes progress.
-fn nearest_char_boundary_at_or_after(s: &str, target: usize) -> usize {
-    let target = target.min(s.len());
-    let mut i = target;
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
 }
 
 #[cfg(test)]
@@ -619,6 +635,42 @@ mod read_tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn read_pages_large_file_without_hashing_it() {
+        // Above the edit cap the hash has no consumer, so a page must not pay
+        // for one -- the file is only touched over the requested window.
+        let dir = tempdir().unwrap();
+        let big = vec![b'x'; MAX_TEXT_BYTES + 1024];
+        std::fs::write(dir.path().join("big.log"), &big).unwrap();
+        let w = Workspace {
+            root: dir.path().to_path_buf(),
+            scratch_root: dir.path().join("scratch"),
+        };
+        let offset = MAX_TEXT_BYTES as u64;
+        match read(&w, "big.log", Some(offset), Some(64)).unwrap() {
+            ResultBody::Read(r) => {
+                assert_eq!(r.content.len(), 64);
+                assert_eq!(r.hash, None, "no hash above the edit cap");
+                assert!(r.truncated);
+                assert_eq!(r.next_offset, Some(offset + 64));
+            }
+            _ => panic!("wrong body"),
+        }
+    }
+
+    #[test]
+    fn read_at_end_of_file_returns_empty_final_page() {
+        let (_d, w) = ws_with("f.txt", "hi");
+        match read(&w, "f.txt", Some(2), Some(8)).unwrap() {
+            ResultBody::Read(r) => {
+                assert_eq!(r.content, "");
+                assert!(!r.truncated);
+                assert_eq!(r.next_offset, None);
+            }
+            _ => panic!("wrong body"),
+        }
     }
 
     #[test]

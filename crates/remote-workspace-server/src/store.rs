@@ -74,7 +74,6 @@ struct RequestLogLine {
 ///
 ///   operations.jsonl   AnyOperationRecord per completed operation
 ///   requests.jsonl     one line per request lifecycle
-///   blobs/<op>.before  original bytes before an fs mutation (for undo)
 ///   scratch/           agent-visible runtime artifacts
 ///
 /// The async `write_lock` serializes all mutating handlers, so the in-memory
@@ -84,7 +83,6 @@ pub struct OperationStore {
     log_dir: PathBuf,
     operations_path: PathBuf,
     requests_path: PathBuf,
-    blobs_dir: PathBuf,
     next_id: Arc<Mutex<u64>>,
     records: Arc<Mutex<Vec<AnyOperationRecord>>>,
     requests: Arc<Mutex<HashMap<String, RequestEntry>>>,
@@ -104,12 +102,20 @@ pub struct PruneStats {
 
 impl OperationStore {
     pub fn new(log_dir: PathBuf) -> Result<Self, ProtocolError> {
-        let blobs_dir = log_dir.join("blobs");
         std::fs::create_dir_all(&log_dir).map_err(io_to_protocol)?;
-        std::fs::create_dir_all(&blobs_dir).map_err(io_to_protocol)?;
         // Grace period covers reconnects racing a predecessor that is still
         // shutting down after its stdin EOF.
         let dir_lock = acquire_dir_lock(&log_dir, std::time::Duration::from_secs(5))?;
+        // Before-content blobs existed only to serve `undo`. With that
+        // operation gone nothing can ever read them again, so a state
+        // directory written by an older server hands its blobs back as disk.
+        let legacy_blobs = log_dir.join("blobs");
+        if legacy_blobs.is_dir() {
+            match std::fs::remove_dir_all(&legacy_blobs) {
+                Ok(()) => tracing::info!("removed legacy undo blobs"),
+                Err(e) => tracing::warn!(error = %e, "could not remove legacy undo blobs"),
+            }
+        }
         let operations_path = log_dir.join("operations.jsonl");
         let requests_path = log_dir.join("requests.jsonl");
 
@@ -206,7 +212,6 @@ impl OperationStore {
             log_dir,
             operations_path,
             requests_path,
-            blobs_dir,
             next_id: Arc::new(Mutex::new(max_id)),
             records: Arc::new(Mutex::new(records)),
             requests: Arc::new(Mutex::new(requests)),
@@ -274,7 +279,7 @@ impl OperationStore {
                 (Some(b), Some(c)) if b == c => RecoveryOutcome::NoOp,
                 (None, None) => RecoveryOutcome::NoOp,
                 // "sha256:" sentinel means the file should NOT exist after the
-                // mutation (it was deleted / undo of creation).
+                // mutation (it was deleted).
                 (_, None) if p.expected_after_hash == FILE_DELETED_SENTINEL => {
                     RecoveryOutcome::Committed
                 }
@@ -407,8 +412,7 @@ impl OperationStore {
             g.push(any);
         }
         drop(g);
-        // Reconstruct the correct terminal result (Mutation vs UndoResult
-        // depending on kind) so replay/status work after restart.
+        // Reconstruct the terminal result so replay/status work after restart.
         let msg = self.reconstruct_result(&AnyOperationRecord::Fs(record));
         self.remember_result(&p.request_id, msg)?;
         Ok(())
@@ -428,7 +432,7 @@ impl OperationStore {
     ) -> Result<(), ProtocolError> {
         self.drop_prepared(&p.operation_id)?;
         let err = ProtocolError::new(
-            ErrorCode::UndoConflict,
+            ErrorCode::StaleFile,
             format!(
                 "startup recovery could not reconcile operation {}: {reason}",
                 p.operation_id
@@ -537,9 +541,9 @@ impl OperationStore {
     /// Write a "prepared" marker line for an fs mutation BEFORE touching the
     /// workspace, so a crash between the rename and the commit log can be
     /// detected on startup. The prepared record stores everything recovery
-    /// needs: the kind, the resolved path, the before hash (None = creation),
-    /// the expected after hash, and a before-content blob (when the file
-    /// existed). Returns the operation id to use for this mutation.
+    /// needs: the kind, the resolved path, the before hash (None = creation)
+    /// and the expected after hash. Returns the operation id to use for this
+    /// mutation.
     pub fn prepare_fs_record(
         &self,
         request_id: &str,
@@ -547,18 +551,8 @@ impl OperationStore {
         path: &str,
         before_hash: Option<String>,
         expected_after_hash: String,
-        before_blob: Option<&[u8]>,
     ) -> Result<String, ProtocolError> {
         let op_id = self.next_operation_id();
-        if let Some(blob) = before_blob {
-            let blob_path = self.blobs_dir.join(format!("{op_id}.before"));
-            std::fs::write(&blob_path, blob).map_err(|e| {
-                ProtocolError::new(ErrorCode::IoError, format!("blob write failed: {e}"))
-            })?;
-            crate::fsync::fsync_file_or_dir(&blob_path).map_err(|e| {
-                ProtocolError::new(ErrorCode::IoError, format!("blob fsync failed: {e}"))
-            })?;
-        }
         let prepared = PreparedRecord {
             operation_id: op_id.clone(),
             request_id: request_id.to_string(),
@@ -572,12 +566,10 @@ impl OperationStore {
         Ok(op_id)
     }
 
-    /// Commit an fs mutation: rewrite the prepared record with the real hashes
-    /// Commit an fs mutation by appending the final FsOperationRecord. The
-    /// before-content blob was already written by `prepare_fs_record`, so the
-    /// caller does not pass it here. Because operations.jsonl is append-only,
-    /// the committed record follows the prepared one; on load the committed
-    /// record supersedes the prepared marker.
+    /// Commit an fs mutation by appending the final FsOperationRecord. Because
+    /// operations.jsonl is append-only, the committed record follows the
+    /// prepared one; on load the committed record supersedes the prepared
+    /// marker.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_fs_record(
         &self,
@@ -598,7 +590,7 @@ impl OperationStore {
             timestamp_ms: now_ms(),
         };
         self.append_any_record(AnyOperationRecord::Fs(record.clone()))?;
-        // Update the in-memory table so future undo/history see the commit.
+        // Update the in-memory table so future history calls see the commit.
         let mut g = self.records.lock();
         if let Some(existing) = g.iter_mut().find(|r| r.operation_id() == operation_id) {
             *existing = AnyOperationRecord::Fs(record.clone());
@@ -623,10 +615,6 @@ impl OperationStore {
             .lock()
             .push(AnyOperationRecord::Transfer(record));
         Ok(())
-    }
-
-    pub fn load_before_blob(&self, operation_id: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.blobs_dir.join(format!("{operation_id}.before"))).ok()
     }
 
     pub fn find_record(&self, operation_id: &str) -> Option<AnyOperationRecord> {
@@ -670,35 +658,15 @@ impl OperationStore {
                     | OperationKind::Edit
                     | OperationKind::Write
                     | OperationKind::Patch
-                    | OperationKind::Delete => remote_workspace_protocol::ResultBody::Mutation(
+                    | OperationKind::Delete
+                    // A legacy undo record replays as the mutation it was.
+                    | OperationKind::Undo => remote_workspace_protocol::ResultBody::Mutation(
                         remote_workspace_protocol::MutationResult {
                             operation_id: fs.operation_id.clone(),
                             old_hash: fs.before_hash.clone(),
                             new_hash: fs.after_hash.clone(),
                         },
                     ),
-                    OperationKind::Undo => {
-                        // The undo's FsOperationRecord records:
-                        //   before_hash = hash before undo ran (the "after"
-                        //                 state of the original operation)
-                        //   after_hash  = hash after undo ran (the restored
-                        //                 content, or FILE_DELETED_SENTINEL)
-                        // restored_hash must be the RESTORED content's hash
-                        // (= after_hash for modification undo, None for
-                        // creation undo where the file was removed).
-                        let (restored_hash, new_hash) = if fs.after_hash == FILE_DELETED_SENTINEL {
-                            (None, fs.after_hash.clone())
-                        } else {
-                            (Some(fs.after_hash.clone()), fs.after_hash.clone())
-                        };
-                        remote_workspace_protocol::ResultBody::Undo(
-                            remote_workspace_protocol::UndoResult {
-                                operation_id: fs.operation_id.clone(),
-                                restored_hash,
-                                new_hash,
-                            },
-                        )
-                    }
                 };
                 ServerMessage::Result {
                     request_id: fs.request_id.clone(),
@@ -807,10 +775,9 @@ impl OperationStore {
         }
     }
 
-    /// Drop all but the `keep` most recent operation records, delete their
-    /// blobs, and drop request entries no longer referenced by a retained
-    /// record (in-flight entries are always kept). Both JSONL files are
-    /// rewritten atomically. Callers must hold the write guard, or run before
+    /// Drop all but the `keep` most recent operation records, and drop request
+    /// entries no longer referenced by a retained record (in-flight entries are
+    /// always kept). Both JSONL files are rewritten atomically. Callers must hold the write guard, or run before
     /// serving traffic.
     ///
     /// Dropping a request entry shrinks the idempotency window: replaying a
@@ -819,7 +786,7 @@ impl OperationStore {
         let mut records = self.records.lock();
         let mut requests = self.requests.lock();
         let removed_operations = records.len().saturating_sub(keep);
-        let dropped: Vec<AnyOperationRecord> = records.drain(..removed_operations).collect();
+        records.drain(..removed_operations);
         let retained_ids: std::collections::HashSet<&str> =
             records.iter().filter_map(record_request_id).collect();
         let before_requests = requests.len();
@@ -852,23 +819,6 @@ impl OperationStore {
             })
             .collect();
         rewrite_jsonl(&self.requests_path, request_lines.iter())?;
-        // Blobs go last: a crash after the log rewrites leaves only orphaned
-        // blob files (harmless), never a record pointing at a missing blob.
-        for r in &dropped {
-            let id = r.operation_id();
-            for suffix in ["before", "stdout", "stderr"] {
-                let p = self.blobs_dir.join(format!("{id}.{suffix}"));
-                if let Err(e) = std::fs::remove_file(&p) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        return Err(ProtocolError::new(
-                            ErrorCode::IoError,
-                            format!("remove blob {p:?}: {e}"),
-                        ));
-                    }
-                }
-            }
-        }
-        crate::fsync::fsync_dir(&self.blobs_dir).map_err(io_to_protocol)?;
         Ok(PruneStats {
             removed_operations,
             removed_requests,
@@ -920,8 +870,7 @@ impl OperationStore {
 }
 
 /// Sentinel value used as `expected_after_hash` when the mutation results in a
-/// deleted file (plain delete, or undo of a file creation). Recovery treats
-/// `current == None` as matching this sentinel.
+/// deleted file. Recovery treats `current == None` as matching this sentinel.
 pub(crate) const FILE_DELETED_SENTINEL: &str = "sha256:";
 
 fn record_request_id(r: &AnyOperationRecord) -> Option<&str> {
@@ -971,7 +920,8 @@ fn acquire_dir_lock(
                 ErrorCode::IoError,
                 format!(
                     "state directory {log_dir:?} is locked by another remote-workspace-server{holder}; \
-                     only one server may serve a workspace root at a time"
+                     one server serves a workspace root at a time, so another agent session is \
+                     already using this workspace -- use a different root or wait for it to exit"
                 ),
             ));
         }

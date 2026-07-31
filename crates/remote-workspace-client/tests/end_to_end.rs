@@ -141,22 +141,20 @@ async fn end_to_end_exec_returns_bounded_result() {
 }
 
 #[tokio::test]
-async fn end_to_end_undo_and_history() {
+async fn end_to_end_history_records_each_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let client = make_client(dir.path()).await;
     let w = client.create("u.txt", "first\n").await.unwrap();
-    let _ = client
+    let edit = client
         .edit("u.txt", &w.new_hash, "first\n", "second\n", false)
         .await
         .unwrap();
 
     let history = client.history(None).await.unwrap();
     assert_eq!(history.len(), 2);
-
-    let target = &history[1];
-    let _ = client.undo(target.operation_id()).await.unwrap();
+    assert_eq!(history[1].operation_id(), edit.operation_id);
     let r = client.read("u.txt", None, None).await.unwrap();
-    assert_eq!(r.content, "first\n");
+    assert_eq!(r.content, "second\n");
 }
 
 #[tokio::test]
@@ -287,7 +285,7 @@ async fn end_to_end_gc_prunes_history() {
 }
 
 #[tokio::test]
-async fn end_to_end_delete_and_undo() {
+async fn end_to_end_delete_is_permanent() {
     let dir = tempfile::tempdir().unwrap();
     let client = make_client(dir.path()).await;
 
@@ -296,12 +294,9 @@ async fn end_to_end_delete_and_undo() {
     assert!(!dir.path().join("d.txt").exists());
     assert_eq!(del.new_hash, "sha256:");
 
-    let u = client.undo(&del.operation_id).await.unwrap();
-    assert_ne!(u.new_hash, "sha256:");
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("d.txt")).unwrap(),
-        "precious"
-    );
+    let ops = client.history(None).await.unwrap();
+    assert_eq!(ops.last().unwrap().operation_id(), del.operation_id);
+    assert!(!dir.path().join("d.txt").exists());
 }
 
 // Drive the REAL `remote-workspace` CLI binary through a stub `ssh` on PATH. The

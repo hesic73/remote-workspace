@@ -12,7 +12,6 @@ use crate::fs_ops;
 use crate::scratch;
 use crate::store::{OperationStore, StoredResult};
 use crate::transfer;
-use crate::undo;
 use crate::workspace::Workspace;
 
 const HISTORY_DEFAULT_LIMIT: usize = 50;
@@ -398,41 +397,6 @@ impl Server {
                     .with_stdout(&stdout)
                     .await;
             }
-            RequestBody::Undo { operation_id } => {
-                let guard = self.store.write_guard().await;
-                let result = match self.store.find_record(&operation_id) {
-                    Some(remote_workspace_protocol::AnyOperationRecord::Fs(fs)) => {
-                        undo::undo(&self.workspace, &self.store, &guard, &request_id, &fs)
-                    }
-                    Some(remote_workspace_protocol::AnyOperationRecord::Exec(_)) => {
-                        Err(remote_workspace_protocol::ProtocolError::new(
-                            ErrorCode::InvalidRequest,
-                            "cannot undo an exec operation",
-                        ))
-                    }
-                    Some(remote_workspace_protocol::AnyOperationRecord::Transfer(_)) => {
-                        Err(remote_workspace_protocol::ProtocolError::new(
-                            ErrorCode::InvalidRequest,
-                            "transfer operations do not support undo",
-                        ))
-                    }
-                    // A Prepared/Aborted marker should have been reconciled at
-                    // startup. If one is still here, treat the op as not found.
-                    Some(
-                        remote_workspace_protocol::AnyOperationRecord::Prepared(_)
-                        | remote_workspace_protocol::AnyOperationRecord::Aborted(_),
-                    )
-                    | None => Err(remote_workspace_protocol::ProtocolError::new(
-                        ErrorCode::OperationNotFound,
-                        format!("operation not found: {operation_id}"),
-                    )),
-                };
-                drop(guard);
-                self.finish(&request_id, result)
-                    .await
-                    .with_stdout(&stdout)
-                    .await;
-            }
             RequestBody::History { limit } => {
                 let limit = limit.unwrap_or(HISTORY_DEFAULT_LIMIT);
                 let result = if limit > HISTORY_MAX_LIMIT {
@@ -758,7 +722,6 @@ fn op_kind_str(body: &RequestBody) -> &str {
         RequestBody::Edit { .. } => "edit",
         RequestBody::Exec { .. } => "exec",
         RequestBody::Delete { .. } => "delete",
-        RequestBody::Undo { .. } => "undo",
         RequestBody::UploadPrepare { .. } => "upload_prepare",
         RequestBody::UploadCommit { .. } => "upload_commit",
         RequestBody::UploadAbort { .. } => "upload_abort",

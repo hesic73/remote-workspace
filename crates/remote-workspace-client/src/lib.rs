@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use remote_workspace_protocol::{
     ErrorCode, ExecResult, FileEntry, ListResult, MutationResult, OperationDetails, ProtocolError,
-    ReadResult, Request, RequestBody, RequestId, RequestStatusResult, ServerMessage, UndoResult,
+    ReadResult, Request, RequestBody, RequestId, RequestStatusResult, ServerMessage,
 };
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -449,21 +449,6 @@ impl Client {
             _ => Err(ClientError::Server(ProtocolError::new(
                 ErrorCode::InvalidRequest,
                 "unexpected result body for download_record",
-            ))),
-        }
-    }
-
-    pub async fn undo(&self, operation_id: &str) -> Result<UndoResult, ClientError> {
-        let (_, msg) = self
-            .send_request(RequestBody::Undo {
-                operation_id: operation_id.into(),
-            })
-            .await?;
-        match Self::unpack(msg)? {
-            remote_workspace_protocol::ResultBody::Undo(u) => Ok(u),
-            _ => Err(ClientError::Server(ProtocolError::new(
-                ErrorCode::InvalidRequest,
-                "unexpected result body for undo",
             ))),
         }
     }

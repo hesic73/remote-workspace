@@ -16,4 +16,6 @@ pub use record::{
 };
 pub use version::{preflight, should_replace, InstallOutcome, Preflight, VersionInfo};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 2: the `undo` operation was removed. A client that still sends it must be
+/// refused rather than fail per-call, so this is an incompatible change.
+pub const PROTOCOL_VERSION: u32 = 2;

@@ -659,122 +659,6 @@ async fn history_rejects_limit_above_hard_maximum() {
 }
 
 #[tokio::test]
-async fn undo_restores_previous_content() {
-    let mut h = harness().await;
-    h.send(&req(
-        "w1",
-        RequestBody::Create {
-            path: "u.txt".into(),
-            content: "original\n".into(),
-        },
-    ));
-    let _ = h.recv().await;
-    h.send(&req(
-        "w2",
-        RequestBody::Edit {
-            path: "u.txt".into(),
-            base_hash: hash_of("original\n"),
-            old_text: "original".into(),
-            new_text: "modified".into(),
-            replace_all: false,
-        },
-    ));
-    let op_id = match h.recv().await {
-        ServerMessage::Result {
-            result: ResultBody::Mutation(w),
-            ..
-        } => w.operation_id,
-        other => panic!("unexpected: {other:?}"),
-    };
-
-    assert_eq!(
-        std::fs::read_to_string(h.root_path.join("u.txt")).unwrap(),
-        "modified\n"
-    );
-
-    h.send(&req(
-        "u",
-        RequestBody::Undo {
-            operation_id: op_id.clone(),
-        },
-    ));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::Undo(ur),
-            ..
-        } => {
-            assert_eq!(
-                ur.restored_hash.as_deref(),
-                Some(hash_of("original\n").as_str())
-            );
-            assert_eq!(ur.new_hash, hash_of("original\n"));
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-    assert_eq!(
-        std::fs::read_to_string(h.root_path.join("u.txt")).unwrap(),
-        "original\n"
-    );
-}
-
-#[tokio::test]
-async fn undo_conflict_when_file_changed() {
-    let mut h = harness().await;
-    h.send(&req(
-        "w1",
-        RequestBody::Create {
-            path: "c.txt".into(),
-            content: "v1\n".into(),
-        },
-    ));
-    let _ = h.recv().await;
-    h.send(&req(
-        "w2",
-        RequestBody::Edit {
-            path: "c.txt".into(),
-            base_hash: hash_of("v1\n"),
-            old_text: "v1".into(),
-            new_text: "v2".into(),
-            replace_all: false,
-        },
-    ));
-    let op_id = match h.recv().await {
-        ServerMessage::Result {
-            result: ResultBody::Mutation(w),
-            ..
-        } => w.operation_id,
-        other => panic!("unexpected: {other:?}"),
-    };
-
-    // Someone else changes the file after the recorded operation.
-    std::fs::write(h.root_path.join("c.txt"), "totally-different\n").unwrap();
-
-    h.send(&req(
-        "u",
-        RequestBody::Undo {
-            operation_id: op_id,
-        },
-    ));
-    let m = h.recv().await;
-    assert!(matches!(
-        m,
-        ServerMessage::Error {
-            error: ProtocolError {
-                code: ErrorCode::UndoConflict,
-                ..
-            },
-            ..
-        }
-    ));
-    // File must be untouched by the failed undo.
-    assert_eq!(
-        std::fs::read_to_string(h.root_path.join("c.txt")).unwrap(),
-        "totally-different\n"
-    );
-}
-
-#[tokio::test]
 async fn idempotent_replay_returns_same_result() {
     let mut h = harness().await;
     let body = RequestBody::Create {
@@ -1148,49 +1032,6 @@ async fn concurrent_duplicate_request_runs_once() {
     }
 }
 
-// F5: undo of file creation removes the file.
-#[tokio::test]
-async fn undo_file_creation_removes_file() {
-    let mut h = harness().await;
-    h.send(&req(
-        "create",
-        RequestBody::Create {
-            path: "new.txt".into(),
-            content: "fresh\n".into(),
-        },
-    ));
-    let op_id = match h.recv().await {
-        ServerMessage::Result {
-            result: ResultBody::Mutation(w),
-            ..
-        } => w.operation_id,
-        other => panic!("unexpected: {other:?}"),
-    };
-    assert!(h.root_path.join("new.txt").exists());
-
-    h.send(&req(
-        "u",
-        RequestBody::Undo {
-            operation_id: op_id,
-        },
-    ));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::Undo(ur),
-            ..
-        } => {
-            assert_eq!(ur.restored_hash, None);
-            assert_eq!(ur.new_hash, "sha256:");
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-    assert!(
-        !h.root_path.join("new.txt").exists(),
-        "undo of creation must remove the file"
-    );
-}
-
 // F6: exec is recorded and retrievable via history and operation.get.
 #[tokio::test]
 async fn exec_recorded_in_history_and_operation_get() {
@@ -1260,11 +1101,6 @@ async fn exec_recorded_in_history_and_operation_get() {
             ..
         } if exec.stdout.prefix.contains("recorded")
     ));
-
-    assert!(!h
-        .root_path
-        .join(format!(".remote-workspace/blobs/{op_id}.stdout"))
-        .exists());
 }
 
 // F6: rejected exec also consumes an id and is recorded.
@@ -1456,16 +1292,15 @@ async fn binary_safe_hash_for_multibyte_utf8() {
 
 // R1: the REAL crash window — prepared written, file already renamed (so its
 // hash == expected_after), but commit and result never written. After restart,
-// recovery must synthesize the commit so the change is recorded, undoable, and
-// the request reports Done (not "in progress").
+// recovery must synthesize the commit so the change is recorded and the
+// request reports Done (not "in progress").
 #[tokio::test]
 async fn recovery_synthesizes_commit_when_rename_done() {
     let root = tempfile::tempdir().unwrap();
     let log_dir = root.path().join(".remote-workspace");
-    let blobs_dir = log_dir.join("blobs");
     let ops_path = log_dir.join("operations.jsonl");
     let req_path = log_dir.join("requests.jsonl");
-    std::fs::create_dir_all(&blobs_dir).unwrap();
+    std::fs::create_dir_all(&log_dir).unwrap();
 
     let before = "old\n";
     let after = "new\n";
@@ -1474,9 +1309,6 @@ async fn recovery_synthesizes_commit_when_rename_done() {
 
     // Pre-existing "before" file (the workspace state prior to the mutation).
     std::fs::write(root.path().join("f.txt"), before).unwrap();
-    // ... and the before-content blob for undo, exactly as prepare_fs_record
-    // would have written it.
-    std::fs::write(blobs_dir.join("op-7.before"), before).unwrap();
     // The rename already happened: file now holds the after-content.
     std::fs::write(root.path().join("f.txt"), after).unwrap();
 
@@ -1550,23 +1382,6 @@ async fn recovery_synthesizes_commit_when_rename_done() {
         }
         other => panic!("replay should return synthesized Done, got {other:?}"),
     }
-
-    // And it must be undoable (before blob present), restoring the old content.
-    h.send(&req(
-        "u",
-        RequestBody::Undo {
-            operation_id: "op-7".into(),
-        },
-    ));
-    let m = h.recv().await;
-    assert!(
-        matches!(m, ServerMessage::Result { .. }),
-        "undo of synthesized op must succeed"
-    );
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("f.txt")).unwrap(),
-        before
-    );
 }
 
 // R1: when the rename did NOT take effect (file still == before), recovery must
@@ -1576,10 +1391,9 @@ async fn recovery_synthesizes_commit_when_rename_done() {
 async fn recovery_drops_when_rename_not_done() {
     let root = tempfile::tempdir().unwrap();
     let log_dir = root.path().join(".remote-workspace");
-    let blobs_dir = log_dir.join("blobs");
     let ops_path = log_dir.join("operations.jsonl");
     let req_path = log_dir.join("requests.jsonl");
-    std::fs::create_dir_all(&blobs_dir).unwrap();
+    std::fs::create_dir_all(&log_dir).unwrap();
 
     let before = "old\n";
     let after = "new\n";
@@ -1588,7 +1402,6 @@ async fn recovery_drops_when_rename_not_done() {
 
     // File is still in the BEFORE state (rename never happened).
     std::fs::write(root.path().join("f.txt"), before).unwrap();
-    std::fs::write(blobs_dir.join("op-7.before"), before).unwrap();
 
     let prepared = serde_json::json!({
         "record_kind": "prepared",
@@ -1890,106 +1703,6 @@ async fn exec_replay_after_disconnect_rejected() {
     );
 }
 
-// R3-regression: undo wrapped in WAL survives a crash window (prepared written,
-// mutation done, commit not written).
-#[tokio::test]
-async fn undo_crash_window_recovers() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let blobs_dir = log_dir.join("blobs");
-    std::fs::create_dir_all(&blobs_dir).unwrap();
-
-    // Create a file, then undo it — but crash before the undo commit.
-    let before = "original\n";
-    let after = "modified\n";
-    let before_hash = hash_of(before);
-    let after_hash = hash_of(after);
-
-    // Pretend a create op-1 made "before", then an edit op-2 changed it to
-    // "after". We'll simulate an undo of op-2 (restore "before") that crashed.
-    std::fs::write(root.path().join("f.txt"), before).unwrap();
-    // Edit op-2: recorded as Fs with before_hash=before_hash, after_hash=after_hash.
-    // Edit op-2 committed.
-    let op2 = serde_json::json!({
-        "record_kind": "fs",
-        "operation_id": "op-2",
-        "request_id": "w2-req",
-        "kind": "edit",
-        "path": "f.txt",
-        "before_hash": before_hash,
-        "after_hash": after_hash,
-        "timestamp_ms": 2,
-    });
-    // Before blob for op-2's undo: original file content.
-    std::fs::write(blobs_dir.join("op-2.before"), before).unwrap();
-
-    // Now the crash: undo of op-2 wrote a prepared marker and actually
-    // restored "before" into the workspace, but never committed.
-    let undo_prepared = serde_json::json!({
-        "record_kind": "prepared",
-        "operation_id": "op-3",
-        "request_id": "undo-req",
-        "kind": "undo",
-        "path": "f.txt",
-        "before_hash": after_hash,
-        "expected_after_hash": before_hash,
-        "timestamp_ms": 3,
-    });
-    // The file already holds "before" (the undo executed).
-    std::fs::write(root.path().join("f.txt"), before).unwrap();
-    // The undo request was in progress.
-    std::fs::write(
-        log_dir.join("requests.jsonl"),
-        format!(
-            "{}\n{}\n",
-            serde_json::json!({"request_id":"w2-req","status":"done","result_done":{"request_id":"w2-req","type":"write","operation_id":"op-2","old_hash":null,"new_hash":after_hash}}),
-            serde_json::json!({"request_id":"undo-req","status":"inprogress","op":"undo"}),
-        ),
-    ).unwrap();
-    // And the operations log only has the prepared marker + the committed op-2.
-    let ops_path = log_dir.join("operations.jsonl");
-    std::fs::write(&ops_path, format!("{op2}\n{undo_prepared}\n")).unwrap();
-
-    // Restart: recovery must see file == expected_after (restored "before")
-    // and synthesize the commit, making undo visible in history.
-    let mut h = harness_at_with(root.path(), log_dir, None).await;
-    h.send(&req("hist", RequestBody::History { limit: None }));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::History { operations },
-            ..
-        } => {
-            // Both op-2 (write) and the synthesized op-3 (undo) must be present.
-            let ids: Vec<_> = operations
-                .iter()
-                .map(|r| r.operation_id().to_string())
-                .collect();
-            assert!(ids.contains(&"op-2".to_string()), "write must be present");
-            assert!(
-                ids.contains(&"op-3".to_string()),
-                "undo must be synthesized"
-            );
-            // op-3 should be kind Undo.
-            let undo_op = operations
-                .iter()
-                .find(|r| r.operation_id() == "op-3")
-                .unwrap();
-            match undo_op {
-                AnyOperationRecord::Fs(fs) => assert_eq!(fs.kind, OperationKind::Undo),
-                _ => panic!("expected fs record for undo"),
-            }
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    // And the file must still be "before" (the undo did not repeat).
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("f.txt")).unwrap(),
-        before
-    );
-}
-
 // Regression: when the committed operation record is on disk but the terminal
 // result was lost in the crash, recovery must reconstruct the result from the
 // committed record rather than clearing the request and allowing replay.
@@ -2078,90 +1791,6 @@ async fn recovery_reconstructs_result_from_committed_record() {
         std::fs::read_to_string(root.path().join("f.txt")).unwrap(),
         "after"
     );
-}
-
-// Regression: when an undo crashed (prepared written, file restored, commit
-// never written), recovery must not only synthesize the commit, but also
-// produce the correct wire-level result type (UndoResult, not Mutation).
-#[tokio::test]
-async fn undo_recovery_produces_undo_result_when_replayed() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let blobs_dir = log_dir.join("blobs");
-    let ops_path = log_dir.join("operations.jsonl");
-    let req_path = log_dir.join("requests.jsonl");
-    std::fs::create_dir_all(&blobs_dir).unwrap();
-
-    let before = "old\n";
-    let after = "new\n";
-    let before_hash = hash_of(before);
-    let after_hash = hash_of(after);
-
-    // Simulate an undo of a modification. The file was "after", the undo
-    // restored "before", but the commit was not written.
-    std::fs::write(root.path().join("f.txt"), before).unwrap();
-    // Before-content blob so undo can verify.
-    std::fs::write(blobs_dir.join("op-2.before"), before).unwrap();
-
-    // The original create that made "after" must exist for undo to target.
-    let original_write = serde_json::json!({
-        "record_kind": "fs",
-        "operation_id": "op-1",
-        "request_id": "orig-req",
-        "kind": "create",
-        "path": "f.txt",
-        "before_hash": null,
-        "after_hash": after_hash,
-        "timestamp_ms": 1,
-    });
-    let undo_prepared = serde_json::json!({
-        "record_kind": "prepared",
-        "operation_id": "op-2",
-        "request_id": "undo-crash-req",
-        "kind": "undo",
-        "path": "f.txt",
-        "before_hash": after_hash,
-        "expected_after_hash": before_hash,
-        "timestamp_ms": 2,
-    });
-    std::fs::write(&ops_path, format!("{original_write}\n{undo_prepared}\n")).unwrap();
-    std::fs::write(
-        &req_path,
-        format!(
-            "{}\n",
-            serde_json::json!({
-                "request_id": "undo-crash-req",
-                "status": "inprogress",
-                "op": "undo",
-            }),
-        ),
-    )
-    .unwrap();
-
-    let mut h = harness_at_with(root.path(), log_dir, None).await;
-
-    // Replay the undo request: must return UndoResult (type: "undo"), NOT
-    // Mutation (type: "write").
-    h.send(&req(
-        "undo-crash-req",
-        RequestBody::Undo {
-            operation_id: "op-1".into(),
-        },
-    ));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::Undo(ur),
-            ..
-        } => {
-            assert_eq!(ur.operation_id, "op-2");
-            // restored_hash is the RESTORED content's hash (= before_hash, the
-            // old content the undo brought back). NOT the post-undo state.
-            assert_eq!(ur.restored_hash.as_deref(), Some(before_hash.as_str()));
-            assert_eq!(ur.new_hash, before_hash);
-        }
-        other => panic!("replay must return UndoResult, got {other:?}"),
-    }
 }
 
 // Regression: a rejected exec committed on disk must reconstruct as Error
@@ -2277,85 +1906,6 @@ async fn utf8_pagination_always_makes_progress() {
         }
         other => panic!("unexpected: {other:?}"),
     }
-}
-
-// Regression: undo of file creation must report restored_hash = None in the
-// recovered result (the file was removed, nothing was restored).
-#[tokio::test]
-async fn creation_undo_recovery_reports_none_restored_hash() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let blobs_dir = log_dir.join("blobs");
-    let ops_path = log_dir.join("operations.jsonl");
-    let req_path = log_dir.join("requests.jsonl");
-    std::fs::create_dir_all(&blobs_dir).unwrap();
-
-    // Original creation: op-1 created "new.txt" with content "fresh\n".
-    let created_hash = hash_of("fresh\n");
-    let original = serde_json::json!({
-        "record_kind": "fs",
-        "operation_id": "op-1",
-        "request_id": "create-req",
-        "kind": "create",
-        "path": "new.txt",
-        "before_hash": null,
-        "after_hash": created_hash,
-        "timestamp_ms": 1,
-    });
-    // Undo of creation: prepared with before=created_hash, expected_after="sha256:"
-    // (FILE_DELETED_SENTINEL). The file was removed but commit was never written.
-    let undo_prepared = serde_json::json!({
-        "record_kind": "prepared",
-        "operation_id": "op-2",
-        "request_id": "undo-create-req",
-        "kind": "undo",
-        "path": "new.txt",
-        "before_hash": created_hash,
-        "expected_after_hash": "sha256:",
-        "timestamp_ms": 2,
-    });
-    // File is absent (undo removed it).
-    std::fs::write(&ops_path, format!("{original}\n{undo_prepared}\n")).unwrap();
-    std::fs::write(
-        &req_path,
-        format!(
-            "{}\n",
-            serde_json::json!({
-                "request_id": "undo-create-req",
-                "status": "inprogress",
-                "op": "undo",
-            })
-        ),
-    )
-    .unwrap();
-
-    let mut h = harness_at_with(root.path(), log_dir, None).await;
-
-    // Replay the undo: restored_hash must be None (creation undo removes the
-    // file, restores nothing).
-    h.send(&req(
-        "undo-create-req",
-        RequestBody::Undo {
-            operation_id: "op-1".into(),
-        },
-    ));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::Undo(ur),
-            ..
-        } => {
-            assert_eq!(ur.operation_id, "op-2");
-            assert_eq!(
-                ur.restored_hash, None,
-                "creation undo restored_hash must be None"
-            );
-            assert_eq!(ur.new_hash, "sha256:");
-        }
-        other => panic!("replay must return UndoResult, got {other:?}"),
-    }
-    // And the file must still be absent.
-    assert!(!root.path().join("new.txt").exists());
 }
 
 // Regression: a command that produces continuous output must STILL be killed at
@@ -2923,10 +2473,10 @@ async fn prepared_and_committed_same_id_reconcile_to_one() {
     }
 }
 
-// Gc drops old operations, their blobs, and stale request entries; retained
-// operations stay undoable and pruned ids are never resolvable again.
+// Gc drops old operations and stale request entries, and pruned ids are never
+// resolvable again.
 #[tokio::test]
-async fn gc_prunes_operations_blobs_and_requests() {
+async fn gc_prunes_operations_and_requests() {
     let root = tempfile::tempdir().unwrap();
     let log_dir = root.path().join(".remote-workspace");
     std::fs::create_dir_all(&log_dir).unwrap();
@@ -2953,8 +2503,6 @@ async fn gc_prunes_operations_blobs_and_requests() {
             ));
             let _ = h.recv().await;
         }
-        assert!(log_dir.join("blobs/op-2.before").exists());
-
         h.send(&req("gc", RequestBody::Gc { keep: Some(1) }));
         match h.recv().await {
             ServerMessage::Result {
@@ -2967,13 +2515,10 @@ async fn gc_prunes_operations_blobs_and_requests() {
             }
             other => panic!("unexpected: {other:?}"),
         }
-        assert!(!log_dir.join("blobs/op-2.before").exists());
-        assert!(log_dir.join("blobs/op-3.before").exists());
-
-        // Undo of a pruned operation must fail cleanly.
+        // A pruned operation is gone for good, not resolvable to a new one.
         h.send(&req(
-            "u2",
-            RequestBody::Undo {
+            "op2",
+            RequestBody::OperationGet {
                 operation_id: "op-2".into(),
             },
         ));
@@ -2981,26 +2526,8 @@ async fn gc_prunes_operations_blobs_and_requests() {
             ServerMessage::Error { error, .. } => {
                 assert_eq!(error.code, ErrorCode::OperationNotFound)
             }
-            other => panic!("undo of pruned op must fail: {other:?}"),
+            other => panic!("pruned op must not resolve: {other:?}"),
         }
-        // The retained operation is still undoable.
-        h.send(&req(
-            "u3",
-            RequestBody::Undo {
-                operation_id: "op-3".into(),
-            },
-        ));
-        match h.recv().await {
-            ServerMessage::Result {
-                result: ResultBody::Undo(_),
-                ..
-            } => {}
-            other => panic!("undo of retained op must work: {other:?}"),
-        }
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("f.txt")).unwrap(),
-            "v2"
-        );
         h.shutdown().await;
     }
     // Restart: pruned state loads, and ids continue past the pruned range
@@ -3011,8 +2538,8 @@ async fn gc_prunes_operations_blobs_and_requests() {
             "w-after",
             RequestBody::Edit {
                 path: "f.txt".into(),
-                base_hash: hash_of("v2"),
-                old_text: "v2".into(),
+                base_hash: hash_of("v3"),
+                old_text: "v3".into(),
                 new_text: "v4".into(),
                 replace_all: false,
             },
@@ -3021,7 +2548,7 @@ async fn gc_prunes_operations_blobs_and_requests() {
             ServerMessage::Result {
                 result: ResultBody::Mutation(w),
                 ..
-            } => assert_eq!(w.operation_id, "op-5"),
+            } => assert_eq!(w.operation_id, "op-4"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -3082,9 +2609,9 @@ async fn gc_without_keep_or_limit_rejected() {
     }
 }
 
-// Delete: result hashes, history record, undo restores, and error cases.
+// Delete: result hashes, history record, and error cases.
 #[tokio::test]
-async fn delete_roundtrip_undo_and_errors() {
+async fn delete_roundtrip_and_errors() {
     let mut h = harness().await;
     h.send(&req(
         "w",
@@ -3137,25 +2664,6 @@ async fn delete_roundtrip_undo_and_errors() {
         ServerMessage::Error { error, .. } => assert_eq!(error.code, ErrorCode::NotFound),
         other => panic!("unexpected: {other:?}"),
     }
-
-    // Undo of the delete restores the exact content.
-    h.send(&req(
-        "u",
-        RequestBody::Undo {
-            operation_id: "op-2".into(),
-        },
-    ));
-    match h.recv().await {
-        ServerMessage::Result {
-            result: ResultBody::Undo(u),
-            ..
-        } => assert_eq!(u.new_hash, hash_of("keep me")),
-        other => panic!("unexpected: {other:?}"),
-    }
-    assert_eq!(
-        std::fs::read_to_string(h.root_path.join("d.txt")).unwrap(),
-        "keep me"
-    );
 
     // The delete is a first-class history record.
     h.send(&req("hist", RequestBody::History { limit: None }));
@@ -3320,5 +2828,74 @@ async fn server_startup_rejects_config_with_unknown_fields() {
             scratch_max_age: None,
         });
         assert!(result.is_err(), "config must be rejected at startup: {bad}");
+    }
+}
+
+// A state directory written before undo was removed must still load: its log
+// carries `kind: "undo"` records, and its blobs directory is dead weight the
+// server reclaims on first start.
+#[tokio::test]
+async fn legacy_undo_state_still_loads_and_sheds_its_blobs() {
+    let root = tempfile::tempdir().unwrap();
+    let log_dir = root.path().join(".remote-workspace");
+    let blobs_dir = log_dir.join("blobs");
+    std::fs::create_dir_all(&blobs_dir).unwrap();
+    std::fs::write(root.path().join("f.txt"), "restored\n").unwrap();
+    std::fs::write(blobs_dir.join("op-1.before"), "restored\n").unwrap();
+
+    let undo_record = serde_json::json!({
+        "record_kind": "fs",
+        "operation_id": "op-2",
+        "request_id": "old-undo",
+        "kind": "undo",
+        "path": "f.txt",
+        "before_hash": hash_of("edited\n"),
+        "after_hash": hash_of("restored\n"),
+        "timestamp_ms": 1,
+    });
+    std::fs::write(log_dir.join("operations.jsonl"), format!("{undo_record}\n")).unwrap();
+    // A stored terminal result of the removed operation must still deserialize.
+    let old_result = serde_json::json!({
+        "request_id": "old-undo",
+        "status": "done",
+        "result_done": {
+            "request_id": "old-undo",
+            "type": "undo",
+            "operation_id": "op-2",
+            "restored_hash": hash_of("restored\n"),
+            "new_hash": hash_of("restored\n"),
+        },
+        "op": "undo",
+    });
+    std::fs::write(log_dir.join("requests.jsonl"), format!("{old_result}\n")).unwrap();
+
+    let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
+    h.send(&req("hist", RequestBody::History { limit: None }));
+    match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::History { operations },
+            ..
+        } => {
+            assert_eq!(operations.len(), 1);
+            assert_eq!(operations[0].operation_id(), "op-2");
+        }
+        other => panic!("legacy undo record must load: {other:?}"),
+    }
+    assert!(!blobs_dir.exists(), "legacy blobs must be reclaimed");
+
+    // New mutations continue past the legacy id.
+    h.send(&req(
+        "w",
+        RequestBody::Create {
+            path: "new.txt".into(),
+            content: "x".into(),
+        },
+    ));
+    match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::Mutation(w),
+            ..
+        } => assert_eq!(w.operation_id, "op-3"),
+        other => panic!("unexpected: {other:?}"),
     }
 }

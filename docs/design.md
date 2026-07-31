@@ -88,13 +88,17 @@ Interactive sessions (PTY, REPL, persistent shell) are out of scope.
 
 ```text
 list  stat  read  create  edit  delete  exec
-undo  history  operation.get  request.status  gc
+history  operation.get  request.status  gc
 upload_prepare  upload_commit  upload_abort  download_record   (transfer control plane)
 ```
 
 ### Reads and hashes
 
-`read` returns content plus a hash over the file's raw bytes:
+`read` returns content plus a hash over the file's raw bytes. Only the
+requested window is read, so paging through a multi-gigabyte exec log costs the
+page, not the file. The hash exists to be handed back as `edit`'s `base_hash`,
+and `edit` refuses files above 4 MiB, so above that size it is omitted rather
+than re-derived per page from content nothing can edit:
 
 ```json
 {"request_id":"r1","op":"read","path":"src/main.py","offset":0,"limit":65536}
@@ -135,8 +139,8 @@ second editing mechanism; logs recorded by older servers still load.
 ```
 
 The result is synchronous and bounded: each stream retains its first 4 KiB and
-last 12 KiB. `exec` promises no transactionality and no undo -- it can do
-anything the remote user can.
+last 12 KiB. `exec` promises no transactionality -- it can do anything the
+remote user can.
 
 `exec` owns the command's process tree (the child runs in its own session via
 `setsid`, whose failure aborts the spawn). The central invariant: every
@@ -199,7 +203,7 @@ reconnect, and an unbounded scan there would tax large workspaces.
 Both directions stream through fixed 64 KiB buffers; memory does not grow
 with file size. Operation records are metadata-only (direction, remote
 logical path, size, hash, duration) -- no local paths, no content. Transfers
-are synchronous, cannot be undone, and have no resume/job machinery: a
+are synchronous and have no resume/job machinery: a
 dropped connection fails the call, the destination is never left
 half-written, and the caller just retries.
 
@@ -215,13 +219,23 @@ is not sufficient on its own: a sender that has stopped producing will also
 never exit, so the child is killed before it is reaped -- otherwise the call
 hangs at the reap, precisely where the stall was supposed to surface.
 
-## Undo
+## No reversal
 
-Applies only to recorded file mutations (`create`, `edit`, `delete`). Each
-mutation stores `before_hash`, `after_hash`, and a `before` blob. Undo runs
-only if `current_hash == after_hash`, otherwise returns `UNDO_CONFLICT`
-instead of clobbering later changes. Undoing a file creation removes the
-file. Single-file only; no multi-file transactions.
+Nothing here undoes a file operation. An `undo` operation existed through
+protocol 1, restoring a `create`/`edit`/`delete` from a stored before-blob
+while the file was untouched since. It was removed in protocol 2, because the
+cases it covered are the ones a caller can already redo -- an agent that just
+wrote an edit still holds the old text, and a tracked file is a `git checkout`
+away -- while everything genuinely destructive (`rm -rf`, `mv`, `sed -i`, a
+bad `git` invocation) runs through `exec` and was never reversible anyway. A
+safety net that catches only what does not fall is worth less than the cost of
+carrying it: a before-blob written and fsync'd on every mutation, plus its own
+recovery and pruning paths.
+
+What remains is the record, not the rescue: `history` and `operation.get` say
+exactly what happened, and durability against mistakes belongs to version
+control. A state directory written by an older server hands its now-unreadable
+`blobs/` back as disk on first start.
 
 ## Server state and logging
 
@@ -232,7 +246,6 @@ the canonical root path:
 ~/.remote-workspace/state/<rootname>-<hash>/
 |-- operations.jsonl   one record per operation (fs + exec)
 |-- requests.jsonl     request idempotency table
-|-- blobs/             before-content for undo
 |-- scratch/           agent-visible runtime artifacts (`@scratch/...`)
 |-- lock               single-writer flock
 `-- op-counter         id high-water mark (prevents reuse after pruning)
@@ -242,11 +255,11 @@ The workspace stays untouched -- nothing for `git status`, nothing a
 destructive command inside the workspace can destroy along with itself.
 `--state-base` swaps the base directory while keeping per-root keying (for
 hosts where home is nearly full). State is per-workspace, not per-session:
-sessions are just connections, and cross-session features (undo, history,
-replay after reconnect) are exactly the reason the state must outlive them.
+sessions are just connections, and cross-session features (history, replay
+after reconnect) are exactly the reason the state must outlive them.
 
 * **Server log = execution truth.** Every operation is recorded with hashes,
-  argv, exit codes, and blob references. Appends are fsync'd. Mutations are
+  argv, and exit codes. Appends are fsync'd. Mutations are
   write-ahead: `prepared` before the rename, `committed` after, so a crash in
   between is reconciled on restart instead of leaving a phantom operation.
 * **Client log = interaction truth.** Optional JSONL log of every request
@@ -254,9 +267,9 @@ replay after reconnect) are exactly the reason the state must outlive them.
   what the agent actually saw.
 * **Bounded growth.** At startup the server prunes to the newest
   `--history-limit` operations (default 1000; 0 disables), dropping older
-  records, their blobs, and request entries no longer referenced. The `gc`
-  operation does the same on demand. Undo of a pruned operation returns
-  `OPERATION_NOT_FOUND`; pruned ids are never reallocated.
+  records and request entries no longer referenced. The `gc` operation does the
+  same on demand. A pruned operation id returns `OPERATION_NOT_FOUND`; pruned
+  ids are never reallocated.
 * **Scratch expires.** Files idle -- neither written nor read -- beyond
   `--scratch-max-age-days` (default 7; 0 disables) are deleted, and `gc`
   reports what scratch holds either way. *Idle* counts reads deliberately:
@@ -398,7 +411,7 @@ root)` pair; "two roots on one machine" and "one root each on two machines"
 are the same concept, because all server-side state is already keyed per
 root. The agent sees tools: `list_workspaces`, `list_directory`,
 `read_file`, `create_file`, `edit_file`, `delete_file`, `run_command`,
-`upload_file`, `download_file`, `undo`, `history`, `operation_get`,
+`upload_file`, `download_file`, `history`, `operation_get`,
 `request_status` -- one canonical tool per intent (search, file discovery,
 Git, builds, and tests all go through `run_command`; no wrapper tools), and
 each (except `list_workspaces`) with a required
@@ -452,7 +465,7 @@ protocol; the system `ssh` binary as transport (no SSH library). The protocol
 crate has no I/O dependencies, so other transports can be added without
 touching operation semantics.
 
-Deliberately absent: databases (JSONL + blobs suffice), custom daemons,
+Deliberately absent: databases (JSONL suffices), custom daemons,
 embedded shells (commands run from explicit `argv`; only profile setup goes
 through a shell), and RPC frameworks.
 
@@ -471,6 +484,16 @@ that drive the real `remote-workspace-mcp` binary.
 ## Non-goals
 
 Deliberately out of scope, so the primitives stay small and predictable:
-workspace sync or cloning, resident daemons, undo of `exec`, multi-file
-transactions, multi-agent merging, job scheduling, and interactive PTYs
-(REPLs, persistent shells).
+workspace sync or cloning, resident daemons, reversal of any operation,
+multi-file transactions, multi-agent merging, job scheduling, and interactive
+PTYs (REPLs, persistent shells).
+
+**Concurrent sessions on one workspace.** The state directory's flock admits
+exactly one server per root, so a second agent session against the same
+workspace fails to connect while the first holds it (after a short grace for a
+predecessor still shutting down). This is a real limitation, not an oversight:
+the alternative is a multi-process operation log -- per-append locking, id
+allocation through the counter file, and in-memory tables demoted to caches
+with invalidation -- which puts the WAL and idempotency core at risk to serve a
+case with a simple workaround. Point the second session at a different root, or
+wait for the first to exit.

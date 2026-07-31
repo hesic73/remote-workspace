@@ -271,7 +271,6 @@ fn mcp_tools_list_has_expected_tools() {
         "run_command",
         "upload_file",
         "download_file",
-        "undo",
         "history",
         "operation_get",
         "request_status",
@@ -518,7 +517,7 @@ fn mcp_workspaces_are_isolated() {
 }
 
 // Drive every remaining tool over real MCP stdio: edit_file, delete_file,
-// undo, history, operation_get, request_status.
+// history, operation_get, request_status.
 #[test]
 fn mcp_full_tool_surface() {
     let dir = tempfile::tempdir().unwrap();
@@ -582,18 +581,6 @@ fn mcp_full_tool_surface() {
     );
     assert!(!e);
     assert!(text.starts_with("l1\nL2\n"), "edit not applied: {text}");
-
-    // Undo the edit.
-    let (e, text) = s.tool(
-        "undo",
-        serde_json::json!({"workspace": "test", "operation_id": edit_op}),
-    );
-    assert!(!e, "undo failed: {text}");
-    let (_, text) = s.tool(
-        "read_file",
-        serde_json::json!({"workspace": "test", "path": "f.txt"}),
-    );
-    assert!(text.starts_with("l1\nl2\n"), "undo not applied: {text}");
 
     // Delete, then verify it is gone.
     let (e, text) = s.tool(

@@ -161,16 +161,6 @@ pub struct RunCommandInput {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct UndoInput {
-    #[schemars(description = "Workspace name the operation was recorded in")]
-    pub workspace: String,
-    #[schemars(
-        description = "Operation ID to undo (from a create_file/edit_file/delete_file result)"
-    )]
-    pub operation_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HistoryInput {
     #[schemars(description = "Workspace name (see list_workspaces)")]
     pub workspace: String,
@@ -517,7 +507,7 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Read a text file. Returns the content, the file hash (pass it to edit_file as base_hash), and a next offset when the file is larger than one page. Refuses binary (non-UTF-8) files; move those with download_file."
+        description = "Read a text file. Returns the content, the file hash (pass it to edit_file as base_hash; omitted for files too large to edit), and a next offset when the file is larger than one page. Refuses binary (non-UTF-8) files; move those with download_file."
     )]
     async fn read_file(
         &self,
@@ -609,7 +599,9 @@ impl RemoteWorkspaceServer {
         }
     }
 
-    #[tool(description = "Delete a file. Recorded in the operation log and can be undone.")]
+    #[tool(
+        description = "Delete a file. Recorded in the operation log; deletion is permanent and cannot be reversed by this server."
+    )]
     async fn delete_file(
         &self,
         Parameters(DeleteFileInput { workspace, path }): Parameters<DeleteFileInput>,
@@ -711,29 +703,6 @@ impl RemoteWorkspaceServer {
                 r.path = local_path;
                 ok_json_in_workspace(&workspace, &r)
             }
-            Err(e) => err(format!("{e}")),
-        }
-    }
-
-    #[tool(
-        description = "Undo a recorded file operation. Only works if the file has not been modified since. Operation IDs are scoped to one workspace; pass the workspace the operation was recorded in."
-    )]
-    async fn undo(
-        &self,
-        Parameters(UndoInput {
-            workspace,
-            operation_id,
-        }): Parameters<UndoInput>,
-    ) -> CallToolResult {
-        let (client, _) = match self.client(&workspace).await {
-            Ok(c) => c,
-            Err(e) => return err(e),
-        };
-        match client.undo(&operation_id).await {
-            Ok(u) => ok(format!(
-                "Undid target {operation_id} in workspace '{workspace}'; undo_operation_id={}, new_hash={}",
-                u.operation_id, u.new_hash
-            )),
             Err(e) => err(format!("{e}")),
         }
     }

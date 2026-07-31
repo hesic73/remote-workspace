@@ -484,7 +484,7 @@ fn raw_receiver_rejects_size_mismatch_and_missing_staging() {
 }
 
 #[tokio::test]
-async fn transfers_appear_in_history_without_undo_or_leaked_paths() {
+async fn transfers_appear_in_history_without_leaked_paths() {
     let remote = tempfile::tempdir().unwrap();
     let local = tempfile::tempdir().unwrap();
     let ep = endpoint(remote.path());
@@ -519,17 +519,7 @@ async fn transfers_appear_in_history_without_undo_or_leaked_paths() {
     ));
     let d = client.operation_get(&up.operation_id).await.unwrap();
     assert_eq!(d.record.operation_id(), up.operation_id);
-
-    // Transfers cannot be undone.
-    for op in [&up.operation_id, &down.operation_id] {
-        let err = client.undo(op).await.unwrap_err();
-        match err {
-            ClientError::Server(e) => {
-                assert!(e.message.contains("undo"), "message: {}", e.message)
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
+    assert_eq!(transfers[1].operation_id, down.operation_id);
 
     // The server-side logs contain neither local paths nor file content nor
     // staging paths.

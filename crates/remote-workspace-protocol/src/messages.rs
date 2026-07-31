@@ -61,9 +61,6 @@ pub enum RequestBody {
     Delete {
         path: String,
     },
-    Undo {
-        operation_id: OperationId,
-    },
     /// Reserve an upload target and create a staging file next to it. The
     /// returned staging path is client-internal plumbing for the raw receiver;
     /// it must never surface in MCP tool results, history, or logs.
@@ -143,6 +140,8 @@ pub enum ResultBody {
     Mutation(MutationResult),
     #[serde(rename = "exec")]
     Exec(ExecResult),
+    /// Legacy result from the removed undo operation. No longer produced, kept
+    /// so request logs written by older servers still deserialize.
     #[serde(rename = "undo")]
     Undo(UndoResult),
     #[serde(rename = "upload_prepare")]
@@ -269,6 +268,7 @@ pub struct TransferResult {
     pub duration_ms: u64,
 }
 
+/// Legacy shape from the removed undo operation; see `ResultBody::Undo`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UndoResult {
     pub operation_id: OperationId,

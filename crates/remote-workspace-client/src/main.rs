@@ -105,8 +105,6 @@ enum Command {
     },
     /// Delete a file.
     Rm { path: String },
-    /// Undo a recorded file operation.
-    Undo { operation_id: String },
     /// Show operation history.
     History {
         #[arg(long)]
@@ -313,10 +311,6 @@ async fn async_main_real() -> Result<()> {
         }
         Command::Rm { path } => {
             let res = client.delete(&path).await?;
-            println!("{}", serde_json::to_string_pretty(&res)?);
-        }
-        Command::Undo { operation_id } => {
-            let res = client.undo(&operation_id).await?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
         Command::History { limit } => {

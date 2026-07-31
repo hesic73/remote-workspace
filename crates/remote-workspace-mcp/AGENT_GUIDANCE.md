@@ -1,6 +1,6 @@
 # Agent guidance
 
-This server manages one or more named workspaces, each a directory on a configured machine. Every tool except `list_workspaces` requires a `workspace` argument naming which one to act on. Workspaces are fully isolated from each other: paths, operation IDs, history, undo, and request IDs are scoped to a single workspace and mean nothing in another.
+This server manages one or more named workspaces, each a directory on a configured machine. Every tool except `list_workspaces` requires a `workspace` argument naming which one to act on. Workspaces are fully isolated from each other: paths, operation IDs, history, and request IDs are scoped to a single workspace and mean nothing in another.
 
 The normal workflow:
 
@@ -8,11 +8,10 @@ The normal workflow:
 2. Inspect with `list_directory` and `read_file`; follow the returned offsets to page through large results.
 3. Use `create_file` only for new text files; it refuses existing paths.
 4. Use `edit_file` for every modification to an existing text file: pass the hash from `read_file` as `base_hash` and copy `old_text` exactly from the current content.
-5. Use `delete_file` for deletion.
+5. Use `delete_file` for deletion. Nothing here reverses a file operation: the log records what happened, it does not restore. Anything that must survive a mistake belongs in version control.
 6. Use `run_command` for search (`rg`), file discovery (`find`), Git, builds, tests, and running programs.
 7. Use `upload_file`/`download_file` for large or binary files; their content never enters the model context. Never move binary data through `create_file`, base64, shell quoting, or paginated `read_file`.
-8. Use `undo` only for recorded file mutations (create/edit/delete), and only while the file is unchanged since.
-9. Never automatically retry `run_command` after an uncertain transport failure, because the command may already have produced side effects.
+8. Never automatically retry `run_command` after an uncertain transport failure, because the command may already have produced side effects.
 
 Normal relative paths address the workspace. Paths beginning with `@scratch/` address the workspace's server-managed scratch area; commands receive its physical path in `$REMOTE_WORKSPACE_SCRATCH`.
 

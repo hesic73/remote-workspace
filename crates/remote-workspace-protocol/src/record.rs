@@ -6,11 +6,12 @@ pub enum OperationKind {
     Create,
     Edit,
     Delete,
-    Undo,
-    /// Legacy kinds from the pre-create/edit protocol. No longer produced,
-    /// kept so operation logs written by older servers still deserialize.
+    /// Legacy kinds from the pre-create/edit protocol and the removed undo
+    /// operation. No longer produced, kept so operation logs written by older
+    /// servers still deserialize.
     Write,
     Patch,
+    Undo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

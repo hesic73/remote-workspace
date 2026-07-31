@@ -15,7 +15,7 @@ struct Args {
     #[arg(long)]
     root: Option<PathBuf>,
 
-    /// Base directory for server state (history, undo blobs, request table).
+    /// Base directory for server state (history, request table).
     /// State lives at `<base>/state/<name>-<hash>`, keyed by the canonical
     /// root path, so the workspace itself stays untouched. Defaults to
     /// `~/.remote-workspace`.

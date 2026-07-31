@@ -8,7 +8,6 @@ pub mod scratch;
 pub mod server;
 pub mod store;
 pub mod transfer;
-pub mod undo;
 pub mod workspace;
 
 pub use server::{Server, ServerOptions};

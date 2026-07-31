@@ -201,7 +201,7 @@ robot [robot@workstation:/home/robot/project]: ok
 lab   [lab-gpu-1:/data/experiments]: ok</code></pre>
 
 <p>Your agent now has tools to list, read, create, edit and delete files, run commands,
-transfer single files in either direction, and undo any recorded change. Every tool
+and transfer single files in either direction. Every tool
 except <code>list_workspaces</code> takes a required <code>workspace</code> argument, so a
 call cannot land on the wrong machine by default.</p>
 
@@ -245,10 +245,11 @@ interactive, while zsh reads <code>.zshrc</code> only for interactive shells, so
 written by <code>workspace add</code> and re-read whenever it changes, so a new workspace
 appears without restarting your agent.</p>
 
-<p>On the remote, the operation log and undo data sit in
+<p>On the remote, the operation log sits in
 <code>~/.remote-workspace/state/</code>, outside your project. Nothing appears in
 <code>git status</code>, and a destructive command inside the workspace cannot take the
-undo history with it. Paths beginning <code>@scratch/</code> address a transient area
+history with it. The log records what happened; it does not reverse it, so keep anything
+that must survive a mistake in version control. Paths beginning <code>@scratch/</code> address a transient area
 there for the agent's own working files; anything untouched for a week is deleted, so
 keep what matters in the workspace or pull it down with <code>download_file</code>.</p>
 

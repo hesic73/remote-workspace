@@ -5,7 +5,7 @@
 The agent runs on your machine; the code, toolchain, and GPUs stay on the
 remote host. Instead of installing an agent on every server, the remote side
 runs one small binary exposing atomic file operations, bounded command
-execution, undo, and a durable operation log.
+execution, and a durable operation log.
 
 ```
 coding agent  ->  remote-workspace (CLI) or remote-workspace-mcp (MCP)  ->  ssh stdio  ->  remote-workspace-server  ->  workspace
@@ -49,7 +49,7 @@ Adding workspace 'robot'
   Remote platform        linux-x86_64
   Workspace root         valid
   Server                 installed 0.1.0
-  Protocol               1
+  Protocol               2
   Workspace probe        passed
   Fleet configuration    updated
 Workspace 'robot' is ready.
@@ -73,8 +73,8 @@ claude mcp add remote-workspace -- remote-workspace-mcp     # one entry serves e
 
 `remote-workspace-mcp` multiplexes the whole fleet over stdio. Tools:
 `list_workspaces`, `list_directory`, `read_file`, `create_file`, `edit_file`,
-`delete_file`, `run_command`, `upload_file`, `download_file`, `undo`,
-`history`, `operation_get`, `request_status`.
+`delete_file`, `run_command`, `upload_file`, `download_file`, `history`,
+`operation_get`, `request_status`.
 
 There is exactly one canonical tool per intent -- search, file discovery, Git,
 builds, and tests all go through `run_command`, with no wrapper tools. Every
@@ -150,7 +150,7 @@ the wrong environment.
 
 ### Server state
 
-Server state (history, undo blobs, idempotency table, scratch) lives **outside
+Server state (history, idempotency table, scratch) lives **outside
 the workspace**, on the remote host, keyed by canonical root path:
 
 ```
@@ -158,7 +158,7 @@ the workspace**, on the remote host, keyed by canonical root path:
 ```
 
 So the workspace has no dotdir, nothing shows up in `git status`, and a
-destructive command inside the workspace cannot take the undo data with it.
+destructive command inside the workspace cannot take the operation log with it.
 `--state-base /data/$USER` relocates the base when home is tight; deleting the
 state directory is always safe. Growth is bounded by `--history-limit`
 (default 1000) and `gc`.
@@ -176,7 +176,6 @@ state directory is always safe. Growth is bounded by `--history-limit`
 | `edit <path> --base-hash H --old-text S --new-text S` | Exact text replacement in an existing file |
 | `rm <path>` | Delete a file |
 | `exec [--cwd D] [--profile P] -- argv...` | Run a command |
-| `undo <operation_id>` | Undo a recorded file change |
 | `history [--limit N]` | List recorded operations |
 | `op <operation_id>` | Details of one operation |
 | `status <request_id>` | Status of a previously-issued request |

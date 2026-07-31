@@ -15,12 +15,13 @@ pub enum ErrorCode {
     StaleFile,
     IoError,
     ExecFailed,
-    UndoConflict,
     OperationNotFound,
     RequestNotFound,
-    /// Legacy code from the removed line-based patch operation. No longer
-    /// produced, kept so request logs written by older servers deserialize.
+    /// Legacy codes from the removed line-based patch and undo operations. No
+    /// longer produced, kept so request logs written by older servers
+    /// deserialize.
     PatchFailed,
+    UndoConflict,
     AlreadyExists,
     NoMatch,
     AmbiguousMatch,
