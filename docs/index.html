@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>remote-workspace: remote workspaces for coding agents, over plain SSH</title>
+<meta name="description" content="Set up a coding agent on one machine and let it work on any machine you can SSH into.">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfcfd; --fg: #12151a; --muted: #5a6472; --rule: #e1e5ea;
+    --code-bg: #f2f4f7; --accent: #0f766e; --card: #f6f9fa;
+    --warn-bg: #edfaf8; --warn-rule: #a9ddd7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216; --fg: #e3e6ea; --muted: #8b95a3; --rule: #262c34;
+      --code-bg: #171b21; --accent: #2dd4bf; --card: #141920;
+      --warn-bg: #10201f; --warn-rule: #2c514c;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #fbfcfd; --fg: #12151a; --muted: #5a6472; --rule: #e1e5ea;
+    --code-bg: #f2f4f7; --accent: #0f766e; --card: #f6f9fa;
+    --warn-bg: #edfaf8; --warn-rule: #a9ddd7;
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1216; --fg: #e3e6ea; --muted: #8b95a3; --rule: #262c34;
+    --code-bg: #171b21; --accent: #2dd4bf; --card: #141920;
+    --warn-bg: #10201f; --warn-rule: #2c514c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.65 ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 44rem; margin: 0 auto; padding: 0 1.25rem 5rem; }
+  header { padding: 4rem 0 2rem; border-bottom: 1px solid var(--rule); }
+  h1 { font-size: 2rem; margin: 0 0 .4rem; letter-spacing: -.02em; }
+  .tag { font-size: 1.08rem; color: var(--muted); margin: 0 0 1.4rem; }
+  .links a {
+    color: var(--accent); text-decoration: none; font-size: .93rem;
+    border: 1px solid var(--rule); border-radius: 6px; padding: .35rem .7rem;
+    display: inline-block; margin-right: .4rem;
+  }
+  .links a:hover { border-color: var(--accent); }
+  h2 { font-size: 1.26rem; margin: 2.8rem 0 .85rem; letter-spacing: -.01em; }
+  h3 { font-size: 1rem; margin: 1.6rem 0 .45rem; }
+  .muted { color: var(--muted); }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: .88em; background: var(--code-bg); padding: .12em .38em; border-radius: 4px;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--rule); border-radius: 8px;
+    padding: .9rem 1rem; overflow-x: auto; font-size: .86rem; line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  .diagram {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 8px;
+    padding: 1rem; overflow-x: auto; font-size: .8rem; line-height: 1.5;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--muted); white-space: pre; margin: 1.2rem 0;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: .92rem; margin: 1rem 0; display: block; overflow-x: auto; }
+  th, td { text-align: left; padding: .5rem .7rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-weight: 600; color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+  .note {
+    background: var(--warn-bg); border: 1px solid var(--warn-rule);
+    border-radius: 8px; padding: .8rem 1rem; margin: 1.2rem 0; font-size: .93rem;
+  }
+  .note strong { color: var(--accent); }
+  footer { margin-top: 3.5rem; padding-top: 1.4rem; border-top: 1px solid var(--rule); color: var(--muted); font-size: .88rem; text-align: center; }
+  footer a { color: var(--accent); }
+  ul { padding-left: 1.3rem; }
+  li { margin: .3rem 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>remote-workspace</h1>
+  <p class="tag">Remote workspaces for coding agents, over plain SSH.</p>
+  <div class="links">
+    <a href="https://github.com/hesic73/remote-workspace">GitHub</a>
+    <a href="https://github.com/hesic73/remote-workspace/releases/latest">Releases</a>
+  </div>
+</header>
+
+<h2>What it is</h2>
+
+<p>Set up your coding agent on one machine. It can then work on any machine you can
+SSH into.</p>
+
+<p>The remote side runs one small binary that the agent drives over your existing SSH
+config. No daemon, no open port, no copying your project around. If
+<code>ssh myhost</code> works, this works.</p>
+
+<div class="diagram">coding agent
+    │
+    ▼
+remote-workspace-mcp        (on your machine)
+    │
+    │  JSON Lines over ssh stdin/stdout
+    ▼
+remote-workspace-server     (on the remote, installed for you)</div>
+
+<h2>Install</h2>
+
+<p>You need two binaries on your own machine. The server is installed on the remote
+automatically when you add a workspace, so you never copy it yourself.</p>
+
+<h3>Download</h3>
+
+<p>Static builds for Linux x86_64, so the glibc version does not matter.</p>
+
+<pre><code>BASE=https://github.com/hesic73/remote-workspace/releases/latest/download
+
+mkdir -p ~/.local/bin
+for b in remote-workspace remote-workspace-mcp; do
+  curl -fsSL "$BASE/$b-linux-x86_64-musl" -o ~/.local/bin/$b
+  chmod +x ~/.local/bin/$b
+done
+
+remote-workspace --version</code></pre>
+
+<p class="muted">Checksums for every asset are published as <code>SHA256SUMS</code> on
+the same release.</p>
+
+<h3>Build from source</h3>
+
+<pre><code>git clone https://github.com/hesic73/remote-workspace
+cd remote-workspace
+cargo build --release
+
+install -m755 target/release/remote-workspace \
+              target/release/remote-workspace-mcp ~/.local/bin/</code></pre>
+
+<h2>Add a workspace</h2>
+
+<p>One command probes the host, installs the matching server, runs a real round trip
+against your directory, and only then records the workspace. The directory must
+already exist.</p>
+
+<pre><code>remote-workspace workspace add robot \
+  --host robot@workstation \
+  --root /home/robot/project</code></pre>
+
+<pre><code>Adding workspace 'robot'
+  SSH                    connected
+  Remote platform        linux-x86_64
+  Workspace root         valid
+  Server                 installed 0.1.2
+  Protocol               1
+  Workspace probe        passed
+  Fleet configuration    updated
+Workspace 'robot' is ready.</code></pre>
+
+<p>If any step fails, nothing is recorded and the error names the layer that broke.
+Add as many workspaces as you like, on as many machines as you like.</p>
+
+<div class="note">
+<strong>Adding is for new workspaces.</strong> To move hosts you already registered onto
+a newer release, update your local binaries and run
+<code>remote-workspace workspace upgrade</code>. It installs once per SSH identity and
+reports <em>up to date</em> without transferring anything when a host already matches.
+</div>
+
+<h2>Connect it to your agent</h2>
+
+<p>One entry serves your whole fleet, so adding a workspace later needs no change here.
+Restart the host application afterwards, since MCP servers are loaded at startup.</p>
+
+<h3>Claude Code</h3>
+<pre><code>claude mcp add remote-workspace -- remote-workspace-mcp</code></pre>
+
+<h3>Claude Desktop</h3>
+<p>In <code>claude_desktop_config.json</code>. Use an absolute path, because a GUI app
+does not inherit your shell's <code>PATH</code>.</p>
+<pre><code>{
+  "mcpServers": {
+    "remote-workspace": {
+      "command": "/home/you/.local/bin/remote-workspace-mcp"
+    }
+  }
+}</code></pre>
+
+<h3>Codex</h3>
+<p>In <code>~/.codex/config.toml</code>:</p>
+<pre><code>[mcp_servers.remote-workspace]
+command = "/home/you/.local/bin/remote-workspace-mcp"</code></pre>
+
+<h2>Check it works</h2>
+
+<pre><code>remote-workspace-mcp --check</code></pre>
+
+<pre><code>fleet config /home/you/.remote-workspace/workspaces.toml ok: 2 workspace(s)
+robot [robot@workstation:/home/robot/project]: ok
+lab   [lab-gpu-1:/data/experiments]: ok</code></pre>
+
+<p>Your agent now has tools to list, read, create, edit and delete files, run commands,
+transfer single files in either direction, and undo any recorded change. Every tool
+except <code>list_workspaces</code> takes a required <code>workspace</code> argument, so a
+call cannot land on the wrong machine by default.</p>
+
+<h2>Making conda work</h2>
+
+<p>Every command runs in a fresh process, so <code>conda activate</code> in one call never
+leaks into the next. Say once what a command's environment should be, in a config file
+on the <strong>remote</strong> host:</p>
+
+<pre><code># ~/.remote-workspace/config.toml on the remote machine
+default_profile = "user"
+
+[profiles.user]
+shell = ["bash", "-lc"]
+setup = """
+. "$HOME/miniforge3/etc/profile.d/conda.sh"
+conda activate myenv
+"""
+
+[profiles.raw]
+shell = ["bash", "-c"]
+setup = ""</code></pre>
+
+<p>Point the workspace at it when adding, with
+<code>--config /home/robot/.remote-workspace/config.toml</code>.</p>
+
+<div class="note">
+<strong>Prefer an explicit setup over an interactive shell.</strong> Asking for
+<code>bash -lic</code> does load your dotfiles, but an interactive shell with no terminal
+prints job control warnings on every command, and on zsh it can drag in prompt plugins
+that fail noisily. Sourcing what you need is quieter and more predictable. Shells also
+differ: bash reaches <code>.bashrc</code> through <code>.profile</code> even when not
+interactive, while zsh reads <code>.zshrc</code> only for interactive shells, so dropping
+<code>-i</code> on a zsh host without an explicit setup can silently change which
+<code>python</code> runs.
+</div>
+
+<h2>Where things live</h2>
+
+<p>Your fleet is <code>~/.remote-workspace/workspaces.toml</code> on your own machine,
+written by <code>workspace add</code> and re-read whenever it changes, so a new workspace
+appears without restarting your agent.</p>
+
+<p>On the remote, the operation log and undo data sit in
+<code>~/.remote-workspace/state/</code>, outside your project. Nothing appears in
+<code>git status</code>, and a destructive command inside the workspace cannot take the
+undo history with it. Paths beginning <code>@scratch/</code> address a transient area
+there for the agent's own working files; anything untouched for a week is deleted, so
+keep what matters in the workspace or pull it down with <code>download_file</code>.</p>
+
+<h2>When something breaks</h2>
+
+<table>
+  <tr><th>Symptom</th><th>Usually</th></tr>
+  <tr>
+    <td><code>connect_failed</code></td>
+    <td>SSH itself cannot reach the host. Try <code>ssh &lt;host&gt; true</code>. Anything needing a password prompt fails rather than hanging.</td>
+  </tr>
+  <tr>
+    <td><code>probe_failed</code>, <em>state directory is locked</em></td>
+    <td>Usually not a fault. Another session is using that workspace, and one server serves one workspace root at a time by design.</td>
+  </tr>
+  <tr>
+    <td>Connected, but the wrong <code>python</code></td>
+    <td>A profile problem rather than a connection problem. Compare <code>run_command</code> under <code>profile: "raw"</code> with your default.</td>
+  </tr>
+  <tr>
+    <td>Edited <code>workspaces.toml</code> by hand, cannot connect</td>
+    <td>Editing it yourself installs nothing and checks nothing. A wrong SSH username quietly produces paths that do not exist. Remove the entry and use <code>workspace add</code>.</td>
+  </tr>
+</table>
+
+<footer>
+  <p>Built by <a href="https://github.com/hesic73">Sicheng He</a></p>
+</footer>
+
+</div>
+</body>
+</html>
