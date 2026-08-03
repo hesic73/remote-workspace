@@ -56,7 +56,14 @@ impl ProtocolError {
 
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {}", self.code, self.message)
+        write!(f, "{:?}: {}", self.code, self.message)?;
+        // Without both hashes a stale edit is unactionable: the caller cannot
+        // tell "I passed an older hash of my own" (retry with this one) from
+        // "someone else changed the file" (re-read first).
+        if let (Some(expected), Some(actual)) = (&self.expected_hash, &self.actual_hash) {
+            write!(f, " (base_hash {expected}, current {actual})")?;
+        }
+        Ok(())
     }
 }
 

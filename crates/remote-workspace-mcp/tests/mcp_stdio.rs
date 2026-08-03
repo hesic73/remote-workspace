@@ -271,9 +271,6 @@ fn mcp_tools_list_has_expected_tools() {
         "run_command",
         "upload_file",
         "download_file",
-        "history",
-        "operation_get",
-        "request_status",
     ];
     for tool in expected {
         assert!(names.contains(&tool), "missing tool {tool}; have {names:?}");
@@ -347,21 +344,16 @@ fn mcp_optional_parameters_are_accepted() {
     assert!(!e);
 
     // Omitted.
-    let (e, text) = s.tool("history", serde_json::json!({"workspace": "test"}));
-    assert!(!e, "history without limit: {text}");
+    let (e, text) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "a.txt"}),
+    );
+    assert!(!e, "read_file without offset/limit: {text}");
     let (e, text) = s.tool(
         "run_command",
         serde_json::json!({"workspace": "test", "argv": ["true"]}),
     );
     assert!(!e, "run_command without optionals: {text}");
-
-    // Supplied, with the declared types.
-    let (e, text) = s.tool(
-        "history",
-        serde_json::json!({"workspace": "test", "limit": 1}),
-    );
-    assert!(!e, "history with integer limit: {text}");
-    assert_eq!(text.lines().filter(|l| !l.trim().is_empty()).count(), 1);
 
     let (e, text) = s.tool(
         "run_command",
@@ -381,6 +373,41 @@ fn mcp_optional_parameters_are_accepted() {
         serde_json::json!({"workspace": "test", "path": ".", "offset": 0, "limit": 1}),
     );
     assert!(!e, "list_directory with offset/limit: {text}");
+}
+
+// Hosts that stringify scalars must not make the integer parameters unusable:
+// the schema says `integer`, so "2" is unambiguous and is accepted. Anything
+// that is not a number still fails.
+#[test]
+fn mcp_integer_parameters_accept_numeric_strings() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = McpSession::spawn(dir.path().to_str().unwrap());
+    s.initialize();
+
+    let (e, _) = s.tool(
+        "create_file",
+        serde_json::json!({"workspace": "test", "path": "a.txt", "content": "x\ny\n"}),
+    );
+    assert!(!e);
+
+    let (e, text) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "a.txt", "offset": "2", "limit": "2"}),
+    );
+    assert!(!e, "read_file with stringified offset/limit: {text}");
+    assert!(text.starts_with('y'), "offset/limit not applied: {text}");
+
+    let (e, text) = s.tool(
+        "run_command",
+        serde_json::json!({"workspace": "test", "argv": ["true"], "timeout_ms": "30000"}),
+    );
+    assert!(!e, "run_command with stringified timeout_ms: {text}");
+
+    let (e, text) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "a.txt", "limit": "soon"}),
+    );
+    assert!(e, "a non-numeric string must still be rejected: {text}");
 }
 
 #[test]
@@ -453,8 +480,9 @@ fn mcp_run_command_returns_exit_code() {
     assert_eq!(result["workspace"], "test");
 }
 
-// Two workspaces in one fleet are fully isolated: files, history, and
-// operation ids live per workspace.
+// Two workspaces in one fleet are fully isolated: a path resolves, and is
+// visible, only in the workspace it belongs to. (Operation ids and the log are
+// isolated by construction: each root gets its own server and state directory.)
 #[test]
 fn mcp_workspaces_are_isolated() {
     let dir_a = tempfile::tempdir().unwrap();
@@ -505,19 +533,25 @@ fn mcp_workspaces_are_isolated() {
     );
     assert!(e, "workspace b must not see a's file");
 
-    let (e, text) = s.tool("history", serde_json::json!({"workspace": "b"}));
+    let (e, text) = s.tool(
+        "list_directory",
+        serde_json::json!({"workspace": "b", "path": "."}),
+    );
     assert!(!e);
     assert!(
-        text.contains("no operations recorded"),
-        "b's history must be empty: {text}"
+        !text.contains("only-in-a.txt"),
+        "b must not see a's file: {text}"
     );
-    let (e, text) = s.tool("history", serde_json::json!({"workspace": "a"}));
+    let (e, text) = s.tool(
+        "list_directory",
+        serde_json::json!({"workspace": "a", "path": "."}),
+    );
     assert!(!e);
-    assert!(text.contains("only-in-a.txt"), "a's history: {text}");
+    assert!(text.contains("only-in-a.txt"), "a's listing: {text}");
 }
 
 // Drive every remaining tool over real MCP stdio: edit_file, delete_file,
-// history, operation_get, request_status.
+// and the error paths an agent actually hits.
 #[test]
 fn mcp_full_tool_surface() {
     let dir = tempfile::tempdir().unwrap();
@@ -566,14 +600,10 @@ fn mcp_full_tool_surface() {
         serde_json::json!({"workspace": "test", "path": "f.txt", "base_hash": hash, "old_text": "l2\n", "new_text": "L2\n"}),
     );
     assert!(!e, "edit failed: {text}");
-    let edit_op = text
-        .split("operation_id=")
-        .nth(1)
-        .unwrap()
-        .split(',')
-        .next()
-        .unwrap()
-        .to_string();
+    assert!(
+        text.contains("operation_id="),
+        "edit result must carry the operation id: {text}"
+    );
 
     let (e, text) = s.tool(
         "read_file",
@@ -595,27 +625,22 @@ fn mcp_full_tool_surface() {
     );
     assert!(e, "reading a deleted file must be an error");
 
-    // History shows the operations; operation_get resolves the edit op.
-    let (e, text) = s.tool("history", serde_json::json!({"workspace": "test"}));
+    // An invented base_hash must not be reported as a stale file: that would
+    // send the agent to re-read and retry a call that fails identically.
+    let (e, _) = s.tool(
+        "create_file",
+        serde_json::json!({"workspace": "test", "path": "g.txt", "content": "x\n"}),
+    );
     assert!(!e);
+    let (e, text) = s.tool(
+        "edit_file",
+        serde_json::json!({"workspace": "test", "path": "g.txt", "base_hash": "auto", "old_text": "x", "new_text": "y"}),
+    );
+    assert!(e, "an invented base_hash must be an error");
     assert!(
-        text.contains("\"delete\""),
-        "history missing delete: {text}"
+        text.contains("not a hash") && !text.contains("Stale"),
+        "unhelpful error for an invented base_hash: {text}"
     );
-    let (e, text) = s.tool(
-        "operation_get",
-        serde_json::json!({"workspace": "test", "operation_id": edit_op}),
-    );
-    assert!(!e, "operation_get failed: {text}");
-    assert!(text.contains(&edit_op));
-
-    // request_status on an unknown id reports unknown, not an error.
-    let (e, text) = s.tool(
-        "request_status",
-        serde_json::json!({"workspace": "test", "request_id": "never-existed"}),
-    );
-    assert!(!e, "request_status failed: {text}");
-    assert!(text.contains("unknown"), "unexpected status: {text}");
 }
 
 // If the connection to the server dies mid-session, the next tool call must
@@ -828,12 +853,4 @@ fn mcp_transfer_tools_roundtrip_and_errors() {
         }),
     );
     assert!(e, "missing local source must be isError=true, got: {text}");
-
-    // The transfer shows up in history as a metadata-only record.
-    let (e, text) = s.tool("history", serde_json::json!({"workspace": "test"}));
-    assert!(!e);
-    assert!(
-        text.contains("\"transfer\""),
-        "history missing transfer: {text}"
-    );
 }

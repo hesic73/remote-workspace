@@ -105,16 +105,46 @@ async fn end_to_end_stale_hash_errors() {
     let dir = tempfile::tempdir().unwrap();
     let client = make_client(dir.path()).await;
     let _ = client.create("f.txt", "v1").await.unwrap();
-    // Wrong base hash.
+    // A real hash of some other content: the file is genuinely not what the
+    // caller last saw.
+    let stale = format!("sha256:{}", "de".repeat(32));
     let err = client
-        .edit("f.txt", "sha256:deadbeef", "v1", "v2", false)
+        .edit("f.txt", &stale, "v1", "v2", false)
         .await
         .unwrap_err();
     match err {
         remote_workspace_client::ClientError::Server(e) => {
             assert_eq!(e.code, remote_workspace_protocol::ErrorCode::StaleFile);
+            // Both hashes must reach the caller, not just the structured
+            // fields: it is the only way to tell an outdated base_hash of
+            // one's own from a file someone else changed.
+            let text = e.to_string();
+            assert!(text.contains(&stale), "stale error lost base_hash: {text}");
+            assert!(
+                text.contains("current sha256:"),
+                "stale error lost the file's current hash: {text}"
+            );
         }
         other => panic!("unexpected: {other:?}"),
+    }
+
+    // A value that was never a hash is a bad request, not a stale file: the
+    // caller must fix the argument, not re-read and retry.
+    for bogus in ["auto", "sha256:REPLACE", "sha256:deadbeef"] {
+        let err = client
+            .edit("f.txt", bogus, "v1", "v2", false)
+            .await
+            .unwrap_err();
+        match err {
+            remote_workspace_client::ClientError::Server(e) => {
+                assert_eq!(
+                    e.code,
+                    remote_workspace_protocol::ErrorCode::InvalidRequest,
+                    "base_hash {bogus:?}"
+                );
+            }
+            other => panic!("unexpected for {bogus:?}: {other:?}"),
+        }
     }
 }
 

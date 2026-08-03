@@ -73,13 +73,21 @@ claude mcp add remote-workspace -- remote-workspace-mcp     # one entry serves e
 
 `remote-workspace-mcp` multiplexes the whole fleet over stdio. Tools:
 `list_workspaces`, `list_directory`, `read_file`, `create_file`, `edit_file`,
-`delete_file`, `run_command`, `upload_file`, `download_file`, `history`,
-`operation_get`, `request_status`.
+`delete_file`, `run_command`, `upload_file`, `download_file`.
 
 There is exactly one canonical tool per intent -- search, file discovery, Git,
 builds, and tests all go through `run_command`, with no wrapper tools. Every
 tool except `list_workspaces` takes a **required** `workspace` argument, so a
 call can never land on the wrong machine because a default filled itself in.
+
+Inspecting what happened -- `history`, `op`, `status` -- is a CLI job: the
+reader is you, not the agent that wrote the record.
+
+Register the MCP with `--log-dir DIR` to record every request and response,
+one JSONL file per workspace, then `remote-workspace stats` for per-tool call
+and error counts. It is the only record of the read-only calls, and is off by
+default because a logged request carries the full content of a `create_file`
+or `edit_file`.
 
 Conventions for the agent itself live in one canonical place,
 [`AGENT_GUIDANCE.md`](crates/remote-workspace-mcp/AGENT_GUIDANCE.md), which the MCP
@@ -180,6 +188,7 @@ state directory is always safe. Growth is bounded by `--history-limit`
 | `op <operation_id>` | Details of one operation |
 | `status <request_id>` | Status of a previously-issued request |
 | `gc [--keep N]` | Prune stored history; also sweeps expired scratch and reports what it holds |
+| `stats [--log-dir D]` | Per-tool call and error counts from the MCP interaction logs (local only) |
 
 Connection flags: `--host`, `--root`, `--remote-bin`, `--config`,
 `--state-base`, `--local`, `--log <file>`. `workspace add` is an
@@ -192,12 +201,24 @@ administrative command with its own `--host`/`--root` and does not use them.
 A newer client upgrades an older server; an older client never downgrades a
 newer one.
 
-Update the local client, then pick up the new server everywhere:
+Upgrading is two steps, in this order. The client only ever fetches the
+release matching **its own** version, so a stale client installs a stale
+server and reports success.
 
 ```bash
+# 1. your own machine -- the same command that installed them
+BASE=https://github.com/hesic73/remote-workspace/releases/latest/download
+for b in remote-workspace remote-workspace-mcp; do
+  curl -fsSL "$BASE/$b-linux-x86_64-musl" -o ~/.local/bin/$b
+  chmod +x ~/.local/bin/$b
+done
+
+# 2. the remote servers
 remote-workspace workspace upgrade            # every workspace in the fleet
 remote-workspace workspace upgrade robot      # or just one
 ```
+
+Restart the MCP host after step 1: MCP servers are loaded at startup.
 
 `upgrade` installs once per SSH identity however many workspaces share it,
 reports `up to date` and transfers nothing when a host is already current, and

@@ -152,8 +152,8 @@ already exist.</p>
   SSH                    connected
   Remote platform        linux-x86_64
   Workspace root         valid
-  Server                 installed 0.1.2
-  Protocol               1
+  Server                 installed 0.2.0
+  Protocol               2
   Workspace probe        passed
   Fleet configuration    updated
 Workspace 'robot' is ready.</code></pre>
@@ -162,10 +162,8 @@ Workspace 'robot' is ready.</code></pre>
 Add as many workspaces as you like, on as many machines as you like.</p>
 
 <div class="note">
-<strong>Adding is for new workspaces.</strong> To move hosts you already registered onto
-a newer release, update your local binaries and run
-<code>remote-workspace workspace upgrade</code>. It installs once per SSH identity and
-reports <em>up to date</em> without transferring anything when a host already matches.
+<strong>Adding is for new workspaces.</strong> A name already in the fleet is refused;
+moving registered hosts onto a newer release is <a href="#upgrading">upgrading</a>.
 </div>
 
 <h2>Connect it to your agent</h2>
@@ -200,10 +198,11 @@ command = "/home/you/.local/bin/remote-workspace-mcp"</code></pre>
 robot [robot@workstation:/home/robot/project]: ok
 lab   [lab-gpu-1:/data/experiments]: ok</code></pre>
 
-<p>Your agent now has tools to list, read, create, edit and delete files, run commands,
+<p>Your agent now has nine tools: list, read, create, edit and delete files, run commands,
 and transfer single files in either direction. Every tool
 except <code>list_workspaces</code> takes a required <code>workspace</code> argument, so a
-call cannot land on the wrong machine by default.</p>
+call cannot land on the wrong machine by default. Inspecting what happened afterwards
+is a job for the <code>remote-workspace</code> CLI, not a tool the agent carries.</p>
 
 <h2>Making conda work</h2>
 
@@ -239,6 +238,29 @@ interactive, while zsh reads <code>.zshrc</code> only for interactive shells, so
 <code>python</code> runs.
 </div>
 
+<h2 id="upgrading">Upgrading</h2>
+
+<p>Two steps, in this order. Your own binaries first: the client only ever fetches the
+release matching <strong>its own</strong> version, so a stale client installs a stale
+server and cheerfully reports success.</p>
+
+<pre><code>BASE=https://github.com/hesic73/remote-workspace/releases/latest/download
+
+for b in remote-workspace remote-workspace-mcp; do
+  curl -fsSL "$BASE/$b-linux-x86_64-musl" -o ~/.local/bin/$b
+  chmod +x ~/.local/bin/$b
+done
+
+remote-workspace workspace upgrade</code></pre>
+
+<p>The second command installs once per SSH identity, however many workspaces share it,
+and reports <em>up to date</em> without transferring anything when a host already
+matches. It never edits your fleet file. Restart the host application afterwards, since
+MCP servers are loaded at startup.</p>
+
+<p class="muted">Servers older than your client keep working: an older protocol is
+accepted, and a client never downgrades a server that is newer than itself.</p>
+
 <h2>Where things live</h2>
 
 <p>Your fleet is <code>~/.remote-workspace/workspaces.toml</code> on your own machine,
@@ -252,6 +274,20 @@ history with it. The log records what happened; it does not reverse it, so keep 
 that must survive a mistake in version control. Paths beginning <code>@scratch/</code> address a transient area
 there for the agent's own working files; anything untouched for a week is deleted, so
 keep what matters in the workspace or pull it down with <code>download_file</code>.</p>
+
+<p>To see which tools your agent actually reaches for, register the MCP with
+<code>--log-dir ~/.remote-workspace/log</code> and read it back:</p>
+
+<pre><code>remote-workspace stats
+
+tool                calls   errors
+run_command          1800       24
+edit_file             678       37
+read_file             201        5
+list_directory          8        0</code></pre>
+
+<p>It is off by default, because a logged request carries the full text of every file
+your agent writes.</p>
 
 <h2>When something breaks</h2>
 

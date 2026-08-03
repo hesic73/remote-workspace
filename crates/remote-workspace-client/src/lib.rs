@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 pub mod deploy;
 pub mod fleet;
 mod log_writer;
+pub mod stats;
 mod transfer;
 
 pub use log_writer::ClientLog;

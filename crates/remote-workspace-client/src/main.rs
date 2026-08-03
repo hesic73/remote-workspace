@@ -121,6 +121,13 @@ enum Command {
         #[arg(long)]
         keep: Option<usize>,
     },
+    /// Summarize how often each tool was called, from the logs written by
+    /// `remote-workspace-mcp --log-dir`. Local only; connects to nothing.
+    Stats {
+        /// Log directory to read. Defaults to ~/.remote-workspace/log.
+        #[arg(long)]
+        log_dir: Option<PathBuf>,
+    },
     /// Manage the local workspace fleet. Trusted local admin operations, not
     /// exposed to the agent through MCP.
     Workspace {
@@ -183,6 +190,12 @@ fn main() -> Result<()> {
     rt.block_on(async_main_real())
 }
 
+fn default_log_dir() -> Result<PathBuf> {
+    let home =
+        std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set; pass --log-dir"))?;
+    Ok(PathBuf::from(home).join(".remote-workspace/log"))
+}
+
 async fn async_main_real() -> Result<()> {
     let cli = Cli::parse();
 
@@ -190,6 +203,24 @@ async fn async_main_real() -> Result<()> {
     // connect-based dispatch that requires --host/--root.
     if let Command::Workspace { cmd } = &cli.command {
         return handle_workspace(cmd).await;
+    }
+    if let Command::Stats { log_dir } = &cli.command {
+        let dir = match log_dir {
+            Some(d) => d.clone(),
+            None => default_log_dir()?,
+        };
+        if !dir.is_dir() {
+            anyhow::bail!(
+                "no log directory at {}; run remote-workspace-mcp with --log-dir {} to record calls",
+                dir.display(),
+                dir.display()
+            );
+        }
+        print!(
+            "{}",
+            remote_workspace_client::stats::collect(&dir)?.render()
+        );
+        return Ok(());
     }
 
     let log = match &cli.log {
@@ -330,7 +361,7 @@ async fn async_main_real() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&r)?);
         }
         // Handled before the connect path.
-        Command::Workspace { .. } => unreachable!(),
+        Command::Stats { .. } | Command::Workspace { .. } => unreachable!(),
     }
     Ok(())
 }

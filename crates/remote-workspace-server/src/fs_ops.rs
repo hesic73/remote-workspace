@@ -193,12 +193,32 @@ fn io_read_error(e: std::io::Error) -> ProtocolError {
 pub const READ_DEFAULT_LIMIT: u64 = 65536;
 pub const READ_MAX_LIMIT: u64 = 64 * 1024;
 
+/// True for a hash in the form this server issues. A caller that invents a
+/// placeholder ("auto", "sha256:REPLACE") must not be told the file is stale:
+/// that sends it to re-read and retry a call that will fail identically.
+fn is_well_formed_hash(hash: &str) -> bool {
+    match hash.strip_prefix("sha256:") {
+        Some(hex) => hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
 /// Validate base_hash and return the current hash. If `base_hash` is given and
 /// does not match the file's current content, returns StaleFile.
 fn check_base_hash(
     abs: &Path,
     base_hash: &Option<String>,
 ) -> Result<Option<String>, ProtocolError> {
+    if let Some(expected) = base_hash {
+        if !is_well_formed_hash(expected) {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "base_hash {expected:?} is not a hash; pass the sha256:... value returned by read_file"
+                ),
+            ));
+        }
+    }
     let current = hash_file(abs)?;
     if let Some(expected) = base_hash {
         match &current {

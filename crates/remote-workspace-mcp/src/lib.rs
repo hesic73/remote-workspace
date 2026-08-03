@@ -45,20 +45,52 @@ fn ok_json_in_workspace<T: serde::Serialize>(workspace: &str, value: &T) -> Call
     }
 }
 
+/// Integer parameters that accept a numeric string as well as a number. The
+/// schema advertises `integer`, but some MCP hosts stringify every scalar; the
+/// agent then gets a deserialize error it cannot act on, because the schema it
+/// was given already said `integer`. Only unambiguous numeric strings are
+/// accepted -- anything else still fails.
+mod lenient_int {
+    use serde::{Deserialize, Deserializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(u64),
+        Str(String),
+    }
+
+    fn parse<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        match Option::<NumOrStr>::deserialize(d)? {
+            None => Ok(None),
+            Some(NumOrStr::Num(n)) => Ok(Some(n)),
+            Some(NumOrStr::Str(s)) => s.trim().parse::<u64>().map(Some).map_err(|_| {
+                serde::de::Error::custom(format!("expected an integer, got the string {s:?}"))
+            }),
+        }
+    }
+
+    pub fn opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        parse(d)
+    }
+
+    pub fn opt_usize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+        Ok(parse(d)?.map(|n| n as usize))
+    }
+}
+
 // ---- Input structs ----
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListDirectoryInput {
-    #[schemars(description = "Workspace name (see list_workspaces)")]
+    #[schemars(description = "Workspace name")]
     pub workspace: String,
-    #[schemars(
-        description = "Directory path relative to workspace, or @scratch/... for server-managed scratch"
-    )]
+    #[schemars(description = "Directory path in the workspace, or @scratch/...")]
     pub path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_int::opt_usize")]
     #[schemars(with = "usize", description = "Entry offset to start at (default: 0)")]
     pub offset: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_int::opt_usize")]
     #[schemars(
         with = "usize",
         description = "Maximum entries to return (default and maximum: 1000)"
@@ -68,19 +100,17 @@ pub struct ListDirectoryInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadFileInput {
-    #[schemars(description = "Workspace name (see list_workspaces)")]
+    #[schemars(description = "Workspace name")]
     pub workspace: String,
-    #[schemars(
-        description = "File path relative to workspace, or @scratch/... for server-managed scratch"
-    )]
+    #[schemars(description = "File path in the workspace, or @scratch/...")]
     pub path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_int::opt_u64")]
     #[schemars(
         with = "u64",
         description = "Byte offset to start reading from (default 0)"
     )]
     pub offset: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_int::opt_u64")]
     #[schemars(
         with = "u64",
         description = "Maximum bytes to read (default and hard maximum: 65536)"
@@ -90,11 +120,9 @@ pub struct ReadFileInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateFileInput {
-    #[schemars(description = "Workspace name (see list_workspaces)")]
+    #[schemars(description = "Workspace name")]
     pub workspace: String,
-    #[schemars(
-        description = "File path relative to workspace, or @scratch/... for server-managed scratch"
-    )]
+    #[schemars(description = "File path in the workspace, or @scratch/...")]
     pub path: String,
     #[schemars(description = "Full content of the new file")]
     pub content: String,
@@ -102,17 +130,13 @@ pub struct CreateFileInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EditFileInput {
-    #[schemars(description = "Workspace name (see list_workspaces)")]
+    #[schemars(description = "Workspace name")]
     pub workspace: String,
-    #[schemars(
-        description = "File path relative to workspace, or @scratch/... for server-managed scratch"
-    )]
+    #[schemars(description = "File path in the workspace, or @scratch/...")]
     pub path: String,
     #[schemars(description = "Current file hash, as returned by read_file")]
     pub base_hash: String,
-    #[schemars(
-        description = "Exact text to replace; must match the current file content exactly, including whitespace"
-    )]
+    #[schemars(description = "Exact text to replace, including whitespace")]
     pub old_text: String,
     #[schemars(description = "Replacement text; empty string deletes old_text")]
     pub new_text: String,
@@ -126,24 +150,22 @@ pub struct EditFileInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteFileInput {
-    #[schemars(description = "Workspace name (see list_workspaces)")]
+    #[schemars(description = "Workspace name")]
     pub workspace: String,
-    #[schemars(
-        description = "File path relative to workspace, or @scratch/... for server-managed scratch"
-    )]
+    #[schemars(description = "File path in the workspace, or @scratch/...")]
     pub path: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RunCommandInput {
-    #[schemars(description = "Workspace name (see list_workspaces)")]
+    #[schemars(description = "Workspace name")]
     pub workspace: String,
     #[schemars(description = "Command and arguments, e.g. [\"pytest\", \"-q\"]")]
     pub argv: Vec<String>,
     #[serde(default)]
     #[schemars(
         with = "String",
-        description = "Working directory relative to workspace, or @scratch/... (default: workspace root)"
+        description = "Working directory in the workspace, or @scratch/... (default: root)"
     )]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -152,7 +174,7 @@ pub struct RunCommandInput {
         description = "Environment profile name (configured server-side)"
     )]
     pub profile: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_int::opt_u64")]
     #[schemars(
         with = "u64",
         description = "Timeout in milliseconds (default: 300000; maximum: 3600000)"
@@ -161,42 +183,12 @@ pub struct RunCommandInput {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct HistoryInput {
-    #[schemars(description = "Workspace name (see list_workspaces)")]
-    pub workspace: String,
-    #[serde(default)]
-    #[schemars(
-        with = "usize",
-        description = "Maximum operations to return (default: 50; maximum: 100)"
-    )]
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct OperationGetInput {
-    #[schemars(description = "Workspace name the operation was recorded in")]
-    pub workspace: String,
-    #[schemars(description = "Operation ID to look up")]
-    pub operation_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RequestStatusInput {
-    #[schemars(description = "Workspace name the request was issued against")]
-    pub workspace: String,
-    #[schemars(description = "Request ID whose status to query")]
-    pub request_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UploadFileInput {
-    #[schemars(description = "Destination workspace name (see list_workspaces)")]
+    #[schemars(description = "Destination workspace name")]
     pub workspace: String,
     #[schemars(description = "Absolute or relative path of the local source file")]
     pub local_path: String,
-    #[schemars(
-        description = "Destination path relative to workspace, or @scratch/... for server-managed scratch"
-    )]
+    #[schemars(description = "Destination path in the workspace, or @scratch/...")]
     pub remote_path: String,
     #[serde(default)]
     #[schemars(
@@ -208,11 +200,9 @@ pub struct UploadFileInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DownloadFileInput {
-    #[schemars(description = "Source workspace name (see list_workspaces)")]
+    #[schemars(description = "Source workspace name")]
     pub workspace: String,
-    #[schemars(
-        description = "Source path relative to workspace, or @scratch/... for server-managed scratch"
-    )]
+    #[schemars(description = "Source path in the workspace, or @scratch/...")]
     pub remote_path: String,
     #[schemars(description = "Absolute or relative path of the local destination file")]
     pub local_path: String,
@@ -278,6 +268,11 @@ struct FleetStamp {
 
 pub struct RemoteWorkspaceServer {
     fleet_path: std::path::PathBuf,
+    /// When set, every connection writes its request/response log to
+    /// `<dir>/<workspace>.jsonl`. This is the only record of the read-only
+    /// calls (`list_directory`, `read_file`), which the server's operation log
+    /// deliberately does not record; `remote-workspace stats` reads it.
+    log_dir: Option<std::path::PathBuf>,
     /// Current fleet, swapped atomically when the fleet file changes on disk.
     /// Reads clone the `Arc` and never block on I/O.
     snapshot: std::sync::RwLock<Arc<Snapshot>>,
@@ -333,9 +328,15 @@ impl RemoteWorkspaceServer {
             parse_fleet(&text).with_context(|| format!("invalid fleet config {fleet_path:?}"))?;
         Ok(Self {
             fleet_path,
+            log_dir: None,
             snapshot: std::sync::RwLock::new(Arc::new(build_snapshot(&BTreeMap::new(), fleet))),
             last_seen: std::sync::Mutex::new(stamp),
         })
+    }
+
+    pub fn with_log_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.log_dir = Some(dir);
+        self
     }
 
     fn snapshot(&self) -> Arc<Snapshot> {
@@ -397,6 +398,16 @@ impl RemoteWorkspaceServer {
         // `code` is a stable keyword so agents can tell transport failures
         // (connect_failed) apart from a reachable-but-unhealthy workspace
         // (probe_failed: server spawned, the round-trip did not survive).
+        let log = match &self.log_dir {
+            None => None,
+            Some(dir) => {
+                let path = dir.join(format!("{workspace}.jsonl"));
+                match remote_workspace_client::ClientLog::open(path.clone()).await {
+                    Ok(l) => Some(l),
+                    Err(e) => return Err(format!("log_open_failed: {}: {e}", path.display())),
+                }
+            }
+        };
         let mut code = "connect_failed";
         let mut last = String::new();
         for attempt in 1..=CONNECT_ATTEMPTS {
@@ -406,7 +417,7 @@ impl RemoteWorkspaceServer {
             let transport = remote_workspace_client::ArgvTransport {
                 argv: handle.endpoint.control_argv(),
             };
-            match Client::connect(transport, None).await {
+            match Client::connect(transport, log.clone()).await {
                 Ok(c) => match c.stat(".").await {
                     Ok(_) => {
                         let c = Arc::new(c);
@@ -432,9 +443,7 @@ impl RemoteWorkspaceServer {
 
 #[tool_router]
 impl RemoteWorkspaceServer {
-    #[tool(
-        description = "List the configured workspaces: name, host, and root directory. Every other tool requires one of these names as its workspace argument."
-    )]
+    #[tool(description = "List the configured workspaces: name, host, and root directory.")]
     async fn list_workspaces(&self) -> CallToolResult {
         if let Err(e) = self.refresh_fleet_if_changed() {
             return err(e);
@@ -507,7 +516,7 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Read a text file. Returns the content, the file hash (pass it to edit_file as base_hash; omitted for files too large to edit), and a next offset when the file is larger than one page. Refuses binary (non-UTF-8) files; move those with download_file."
+        description = "Read a text file, paging with the returned next offset. Also returns the hash to pass to edit_file as base_hash, omitted for files too large to edit. Refuses non-UTF-8 files."
     )]
     async fn read_file(
         &self,
@@ -540,7 +549,7 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Create a new text file atomically. Fails with ALREADY_EXISTS if the path exists: existing files are modified only through edit_file. Returns operation_id and the new hash."
+        description = "Create a new text file atomically. Fails with ALREADY_EXISTS if the path exists; modify existing files with edit_file."
     )]
     async fn create_file(
         &self,
@@ -564,7 +573,7 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Modify an existing text file by exact text replacement, atomically (all or nothing). old_text must match the current content exactly: zero occurrences fail with NO_MATCH, several with AMBIGUOUS_MATCH unless replace_all is set. If the file changed since base_hash the edit fails with STALE_FILE; re-read and retry. Returns operation_id and the new hash."
+        description = "Modify an existing text file by exact text replacement, atomically. old_text must match the current content exactly: zero occurrences fail with NO_MATCH, several with AMBIGUOUS_MATCH unless replace_all is set. An edit against a stale base_hash fails with STALE_FILE; re-read and retry."
     )]
     async fn edit_file(
         &self,
@@ -599,9 +608,7 @@ impl RemoteWorkspaceServer {
         }
     }
 
-    #[tool(
-        description = "Delete a file. Recorded in the operation log; deletion is permanent and cannot be reversed by this server."
-    )]
+    #[tool(description = "Delete a file. Permanent: nothing here restores it.")]
     async fn delete_file(
         &self,
         Parameters(DeleteFileInput { workspace, path }): Parameters<DeleteFileInput>,
@@ -620,7 +627,7 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Run a command synchronously in a workspace. Returns termination, duration, and a fixed-size preview of each output stream (first 4 KiB and last 12 KiB). Redirect full output to $REMOTE_WORKSPACE_SCRATCH and read it through @scratch/... when needed."
+        description = "Run a command synchronously. Returns termination, duration, and a bounded preview of each output stream (first 4 KiB, last 12 KiB)."
     )]
     async fn run_command(
         &self,
@@ -643,7 +650,7 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Upload one local regular file to a workspace as raw streamed bytes; the file content never enters the model context, so use this (not write_file or shell tricks) for binary or large files. remote_path is workspace-relative or @scratch/...; its parent directory must already exist. Synchronous: the call returns only when the file is fully installed remotely, so a long-running call is normal for big files. Existing destinations are never replaced unless overwrite=true."
+        description = "Upload one local file to a workspace as raw streamed bytes; the content never enters the model context. Use this, not create_file, for binary or large files. A long-running call is normal for a big file."
     )]
     async fn upload_file(
         &self,
@@ -673,7 +680,7 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Download one remote regular file from a workspace to the local machine as raw streamed bytes; the file content never enters the model context, so use this (not read_file) for binary or large files. remote_path is workspace-relative or @scratch/...; the local parent directory must already exist. Synchronous: the call returns only when the file is fully installed locally, so a long-running call is normal for big files. Existing destinations are never replaced unless overwrite=true."
+        description = "Download one file from a workspace to the local machine as raw streamed bytes; the content never enters the model context. Use this, not read_file, for binary or large files. A long-running call is normal for a big file."
     )]
     async fn download_file(
         &self,
@@ -703,73 +710,6 @@ impl RemoteWorkspaceServer {
                 r.path = local_path;
                 ok_json_in_workspace(&workspace, &r)
             }
-            Err(e) => err(format!("{e}")),
-        }
-    }
-
-    #[tool(
-        description = "Show the history of operations recorded in one workspace (file mutations, exec invocations, transfers)."
-    )]
-    async fn history(
-        &self,
-        Parameters(HistoryInput { workspace, limit }): Parameters<HistoryInput>,
-    ) -> CallToolResult {
-        let (client, _) = match self.client(&workspace).await {
-            Ok(c) => c,
-            Err(e) => return err(e),
-        };
-        match client.history(limit).await {
-            Ok(ops) => {
-                if ops.is_empty() {
-                    return ok(format!(
-                        "(no operations recorded in workspace '{workspace}')"
-                    ));
-                }
-                let out = ops
-                    .iter()
-                    .map(|r| serde_json::to_string(r).unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                ok(out)
-            }
-            Err(e) => err(format!("{e}")),
-        }
-    }
-
-    #[tool(description = "Get details of a specific operation by ID, within one workspace.")]
-    async fn operation_get(
-        &self,
-        Parameters(OperationGetInput {
-            workspace,
-            operation_id,
-        }): Parameters<OperationGetInput>,
-    ) -> CallToolResult {
-        let (client, _) = match self.client(&workspace).await {
-            Ok(c) => c,
-            Err(e) => return err(e),
-        };
-        match client.operation_get(&operation_id).await {
-            Ok(d) => ok_json_in_workspace(&workspace, &d),
-            Err(e) => err(format!("{e}")),
-        }
-    }
-
-    #[tool(
-        description = "Query the status of a previously-issued request by request ID, within one workspace."
-    )]
-    async fn request_status(
-        &self,
-        Parameters(RequestStatusInput {
-            workspace,
-            request_id,
-        }): Parameters<RequestStatusInput>,
-    ) -> CallToolResult {
-        let (client, _) = match self.client(&workspace).await {
-            Ok(c) => c,
-            Err(e) => return err(e),
-        };
-        match client.request_status(&request_id).await {
-            Ok(r) => ok_json_in_workspace(&workspace, &r),
             Err(e) => err(format!("{e}")),
         }
     }

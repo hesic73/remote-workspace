@@ -64,6 +64,12 @@ struct Cli {
     #[arg(long)]
     fleet: Option<PathBuf>,
 
+    /// Record every request and response to <LOG_DIR>/<workspace>.jsonl. Off by
+    /// default; `remote-workspace stats` reads these logs, and nothing else
+    /// records the read-only calls.
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
+
     /// Diagnostic mode: validate the fleet config, probe every workspace once
     /// (spawn its server, one real round-trip), report per-workspace status,
     /// and exit nonzero if any workspace is unhealthy.
@@ -125,8 +131,11 @@ async fn main() -> Result<()> {
     // loop here makes the MCP host time the server out, e.g. when a session
     // being resumed briefly overlaps its predecessor on the same state lock).
     // The first tool call to each workspace connects on demand.
-    let server = RemoteWorkspaceServer::load(fleet_path)
+    let mut server = RemoteWorkspaceServer::load(fleet_path)
         .context("fleet config unusable; create it or pass --fleet")?;
+    if let Some(dir) = cli.log_dir {
+        server = server.with_log_dir(dir);
+    }
     let service = server
         .serve(RejectUnknownMethods(
             AsyncRwTransport::<RoleServer, _, _>::new(tokio::io::stdin(), tokio::io::stdout()),

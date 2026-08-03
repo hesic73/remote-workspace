@@ -264,7 +264,13 @@ after reconnect) are exactly the reason the state must outlive them.
   between is reconciled on restart instead of leaving a phantom operation.
 * **Client log = interaction truth.** Optional JSONL log of every request
   sent and every response/event received (including truncation flags), i.e.
-  what the agent actually saw.
+  what the agent actually saw. `remote-workspace-mcp --log-dir DIR` writes one
+  per workspace and `remote-workspace stats` aggregates them into per-tool
+  call and error counts. It is the only record of the read-only calls, which
+  mutate nothing and are deliberately absent from the operation log, so
+  "which tools does the agent actually use" is a question only this log
+  answers. Off by default: a request line carries the full content of a
+  `create_file` or `edit_file`.
 * **Bounded growth.** At startup the server prunes to the newest
   `--history-limit` operations (default 1000; 0 disables), dropping older
   records and request entries no longer referenced. The `gc` operation does the
@@ -296,10 +302,16 @@ after reconnect) are exactly the reason the state must outlive them.
 ## Idempotency and reconnect
 
 Every request has a globally unique `request_id`. The server persists results
-in `requests.jsonl` and reloads them on restart. After a dropped connection
-the client can either query `request.status` or resend the same
-`request_id` -- the server returns the stored result without re-executing.
-`exec` is never auto-retried, since re-running a command may not be safe.
+in `requests.jsonl` and reloads them on restart, so resending the same
+`request_id` returns the stored result without re-executing, and
+`request.status` reports what became of one.
+
+No shipped client draws on this yet. The MCP layer generates a fresh id per
+send and never replays: a dropped connection surfaces as an error and the
+next call reconnects. The table is still worth its one append per request --
+it is what makes replay possible at all -- but the recovery it enables is a
+capability, not a behavior. `exec` is never auto-retried in any case, since
+re-running a command may not be safe.
 
 The replay window equals the retention window: request entries older than the
 newest `--history-limit` operations are pruned along with them. Reconnect
@@ -411,14 +423,28 @@ root)` pair; "two roots on one machine" and "one root each on two machines"
 are the same concept, because all server-side state is already keyed per
 root. The agent sees tools: `list_workspaces`, `list_directory`,
 `read_file`, `create_file`, `edit_file`, `delete_file`, `run_command`,
-`upload_file`, `download_file`, `history`, `operation_get`,
-`request_status` -- one canonical tool per intent (search, file discovery,
-Git, builds, and tests all go through `run_command`; no wrapper tools), and
-each (except `list_workspaces`) with a required
+`upload_file`, `download_file` -- one canonical tool per intent (search, file
+discovery, Git, builds, and tests all go through `run_command`; no wrapper
+tools), and each (except `list_workspaces`) with a required
 `workspace` argument. Making it required, with no default, is deliberate: a
 call can never land on the wrong machine because a default silently filled
 in. Results echo the workspace name, since operation and request IDs are
 only unique within one workspace.
+
+`history`, `operation.get` and `request.status` are protocol operations
+without MCP tools. Across ~3,000 logged calls, `history` was used three times
+(all while testing this server) and the other two never. `request.status`
+never could be: request ids are generated per send and appear in no result or
+error, so the agent cannot obtain the argument. `operation.get` could be, but
+an agent that just made an edit already knows what it did. Both stay on the
+CLI, where the reader is a person rather than the agent that wrote the
+record.
+
+`list_directory` survives a similar test for the opposite reason. Agents
+rarely call it either, preferring `ls` for its flags and composition, but it
+is the only file discovery that enforces the workspace boundary, and a
+surface that can read a path but not find one is incoherent. An unpopular
+tool is not a dead one.
 
 The MCP process keeps one independent, lazily-opened connection per
 workspace, so a dead machine costs only its own calls, and the fleet needs
@@ -434,6 +460,10 @@ no server-side coordination at all -- there is no cross-workspace operation
 * `read_file` returns at most 64 KiB per call; directory listings return at
   most 1,000 entries with `next_offset`. History defaults to 50 records,
   rejects limits above 100, and omits exec preview text.
+* Integer parameters are published as `integer` but also accept an
+  unambiguous numeric string, because some hosts stringify every scalar and
+  the agent cannot diagnose the resulting rejection from a schema that told
+  it `integer`. Nothing else is coerced.
 * In SSH mode the remote command line is shell-quoted per argument, because
   `ssh` re-parses its trailing arguments through the remote shell.
 * The fleet file is reloadable configuration, not startup-only state. Before
