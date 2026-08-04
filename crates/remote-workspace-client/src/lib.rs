@@ -46,9 +46,9 @@ pub enum ClientError {
 
 type DispMap = Arc<Mutex<std::collections::HashMap<RequestId, oneshot::Sender<ServerMessage>>>>;
 
-/// Hard cap on how long a non-streaming request waits for a reply. Guards
-/// against a server that stays connected but never responds. Long-running work
-/// goes through `exec`, which has its own server-side `timeout_ms`.
+/// Default deadline for a reply, guarding against a server that stays connected
+/// but never responds. `exec` overrides it with one derived from the
+/// server-side `timeout_ms`.
 const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
@@ -201,9 +201,6 @@ impl Client {
             stdout,
             stderr,
         } = transport.spawn()?;
-        // Keep the child alive for the connection lifetime by leaking its
-        // handle into a detached task that also reaps it on drop. We hold it
-        // via the reader task.
         let stdin = Arc::new(Mutex::new(stdin));
         let reply_map: DispMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -282,9 +279,7 @@ impl Client {
         self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Resolves once the connection is closed. Checks the persistent flag first
-    /// (so a Client reused after EOF returns immediately) and otherwise waits
-    /// for the reader task's notify.
+    /// Resolves once the connection is closed.
     async fn wait_closed(&self) {
         if self.is_closed() {
             return;

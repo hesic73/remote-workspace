@@ -55,12 +55,18 @@ Adding workspace 'robot'
 Workspace 'robot' is ready.
 ```
 
-Then use it, from an agent through MCP or directly from the CLI:
+Then use it from an agent through MCP. The CLI reaches the same workspace, but
+it does not read the fleet file -- point it at the server `workspace add`
+installed:
 
 ```bash
-remote-workspace --host robot@workstation --root /home/robot/project ls .
-remote-workspace --host robot@workstation --root /home/robot/project exec -- pytest -q
+BIN=/home/robot/.local/lib/remote-workspace/remote-workspace-server
+remote-workspace --host robot@workstation --root /home/robot/project --remote-bin $BIN ls .
+remote-workspace --host robot@workstation --root /home/robot/project --remote-bin $BIN exec -- pytest -q
 ```
+
+Without `--remote-bin` the CLI looks for `remote-workspace-server` on the
+remote PATH, where `workspace add` does not put it.
 
 `--local` runs the server as a subprocess instead of over SSH, which is handy
 for trying things out on one machine.
@@ -100,9 +106,9 @@ remote-workspace-mcp --check
 ```
 
 It validates the config and probes every workspace once, printing per-workspace
-status and exiting nonzero if anything is unhealthy. Connection-class errors
-carry stable codes (`unknown_workspace`, `connect_failed`, `probe_failed`) so a
-failure says which layer broke.
+status and exiting nonzero if anything is unhealthy. Each failure carries a
+stable code (`connect_failed`, `probe_failed`) so it says which layer broke; a
+tool call naming a workspace that is not configured gets `unknown_workspace`.
 
 ## Configuration
 
@@ -238,9 +244,10 @@ Each SSH identity holds one managed server at
 `~/.local/lib/remote-workspace/remote-workspace-server`, shared by every workspace on
 that host. Passing `--remote-bin` marks a server user-managed: checked for
 compatibility, never installed or overwritten. Releases are cut by pushing a
-tag (`git tag -a vX.Y.Z && git push origin vX.Y.Z`), the only event that runs
-CI: it builds the static artifacts and publishes them with a manifest and
-checksums.
+tag (`git tag -a vX.Y.Z && git push origin vX.Y.Z`): CI builds the static
+artifacts and publishes them with a manifest and checksums. The workflow can
+also be run by hand; it builds either way, and publishes only when the ref it
+runs against is a tag.
 
 ## Development
 

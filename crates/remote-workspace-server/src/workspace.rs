@@ -20,8 +20,9 @@ impl Workspace {
     }
 
     /// Resolve a client-supplied relative path against root, rejecting `..`
-    /// escapes and symlink escapes. Returns a path that is guaranteed to stay
-    /// inside root even when intermediate components are symlinks pointing out.
+    /// escapes and symlink escapes. The result is guaranteed to stay inside the
+    /// workspace root -- or the scratch root, for `@scratch/...` paths -- even
+    /// when intermediate components are symlinks pointing out.
     pub fn resolve(&self, rel: &str) -> Result<PathBuf, ProtocolError> {
         if rel.is_empty() {
             return Err(ProtocolError::new(

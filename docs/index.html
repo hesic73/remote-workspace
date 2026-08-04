@@ -199,7 +199,9 @@ robot [robot@workstation:/home/robot/project]: ok
 lab   [lab-gpu-1:/data/experiments]: ok</code></pre>
 
 <p>Your agent now has nine tools: list, read, create, edit and delete files, run commands,
-and transfer single files in either direction. Every tool
+and transfer single files in either direction. One <code>edit_file</code> call carries up to a
+hundred replacements: they apply in order, and either all of them land or the file is
+left untouched. Every tool
 except <code>list_workspaces</code> takes a required <code>workspace</code> argument, so a
 call cannot land on the wrong machine by default. Inspecting what happened afterwards
 is a job for the <code>remote-workspace</code> CLI, not a tool the agent carries.</p>
@@ -258,8 +260,10 @@ and reports <em>up to date</em> without transferring anything when a host alread
 matches. It never edits your fleet file. Restart the host application afterwards, since
 MCP servers are loaded at startup.</p>
 
-<p class="muted">Servers older than your client keep working: an older protocol is
-accepted, and a client never downgrades a server that is newer than itself.</p>
+<p class="muted">The upgrade never downgrades a server newer than itself, and an older
+one is upgraded rather than worked around. Nothing negotiates at connection time, so
+upgrade your own binaries and your workspaces together: a client and a server from
+releases that disagree about the protocol fail per request, not up front.</p>
 
 <h2>Where things live</h2>
 
@@ -299,7 +303,7 @@ your agent writes.</p>
   </tr>
   <tr>
     <td><code>probe_failed</code>, <em>state directory is locked</em></td>
-    <td>Usually not a fault. Another session is using that workspace, and one server serves one workspace root at a time by design.</td>
+    <td>Usually not a fault: another session is using that workspace, and one server serves one workspace root at a time by design. A server left behind by a session that died with its network releases the lock about fifteen minutes after its last activity -- longer if a command it started is still running. <code>server.jsonl</code> in the state directory records when each server started and why it stopped, which dates the holder; the lock itself is released by the kernel, so a server that was killed leaves no <code>exit</code> line and no lock either.</td>
   </tr>
   <tr>
     <td>Connected, but the wrong <code>python</code></td>

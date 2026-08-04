@@ -114,9 +114,9 @@ pub enum RequestBody {
         #[serde(rename = "target_request_id")]
         target: RequestId,
     },
-    /// Prune stored history: keep only the `keep` most recent operations
-    /// (dropping their blobs) and the request entries they reference. `None`
-    /// uses the server's configured history limit.
+    /// Prune stored history to the `keep` most recent operations and the
+    /// request entries they reference; also sweeps scratch and stale upload
+    /// staging. `None` uses the server's configured history limit.
     Gc {
         #[serde(default)]
         keep: Option<usize>,

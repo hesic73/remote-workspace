@@ -47,7 +47,7 @@ impl std::fmt::Debug for Server {
 
 pub struct ServerOptions {
     pub root: PathBuf,
-    /// Resolved state directory (operation log, blobs, request table).
+    /// Resolved state directory (operation log, request table, scratch).
     pub state_dir: PathBuf,
     pub config_path: Option<PathBuf>,
     /// Keep only this many recent operations; pruned automatically at startup
@@ -85,7 +85,7 @@ impl Server {
             .iter()
             .any(|a| matches!(a, crate::store::RecoveryAction::Conflict { .. }))
         {
-            tracing::warn!("startup recovery encountered one or more conflicts; affected requests are marked Done with an error");
+            tracing::warn!("startup recovery encountered one or more conflicts; affected requests are marked Error");
         }
         if let Some(keep) = opts.history_limit {
             let stats = store
@@ -349,11 +349,11 @@ impl Server {
     ) {
         let request_id = req.request_id.clone();
 
-        // upload_prepare/upload_abort bypass the idempotency store entirely:
-        // their results carry the staging path, which must never be persisted
-        // (requests.jsonl included), and the in-memory upload registry dies
-        // with this process, so replaying either after a reconnect could not
-        // succeed anyway.
+        // upload_prepare's result carries the staging path, which must never be
+        // persisted (requests.jsonl included); upload_abort acts only on the
+        // in-memory registry, which dies with this process. Neither could be
+        // usefully replayed after a reconnect, so both skip the idempotency
+        // store.
         let unpersisted = match &req.body {
             RequestBody::UploadPrepare { path, overwrite } => Some(transfer::upload_prepare(
                 &self.workspace,
@@ -387,7 +387,7 @@ impl Server {
         // check-and-insert, so concurrent duplicate requests cannot both run.
         let op_kind = op_kind_str(&req.body);
         match self.store.claim_request(&request_id, op_kind) {
-            Ok(None) => {} // won ownership; proceed to dispatch below.
+            Ok(None) => {}
             Ok(Some(entry)) => match entry.result {
                 Some(StoredResult::Done(m)) => {
                     write_line(&stdout, &m).await;
@@ -404,9 +404,9 @@ impl Server {
                     .await;
                     return;
                 }
-                // A genuinely in-flight request should not happen in a
-                // single-connection server, but if it does, refuse rather than
-                // re-execute.
+                // Two requests sharing an id can be in flight at once, since
+                // handlers run concurrently. No shipped client does it; refuse
+                // rather than re-execute.
                 None => {
                     write_line(
                         &stdout,
@@ -817,8 +817,7 @@ impl Server {
     /// Wrap a sync result into a ServerMessage, remember it, and return it for
     /// writing. If persisting the result to the request log fails, the client
     /// is told the operation failed (with an IO error), so the server never
-    /// reports success for state it could not durably record. This honors the
-    /// repo's no-silent-failure rule.
+    /// reports success for state it could not durably record.
     async fn finish(
         &self,
         request_id: &str,

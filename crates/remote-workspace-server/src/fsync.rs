@@ -7,7 +7,7 @@ pub fn fsync_file_or_dir(path: &Path) -> std::io::Result<()> {
     let f = File::open(path)?;
     f.sync_all()?;
     // Also sync the parent directory so the file entry is durable in the
-    // directory metadata itself (important for newly created files/blobs).
+    // directory metadata itself (important for newly created files).
     if let Some(parent) = path.parent() {
         let dir = OpenOptions::new().read(true).open(parent)?;
         dir.sync_all()?;

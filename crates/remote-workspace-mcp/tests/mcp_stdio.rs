@@ -550,8 +550,8 @@ fn mcp_workspaces_are_isolated() {
     assert!(text.contains("only-in-a.txt"), "a's listing: {text}");
 }
 
-// Drive every remaining tool over real MCP stdio: edit_file, delete_file,
-// and the error paths an agent actually hits.
+// Drive edit_file and delete_file over real MCP stdio, plus the error paths an
+// agent actually hits. Transfers have their own test.
 #[test]
 fn mcp_full_tool_surface() {
     let dir = tempfile::tempdir().unwrap();

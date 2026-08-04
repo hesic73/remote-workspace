@@ -43,8 +43,8 @@ struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Keep only this many recent operations (older ones and their blobs are
-    /// pruned at startup and on gc). 0 disables pruning.
+    /// Keep only this many recent operations (older ones are pruned at startup
+    /// and on gc). 0 disables pruning.
     #[arg(long, default_value_t = 1000)]
     history_limit: usize,
 

@@ -286,12 +286,9 @@ fn write_ahead_create(
         new_hash.clone(),
     )?;
     if let Err(f) = atomic_create_bytes(abs, content, path) {
-        // Any create that did not happen withdraws its marker. Leaving one
-        // behind is not safe merely because the path is empty right now:
-        // recovery runs later, and by then any writer -- another request, a
-        // command, a person -- may have put the requested bytes there, which
-        // recovery would read as this request's own completed create and turn
-        // its recorded error into a success.
+        // The path being empty right now is not a reason to leave the marker:
+        // by the time recovery runs, another writer may have put the requested
+        // bytes there, and recovery cannot tell them from this create's own.
         if !f.changed {
             store.abort_prepared(&op_id)?;
         }
@@ -324,12 +321,9 @@ fn write_ahead_delete(
         FILE_ABSENT_HASH.into(),
     )?;
     if let Err(e) = std::fs::remove_file(abs) {
-        // Withdrawn whatever went wrong: a delete that failed because the file
-        // was already gone leaves recovery looking at an absent file, which for
-        // a delete marker reads as "it worked" -- crediting this request with
-        // someone else's removal and replacing its recorded error with a
-        // success. If the file is instead still there, recovery would drop the
-        // marker anyway, so withdrawing it changes nothing.
+        // Withdrawn whatever went wrong: an absent file reads as success for a
+        // delete marker, so a removal someone else did would be credited to
+        // this request.
         store.abort_prepared(&op_id)?;
         return Err(ProtocolError::new(
             ErrorCode::IoError,
@@ -353,13 +347,9 @@ fn write_ahead_delete(
 }
 
 /// The `edit` half: record the intent, take the last look, install, record the
-/// result. The order of these four is the whole correctness argument, and it is
-/// one function so the unwinding stays with it: a refusal after the marker is
-/// written has to take the marker with it, or recovery will later judge that
-/// marker against whatever the file holds and can synthesize a commit for a
-/// mutation that never happened.
-///
-/// Returns the operation id and the installed hash.
+/// result. The order of these four is the whole correctness argument, and they
+/// are one function so the unwinding stays with them. Returns the operation id
+/// and the installed hash.
 fn write_ahead_install(
     store: &OperationStore,
     request_id: &str,
@@ -387,14 +377,11 @@ fn write_ahead_install(
         return Err(e);
     }
     if let Err(f) = staged.install(abs) {
-        // Only a rename that never happened withdraws the marker. A durability
-        // failure after it leaves the marker for the next start, which re-hashes
-        // the file and completes the record -- committing it here instead would
-        // claim a change survived a crash when the sync that guarantees it is
-        // exactly what failed. Such a marker is not resolvable in-session and
-        // is deliberately exempt from pruning, so a filesystem whose fsync keeps
-        // failing accumulates one line per attempt until the next start. That is
-        // the WAL doing its job on a disk that is not.
+        // A durability failure after the rename keeps its marker for the next
+        // start to re-hash: committing here would claim a change survived a
+        // crash when the sync guaranteeing that is what failed. Such a marker
+        // is exempt from pruning, so a disk whose fsync keeps failing grows the
+        // log by a line per attempt until restart.
         if !f.changed {
             store.abort_prepared(&op_id)?;
         }
@@ -413,12 +400,11 @@ fn write_ahead_install(
 
 /// A failed install, and whether it left the workspace changed.
 ///
-/// The distinction is what decides the prepared marker's fate: a marker kept
-/// for a mutation that never happened can later be matched against a file some
-/// other writer produced and synthesized into a commit that never occurred,
-/// while a marker withdrawn for a mutation that DID happen loses the record of
-/// a real change. Neither is recoverable from afterwards, so the failing step
-/// has to say which it was.
+/// This decides the prepared marker's fate, and neither mistake is recoverable
+/// from: a marker kept for a mutation that never happened can be matched later
+/// against a file some other writer produced and synthesized into a commit that
+/// never occurred, while a marker withdrawn for a mutation that DID happen
+/// loses the record of a real change. So the failing step has to say which.
 #[derive(Debug)]
 struct InstallFailure {
     changed: bool,
@@ -732,7 +718,6 @@ pub fn edit(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn delete(
     ws: &Workspace,
     store: &OperationStore,
@@ -754,13 +739,12 @@ pub fn delete(
             format!("not found: {path}"),
         ));
     }
-    // For a delete, "expected after" is the empty-file hash sentinel, matching
-    // the deleted state (file absent).
+    // A delete's "expected after" is the absent-file sentinel.
     let op_id = write_ahead_delete(store, request_id, path, &abs, &before_hash)?;
     Ok(ResultBody::Mutation(MutationResult {
         operation_id: op_id,
         old_hash: before_hash,
-        new_hash: "sha256:".into(),
+        new_hash: FILE_ABSENT_HASH.into(),
     }))
 }
 

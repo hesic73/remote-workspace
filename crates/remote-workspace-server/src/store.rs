@@ -41,8 +41,8 @@ pub enum RecoveryAction {
     },
     /// A request stuck InProgress (crash mid-request) was cleared so it can be retried.
     ClearedStuck { request_id: String },
-    /// An exec request stuck InProgress was permanently marked Error (per DESIGN,
-    /// exec must not auto-retry after disconnection).
+    /// A stuck InProgress request that must not be retried -- an exec, or one
+    /// whose type the log does not record -- was permanently marked Error.
     StuckExecMarkedError { request_id: String },
 }
 
@@ -64,17 +64,23 @@ struct RequestLogLine {
     result_error: Option<ProtocolError>,
     /// The original request kind ("exec", "write", ...). Used at recovery to
     /// decide whether a stuck InProgress request is retryable (fs, read-only)
-    /// or must be permanently marked Error (exec, per DESIGN "不得自动重试").
+    /// or must be permanently marked Error (exec is never auto-retried).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     op: Option<String>,
 }
 
-/// Operation store: durable logs of all operations (fs + exec) and the request
-/// idempotency table. All filesystem state lives in `log_dir`:
+/// Operation store: durable logs of every operation (fs, exec, transfer) and
+/// the request idempotency table. A mutation appends more than one line -- a
+/// prepared marker before it, then the committed record or an aborted marker --
+/// which the loader reconciles by operation id. All state lives in `log_dir`:
 ///
-///   operations.jsonl   AnyOperationRecord per completed operation
+///   operations.jsonl   AnyOperationRecord per operation, WAL markers included
 ///   requests.jsonl     one line per request lifecycle
+///   op-counter         id high-water mark, so pruned ids are never reused
+///   lock               single-writer flock
+///   server.jsonl       server lifecycle, for diagnosing a stale holder
 ///   scratch/           agent-visible runtime artifacts
+///   scratch-swept      marker rate-limiting the scratch sweep to once a day
 ///
 /// The async `write_lock` serializes mutating handlers, so their in-memory
 /// tables and workspace effects do not interleave. It does NOT cover the logs:
@@ -90,9 +96,7 @@ pub struct OperationStore {
     records: Arc<Mutex<Vec<AnyOperationRecord>>>,
     requests: Arc<Mutex<HashMap<String, RequestEntry>>>,
     write_lock: Arc<AsyncMutex<()>>,
-    /// Serializes physical appends to both logs. Distinct from `write_lock`,
-    /// which serializes mutating handlers: request-table and exec records are
-    /// appended without it, so handler tasks do reach the logs concurrently.
+    /// Serializes physical appends to both logs -- see the struct doc.
     log_append: Arc<Mutex<()>>,
     /// Set when a partial line could not be rolled back. Nothing may be
     /// appended after a fragment, so this stops trying -- see `append_line`.
@@ -263,7 +267,7 @@ impl OperationStore {
     ///     and mark the owning request Done with a reconstructed result.
     ///   - any other value: recovery conflict; the file was changed by something
     ///     we cannot account for. Drop the prepared marker and mark the owning
-    ///     request Done with an UNDO_CONFLICT-style error so it surfaces.
+    ///     request Error with a STALE_FILE error so it surfaces.
     ///
     /// Returns the list of recovery actions taken, for logging.
     pub fn recover(
@@ -271,7 +275,6 @@ impl OperationStore {
         ws: &crate::workspace::Workspace,
     ) -> Result<Vec<RecoveryAction>, ProtocolError> {
         let mut actions = Vec::new();
-        // Snapshot the prepared markers.
         let prepareds: Vec<remote_workspace_protocol::PreparedRecord> = {
             let g = self.records.lock();
             g.iter()
@@ -617,10 +620,7 @@ impl OperationStore {
                 return Err(e);
             }
             Err(AppendFailure::Incomplete(e)) => {
-                // Nothing may follow a possibly-partial line: an unterminated
-                // tail is what the loader discards, and writing after it would
-                // make the pair a terminated line that cannot parse, which it
-                // must refuse instead.
+                // Nothing may follow a possibly-partial line -- see append_line.
                 return Err(e);
             }
         }
@@ -640,7 +640,6 @@ impl OperationStore {
     /// operations.jsonl is append-only, the committed record follows the
     /// prepared one; on load the committed record supersedes the prepared
     /// marker.
-    #[allow(clippy::too_many_arguments)]
     pub fn commit_fs_record(
         &self,
         operation_id: &str,
@@ -696,7 +695,7 @@ impl OperationStore {
             .cloned()
     }
 
-    /// Find the first committed (Fs or Exec) record whose `request_id` field
+    /// Find the first committed record (Fs, Exec or Transfer) whose `request_id`
     /// matches. Used during recovery to detect that a stuck InProgress request
     /// actually completed its operation — only the terminal result line was
     /// lost in the crash.
@@ -848,8 +847,9 @@ impl OperationStore {
 
     /// Drop all but the `keep` most recent operation records, and drop request
     /// entries no longer referenced by a retained record (in-flight entries are
-    /// always kept). Both JSONL files are rewritten atomically. Callers must hold the write guard, or run before
-    /// serving traffic.
+    /// always kept). Both JSONL files and the id counter are replaced atomically.
+    /// `log_append` is taken here to exclude concurrent appends. The `gc` path
+    /// also holds the write guard; the startup call runs before serving.
     ///
     /// Dropping a request entry shrinks the idempotency window: replaying a
     /// pruned request_id re-executes instead of returning the stored result.
@@ -937,11 +937,7 @@ impl OperationStore {
             })
     }
 
-    /// The request-log counterpart of `append_record_tracked`: the durable
-    /// append and the matching change to the request table happen under one
-    /// lock, so `prune` -- which rewrites the file from that table -- cannot
-    /// snapshot it between the two and write back a file missing an entry that
-    /// is already in it.
+    /// The request-log counterpart of `append_record_tracked`.
     fn append_request_tracked(
         &self,
         line: RequestLogLine,
@@ -1049,14 +1045,7 @@ impl OperationStore {
 }
 
 /// How far a failed append got, which decides whether anything may be appended
-/// after it.
-///
-/// A write that failed part-way can leave a line with no newline, and that is
-/// precisely the shape the loader knows how to discard as a crash-truncated
-/// tail. Appending after it would weld the next record onto the fragment and
-/// terminate the pair with a newline, turning a repairable tail into a
-/// newline-terminated line that does not parse -- which the loader must treat
-/// as a corrupted authoritative log and refuse.
+/// after it. See `append_line`.
 enum AppendFailure {
     /// The record may be a partial line. Nothing more may be appended.
     Incomplete(ProtocolError),
@@ -1138,8 +1127,6 @@ fn acquire_dir_lock(
     }
 }
 
-/// Replace a JSONL file's contents atomically: write to a temp file in the
-/// same directory, fsync, rename over the original, fsync the directory.
 /// Replace a file's contents whole: write a temp file beside it, sync, rename.
 /// A caller that cannot tolerate a half-written file uses this instead of
 /// `std::fs::write`, which truncates before it writes.
@@ -1255,27 +1242,7 @@ fn valid_content_end_offset(entries: &[LineEntry]) -> usize {
         .unwrap_or(0)
 }
 
-/// Parse a JSONL line strictly. A corrupted line in the MIDDLE of the file is
-/// a real data-integrity problem: silently skipping it would lose authoritative
-/// operation records, allow operation-id reuse, or break request idempotency
-/// (violating the repo's no-silent-failure rule). So we fail startup with the
-/// file path and 1-based line number.
-///
-/// The return value distinguishes three outcomes:
-///   Parsed(v)     — successfully deserialized; caller MUST keep the record.
-///   SkippedBlank  — trailing blank line; skip it (no truncation needed).
-///   SkippedCrashTruncated — parse failed on a trailing line WITHOUT a newline
-///     (crash truncated a partial write). The caller should skip this record
-///     AND signal to truncate the log file.
-///
-/// A line WITH a newline that fails to parse is a complete-but-corrupted record
-/// and is a hard Err (startup must abort).
-///
-/// Returns:
-///   Ok(Parsed(v))               — valid record
-///   Ok(SkippedCrashTruncated)   — trailing, no newline, parse failed → truncate later
-///   Ok(SkippedBlank)            — trailing blank (no-op)
-///   Err(..)                     — corrupted middle line or blank middle line
+/// What a log line turned out to be.
 #[allow(clippy::large_enum_variant)]
 enum ParseResult<T> {
     Parsed(T),
@@ -1283,6 +1250,14 @@ enum ParseResult<T> {
     SkippedBlank,
 }
 
+/// Parse one JSONL line.
+///
+/// A corrupted line in the MIDDLE of the file is a data-integrity problem, not
+/// something to skip: doing so would lose authoritative operation records,
+/// allow operation-id reuse, or break request idempotency. Startup fails with
+/// the path and 1-based line number instead. A trailing line WITHOUT a newline
+/// is the other case entirely -- a crash between the write and the newline --
+/// and is reported for the caller to truncate away.
 fn parse_log_line_strict<T: serde::de::DeserializeOwned>(
     entry: &LineEntry,
     path: &std::path::Path,

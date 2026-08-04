@@ -151,7 +151,7 @@ pub struct EditFileInput {
     #[schemars(description = "Current file hash, as returned by read_file")]
     pub base_hash: String,
     #[schemars(
-        description = "Replacements to apply in order, each to the result of the one before it. All succeed or the file is left untouched."
+        description = "Replacements to apply in order, each to the result of the one before it, at most 100. A replacement that does not match rejects the whole call and leaves the file untouched; a list whose net effect leaves the file unchanged is refused."
     )]
     pub edits: Vec<EditInput>,
 }
@@ -451,7 +451,9 @@ impl RemoteWorkspaceServer {
 
 #[tool_router]
 impl RemoteWorkspaceServer {
-    #[tool(description = "List the configured workspaces: name, host, and root directory.")]
+    #[tool(
+        description = "List the configured workspaces: name, host, root directory, optional label, and the connection state this process last observed -- a hint about which are already warm, not a reachability check."
+    )]
     async fn list_workspaces(&self) -> CallToolResult {
         if let Err(e) = self.refresh_fleet_if_changed() {
             return err(e);

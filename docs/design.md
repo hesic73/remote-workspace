@@ -88,7 +88,7 @@ Interactive sessions (PTY, REPL, persistent shell) are out of scope.
 
 ```text
 list  stat  read  create  edit  delete  exec
-history  operation.get  request.status  gc
+history  operation_get  request_status  gc
 upload_prepare  upload_commit  upload_abort  download_record   (transfer control plane)
 ```
 
@@ -121,33 +121,33 @@ canonical way to perform each:
   content as `old_text`, keeping destructive replacement explicit.
 
   One `edit` carries a **list** of replacements, applied in order, each to the
-  result of the one before it -- so a replacement may match text an earlier one
-  produced, and its match count is taken against that content rather than the
-  original. The list is one operation: the content is built and fully validated
-  in memory, then installed by a single rename, so a failure at any position
-  leaves the file byte-for-byte unchanged and the log gets one record with one
-  before/after pair. This is why the list exists at all -- three separate
-  `edit` calls are three separately interruptible mutations, and a failure in
-  the third leaves the file in a state no caller asked for. Errors name the
-  failing position (`edit 2 of 3`) when there is more than one. Bounded at 100
-  replacements per call, each separately bounded like any other text input.
+  result of the one before it, so a replacement may match text an earlier one
+  produced and its match count is taken against that content. The list is one
+  operation -- three separate `edit` calls are three separately interruptible
+  mutations, and a failure in the third leaves the file in a state no caller
+  asked for. Errors name the failing position (`edit 2 of 3`) when there is more
+  than one. Replacements
+  that cancel out are refused: a record whose before and after hashes are equal
+  is one recovery must read as "the rename never happened". Bounded at 100
+  replacements per call.
 
   Creating a file is still `create` alone: an empty `old_text` is a bad
-  argument here, not a shorthand for "write this file". One intent, one
-  operation applies to the list form too.
+  argument here, not a shorthand for "write this file".
 
 ```json
 {"request_id":"r2","op":"edit","path":"src/main.py","base_hash":"sha256:abc","edits":[{"old_text":"x = 1","new_text":"x = 2"},{"old_text":"def f(","new_text":"def g("}]}
 {"request_id":"r2","type":"write","operation_id":"op-7","old_hash":"sha256:abc","new_hash":"sha256:def"}
 ```
 
-`edit` requires a `base_hash`. The server checks the current hash first and
-rejects with `STALE_FILE` (carrying `expected_hash`/`actual_hash`) if the
-file changed under you. Mutations build the complete new content, then
-atomically rename into place (preserving file mode) -- a failed edit leaves
-the file byte-for-byte unchanged. Success returns an `operation_id` plus
-`old_hash`/`new_hash`. Inputs, the edited file, and the result are bounded at
-4 MiB; larger or binary files use the transfer path.
+`edit` requires a `base_hash`, compared against the bytes actually read and
+re-checked with the replacement already staged, so a write landing in between
+is refused with `STALE_FILE` (carrying `expected_hash`/`actual_hash`) rather
+than discarded. The complete new content is built, then renamed into place
+preserving file mode, so an edit that fails before the rename leaves the file
+byte-for-byte unchanged. Only a durability failure after it can report an error
+with the new bytes already installed; the next start reconciles that. Success returns an `operation_id` plus `old_hash`/`new_hash`.
+Inputs, the edited file, and the result are bounded at 4 MiB; larger or binary
+files use the transfer path.
 
 The earlier line-based `patch` operation was removed rather than kept as a
 second editing mechanism; logs recorded by older servers still load.
@@ -228,8 +228,7 @@ are synchronous and have no resume/job machinery: a
 dropped connection fails the call, the destination is never left
 half-written, and the caller just retries.
 
-A stalled transfer is not the same as a slow one, and the difference is what a
-caller actually needs to know. There is deliberately **no total timeout**: a
+There is deliberately **no total timeout**: a
 large file over a slow link legitimately takes hours, and any ceiling would
 kill healthy transfers. Instead each step is bounded by a stall window
 (`REMOTE_WORKSPACE_STALL_TIMEOUT_MS`, default 120 s) measuring only whether

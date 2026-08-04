@@ -860,9 +860,7 @@ async fn profile_unknown_rejected() {
     ));
 }
 
-// ===== Tests for reviewer findings =====
-
-// F1: symlinked ancestor + nonexistent leaf (the critical escape).
+// symlinked ancestor + nonexistent leaf (the critical escape).
 #[tokio::test]
 async fn symlinked_ancestor_nonexistent_leaf_blocked() {
     let root = tempfile::tempdir().unwrap();
@@ -895,7 +893,7 @@ async fn symlinked_ancestor_nonexistent_leaf_blocked() {
         .unwrap_or(true));
 }
 
-// F2: idempotency survives restart.
+// idempotency survives restart.
 #[tokio::test]
 async fn replay_after_restart_returns_stored_result() {
     let root = tempfile::tempdir().unwrap();
@@ -965,7 +963,7 @@ async fn replay_after_restart_returns_stored_result() {
     }
 }
 
-// F2: request.status recovers prior status after restart.
+// request.status recovers prior status after restart.
 #[tokio::test]
 async fn request_status_survives_restart() {
     let root = tempfile::tempdir().unwrap();
@@ -1006,7 +1004,7 @@ async fn request_status_survives_restart() {
     }
 }
 
-// F2: concurrent duplicate request ids execute once.
+// concurrent duplicate request ids execute once.
 #[tokio::test]
 async fn concurrent_duplicate_request_runs_once() {
     let mut h = harness().await;
@@ -1043,7 +1041,7 @@ async fn concurrent_duplicate_request_runs_once() {
     }
 }
 
-// F6: exec is recorded and retrievable via history and operation.get.
+// exec is recorded and retrievable via history and operation.get.
 #[tokio::test]
 async fn exec_recorded_in_history_and_operation_get() {
     let mut h = harness().await;
@@ -1087,7 +1085,6 @@ async fn exec_recorded_in_history_and_operation_get() {
                     assert_eq!(e.termination, Some(ExecTermination::Exited { code: 0 }));
                     assert!(e.stdout.prefix.is_empty());
                     assert_eq!(e.stdout.omitted_bytes, e.stdout.total_bytes);
-                    // duration_ms field is present and non-negative by type.
                 }
                 other => panic!("expected exec record, got {other:?}"),
             }
@@ -1114,7 +1111,7 @@ async fn exec_recorded_in_history_and_operation_get() {
     ));
 }
 
-// F6: rejected exec also consumes an id and is recorded.
+// rejected exec also consumes an id and is recorded.
 #[tokio::test]
 async fn rejected_exec_recorded_with_disposition() {
     let mut h = harness().await;
@@ -1149,7 +1146,7 @@ async fn rejected_exec_recorded_with_disposition() {
     }
 }
 
-// F7: edit of an existing file preserves executable permissions.
+// edit of an existing file preserves executable permissions.
 #[tokio::test]
 async fn edit_preserves_executable_bit() {
     use std::os::unix::fs::PermissionsExt;
@@ -1195,8 +1192,7 @@ async fn edit_preserves_executable_bit() {
     );
 }
 
-// F8: read returns a hash that matches base_hash on the next mutation, and
-// rejects non-UTF-8 content.
+// The hash read returns is accepted as base_hash by the next mutation.
 #[tokio::test]
 async fn read_hash_consistent_with_base_hash() {
     let mut h = harness().await;
@@ -1246,7 +1242,7 @@ async fn read_hash_consistent_with_base_hash() {
     );
 }
 
-// F8: non-UTF-8 read is rejected, not lossy-converted.
+// non-UTF-8 read is rejected, not lossy-converted.
 #[tokio::test]
 async fn read_rejects_non_utf8() {
     let mut h = harness().await;
@@ -1272,7 +1268,7 @@ async fn read_rejects_non_utf8() {
     ));
 }
 
-// F8: write+read over binary-ish but valid UTF-8 round-trips with a consistent
+// write+read over binary-ish but valid UTF-8 round-trips with a consistent
 // hash (hash is over raw bytes).
 #[tokio::test]
 async fn binary_safe_hash_for_multibyte_utf8() {
@@ -1305,7 +1301,7 @@ async fn binary_safe_hash_for_multibyte_utf8() {
     assert_eq!(r.hash.unwrap(), hash_of(content));
 }
 
-// R1: the REAL crash window — prepared written, file already renamed (so its
+// the crash window — prepared written, file already renamed (so its
 // hash == expected_after), but commit and result never written. After restart,
 // recovery must synthesize the commit so the change is recorded and the
 // request reports Done (not "in progress").
@@ -1401,7 +1397,7 @@ async fn recovery_synthesizes_commit_when_rename_done() {
     }
 }
 
-// R1: when the rename did NOT take effect (file still == before), recovery must
+// when the rename did NOT take effect (file still == before), recovery must
 // drop the orphaned prepared marker and make the request retryable, so the
 // change is neither lost nor stuck.
 #[tokio::test]
@@ -1483,7 +1479,7 @@ async fn recovery_drops_when_rename_not_done() {
     }
 }
 
-// R2: when the request log is unwritable, the server must surface the error to
+// when the request log is unwritable, the server must surface the error to
 // the client rather than silently reporting success with no durable state.
 #[tokio::test]
 async fn read_only_request_log_surfaces_error() {
@@ -1513,9 +1509,6 @@ async fn read_only_request_log_surfaces_error() {
         matches!(m, ServerMessage::Error { .. }),
         "expected error when request log is unwritable, got {m:?}"
     );
-    // And the file must NOT have been written, since claim failed before execution.
-    // (Actually the write guard + mutation could run; the key assertion is that
-    // the client never sees success. We additionally confirm no success result.)
     // Restore perms so the tempdir cleans up.
     std::fs::set_permissions(
         root.path().join(".remote-workspace/requests.jsonl"),
@@ -1524,7 +1517,7 @@ async fn read_only_request_log_surfaces_error() {
     .ok();
 }
 
-// F4: a normal create durably appends BOTH a prepared marker and a committed
+// a normal create durably appends BOTH a prepared marker and a committed
 // fs record (the WAL), and history reconciles them to a single entry.
 #[tokio::test]
 async fn create_appends_prepared_then_committed() {
@@ -1565,7 +1558,7 @@ async fn create_appends_prepared_then_committed() {
     }
 }
 
-// R1-regression: zombie prepared record does not resurrect after drop+retry+restart.
+// Regression: zombie prepared record does not resurrect after drop+retry+restart.
 #[tokio::test]
 async fn aborted_marker_prevents_zombie_prepared() {
     let root = tempfile::tempdir().unwrap();
@@ -1652,7 +1645,7 @@ async fn aborted_marker_prevents_zombie_prepared() {
     }
 }
 
-// R2-regression: exec must not auto-retry when replayed after disconnection.
+// Regression: exec must not auto-retry when replayed after disconnection.
 #[tokio::test]
 async fn exec_replay_after_disconnect_rejected() {
     let root = tempfile::tempdir().unwrap();
@@ -2330,7 +2323,6 @@ async fn valid_record_without_trailing_newline_survives_restart() {
     }
 }
 
-// Confirm the old crash-truncated test still works with the new logic.
 #[tokio::test]
 async fn crash_truncated_partial_record_still_removed() {
     let root = tempfile::tempdir().unwrap();
@@ -2444,9 +2436,9 @@ async fn crash_mid_utf8_codepoint_tail_recovered() {
     );
 }
 
-// Regression: a three-line operations log where a committed record follows a
-// prepared record for the same operation_id must show exactly one record in
-// history (the committed version supersedes the prepared marker).
+// A committed record following a prepared one for the same operation_id
+// collapses to a single entry, so the three-line log below reconciles to two
+// operations: op-1 and the committed op-2.
 #[tokio::test]
 async fn prepared_and_committed_same_id_reconcile_to_one() {
     let root = tempfile::tempdir().unwrap();
@@ -2839,8 +2831,9 @@ setup = "export MARKER=via-override"
     }
 }
 
-// A config written for a newer server (unknown fields) must fail startup
-// loudly instead of silently running commands in the wrong environment.
+// A config the server cannot honour -- an undeclared default_profile, an
+// unknown field, an empty shell -- must fail startup loudly instead of
+// silently running commands in the wrong environment.
 #[tokio::test]
 async fn server_startup_rejects_config_with_unknown_fields() {
     for bad in [
