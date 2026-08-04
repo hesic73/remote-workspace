@@ -248,6 +248,7 @@ the canonical root path:
 |-- requests.jsonl     request idempotency table
 |-- scratch/           agent-visible runtime artifacts (`@scratch/...`)
 |-- lock               single-writer flock
+|-- server.jsonl       server lifecycle: start, lock refusal, exit reason
 `-- op-counter         id high-water mark (prevents reuse after pruning)
 ```
 
@@ -271,6 +272,14 @@ after reconnect) are exactly the reason the state must outlive them.
   "which tools does the agent actually use" is a question only this log
   answers. Off by default: a request line carries the full content of a
   `create_file` or `edit_file`.
+* **Session log = lifecycle truth.** `server.jsonl` records one line per
+  server start, refused start (with the pid holding the lock), and exit (with
+  the reason). The server's stderr goes to whoever is attached over SSH, and
+  the case worth diagnosing -- a server still running after its client
+  vanished -- is precisely the case where nobody is. This file is what remains
+  on the remote to answer it. Trimmed to its newest lines at startup once past
+  256 KiB. The server logs at `info` by default rather than requiring
+  `RUST_LOG`, which cannot be set through `ssh host '<binary> ...'` anyway.
 * **Bounded growth.** At startup the server prunes to the newest
   `--history-limit` operations (default 1000; 0 disables), dropping older
   records and request entries no longer referenced. The `gc` operation does the
@@ -298,6 +307,19 @@ after reconnect) are exactly the reason the state must outlive them.
   held for the server's lifetime (auto-released by the kernel on death). A
   second server on the same root fails fast with a clear error; reconnects
   get a short grace period while the predecessor shuts down.
+* **The server outlives no one.** Stdin EOF is the ordinary way a server
+  exits, but it depends on the far end of the SSH session noticing that its
+  peer is gone -- which a suspended laptop, a switched network, or a dropped
+  VPN can delay for as long as TCP keepalives take (hours). The client's own
+  detection is aggressive by comparison (`ServerAliveInterval=30`,
+  `ServerAliveCountMax=4`), so without a deadline of its own the server spends
+  that entire gap holding a lock for a client that is already gone and
+  reconnecting -- which is what makes a workspace look occupied when nobody is
+  using it. So the server also exits after `--idle-timeout-secs` (default 900;
+  0 disables) with no request arriving *and none running*: a single hour-long
+  `exec` is silence, not idleness, and must not be killed by the timer waiting
+  on it. Timing out is cheap because connections are rebuilt on demand -- the
+  next tool call pays one SSH connect.
 
 ## Idempotency and reconnect
 
@@ -485,7 +507,15 @@ no server-side coordination at all -- there is no cross-workspace operation
   call that dies mid-flight surfaces as an error and is never auto-retried.
   `initialize` never blocks on connecting, and the transport child carries
   PDEATHSIG so a killed MCP cannot orphan its ssh (which would keep the
-  remote server -- and the state lock -- alive).
+  remote server -- and the state lock -- alive). PDEATHSIG covers a dead
+  *process*; a dead *link* is covered from the far end by the server's idle
+  timeout.
+* The transport child's stderr is captured, not inherited, and its tail is
+  attached to `server closed connection`. A server that refuses to start says
+  why and exits; inheriting that text scatters it into the MCP host's log,
+  where the agent -- the one being told the workspace is unreachable -- cannot
+  see it. Kept as the *last* few lines, since a login shell on the far end
+  prints its own noise before the part that matters.
 
 ## Technology
 
@@ -526,4 +556,7 @@ the alternative is a multi-process operation log -- per-append locking, id
 allocation through the counter file, and in-memory tables demoted to caches
 with invalidation -- which puts the WAL and idempotency core at risk to serve a
 case with a simple workaround. Point the second session at a different root, or
-wait for the first to exit.
+wait for the first to exit -- bounded by the idle timeout, so "wait for it" is
+minutes rather than however long a dead session goes unnoticed. Which server
+holds the lock, and whether it was ever knocked on, is in the holder's
+`server.jsonl`.

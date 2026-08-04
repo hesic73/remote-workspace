@@ -10,6 +10,7 @@ use crate::config::ServerConfig;
 use crate::exec;
 use crate::fs_ops;
 use crate::scratch;
+use crate::session_log::SessionLog;
 use crate::store::{OperationStore, StoredResult};
 use crate::transfer;
 use crate::workspace::Workspace;
@@ -23,6 +24,8 @@ pub struct Server {
     pub config: Arc<ServerConfig>,
     history_limit: Option<usize>,
     scratch_max_age: Option<std::time::Duration>,
+    idle_timeout: Option<std::time::Duration>,
+    session_log: Arc<SessionLog>,
     /// Pending uploads (staging file created, commit not yet received).
     /// In-memory only: staging paths must never be persisted, and the staging
     /// files die with the connection anyway.
@@ -46,13 +49,23 @@ pub struct ServerOptions {
     /// Evict scratch files idle beyond this, on `gc` and at most once a day at
     /// startup. `None` disables sweeping.
     pub scratch_max_age: Option<std::time::Duration>,
+    /// Exit after this long with no request arriving and none still running.
+    /// The only other way this server ever stops is EOF on stdin, which
+    /// depends on the far end of the SSH session noticing that its peer is
+    /// gone -- something a suspended laptop or a dropped link can delay for
+    /// hours, during which the state lock makes the workspace look occupied.
+    /// `None` disables the timeout and restores that dependency.
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 impl Server {
     pub fn new(opts: ServerOptions) -> anyhow::Result<Self> {
         let state_dir = opts.state_dir.clone();
+        let root = opts.root.clone();
         let workspace = Arc::new(Workspace::new(opts.root, opts.state_dir.join("scratch"))?);
         let store = OperationStore::new(opts.state_dir).map_err(|e| anyhow::anyhow!(e))?;
+        let session_log = Arc::new(SessionLog::new(&state_dir));
+        session_log.trim_if_large();
         // Run WAL recovery before serving: reconcile any prepared markers left
         // by a crash, and clear requests stuck InProgress so they become retryable.
         let actions = store
@@ -101,12 +114,32 @@ impl Server {
             }
             None => Arc::new(ServerConfig::default()),
         };
+        // Last, so that a `started` with no matching `exit` means one thing
+        // only: that server reached the point of serving and has not recorded
+        // stopping. A start that fails never claims to have begun; it reports
+        // itself on stderr, which the client now carries.
+        session_log.record(
+            "started",
+            serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "root": root.display().to_string(),
+                "idle_timeout_ms": opts.idle_timeout.map(|d| d.as_millis() as u64),
+            }),
+        );
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            root = %root.display(),
+            state_dir = %state_dir.display(),
+            "server started"
+        );
         Ok(Self {
             workspace,
             store,
             config,
             history_limit: opts.history_limit,
             scratch_max_age: opts.scratch_max_age,
+            idle_timeout: opts.idle_timeout,
+            session_log,
             uploads: transfer::UploadRegistry::default(),
         })
     }
@@ -122,22 +155,49 @@ impl Server {
         R: tokio::io::AsyncRead + Unpin + Send,
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        let idle_timeout = self.idle_timeout;
+        let session_log = self.session_log.clone();
+        let started = std::time::Instant::now();
         let server = Arc::new(self);
         let mut reader = BufReader::new(read);
         let stdout: Arc<tokio::sync::Mutex<W>> = Arc::new(tokio::sync::Mutex::new(write));
         let mut line = String::new();
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut served: u64 = 0;
 
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).await?;
+        let reason = loop {
+            // `read_line` appends and is cancel-safe in that sense: a line the
+            // idle timeout interrupts part-way stays in `line` and is finished
+            // by the next call, so the buffer is cleared only once a whole
+            // line has been consumed.
+            let read = match idle_timeout {
+                Some(d) => tokio::time::timeout(d, reader.read_line(&mut line)).await,
+                None => Ok(reader.read_line(&mut line).await),
+            };
+            let n = match read {
+                Ok(r) => r?,
+                Err(_elapsed) => {
+                    // A single `exec` may legitimately run for an hour without
+                    // the client sending anything, so idleness means no work in
+                    // flight either -- otherwise the timeout would kill the
+                    // very request it is waiting on.
+                    if in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                        break "idle_timeout";
+                    }
+                    continue;
+                }
+            };
             if n == 0 {
-                break;
+                break "stdin_eof";
             }
             let trimmed = line.trim();
             if trimmed.is_empty() {
+                line.clear();
                 continue;
             }
-            let req: Request = match serde_json::from_str(trimmed) {
+            let parsed = serde_json::from_str::<Request>(trimmed);
+            line.clear();
+            let req = match parsed {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = ServerMessage::Error {
@@ -151,12 +211,28 @@ impl Server {
                     continue;
                 }
             };
+            served += 1;
+            // Counted here rather than inside the task, so there is no window
+            // in which an accepted request is invisible to the idle check.
+            let flight = InFlight::enter(&in_flight);
             let server = server.clone();
             let stdout = stdout.clone();
             tokio::spawn(async move {
+                let _flight = flight;
                 server.handle(req, stdout).await;
             });
-        }
+        };
+
+        let uptime_ms = started.elapsed().as_millis() as u64;
+        session_log.record(
+            "exit",
+            serde_json::json!({
+                "reason": reason,
+                "uptime_ms": uptime_ms,
+                "requests": served,
+            }),
+        );
+        tracing::info!(reason, uptime_ms, requests = served, "server exiting");
         Ok(())
     }
 
@@ -688,6 +764,25 @@ impl Server {
                 error: log_err,
             }),
         }
+    }
+}
+
+/// Counts a request from the moment it is accepted until its handler task
+/// ends, including a handler that panics. Only a count that never drifts up
+/// can be trusted by the idle timeout, since a phantom in-flight request would
+/// keep the server -- and the workspace's state lock -- alive indefinitely.
+struct InFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl InFlight {
+    fn enter(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

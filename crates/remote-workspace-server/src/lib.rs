@@ -6,6 +6,7 @@ pub mod hash;
 pub mod install;
 pub mod scratch;
 pub mod server;
+pub mod session_log;
 pub mod store;
 pub mod transfer;
 pub mod workspace;

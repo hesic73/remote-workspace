@@ -910,10 +910,18 @@ fn acquire_dir_lock(
             return Ok(f);
         }
         if std::time::Instant::now() >= deadline {
-            let holder = std::fs::read_to_string(&path)
+            let holder_pid = std::fs::read_to_string(&path)
                 .ok()
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty());
+            // Recorded from the refused side: the holder writes nothing when it
+            // is stuck, so this is what shows a workspace being knocked on
+            // while something older still owns it.
+            crate::session_log::SessionLog::new(log_dir).record(
+                "lock_denied",
+                serde_json::json!({ "holder_pid": holder_pid }),
+            );
+            let holder = holder_pid
                 .map(|pid| format!(" (held by pid {pid})"))
                 .unwrap_or_default();
             return Err(ProtocolError::new(

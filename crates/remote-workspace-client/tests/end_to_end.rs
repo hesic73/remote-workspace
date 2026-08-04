@@ -16,26 +16,32 @@ struct LocalServerTransport {
 }
 
 impl Transport for LocalServerTransport {
-    fn spawn(
-        &mut self,
-    ) -> std::io::Result<(
-        tokio::process::Child,
-        tokio::process::ChildStdin,
-        tokio::process::ChildStdout,
-    )> {
-        use std::process::Stdio;
-        use tokio::process::Command;
-        let mut cmd = Command::new(&self.argv[0]);
-        cmd.args(&self.argv[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        Ok((child, stdin, stdout))
+    fn spawn(&mut self) -> std::io::Result<remote_workspace_client::Spawned> {
+        spawn_piped(&self.argv)
     }
+}
+
+/// The argv spawned the way `ArgvTransport` does it, stderr included, so the
+/// tests exercise the same pipe setup the real client uses.
+fn spawn_piped(argv: &[String]) -> std::io::Result<remote_workspace_client::Spawned> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take();
+    Ok(remote_workspace_client::Spawned {
+        child,
+        stdin,
+        stdout,
+        stderr,
+    })
 }
 
 async fn make_client(root: &Path) -> Client {
@@ -212,24 +218,8 @@ async fn client_returns_closed_when_server_dies() {
     // client must surface an error, not block forever on its reply channel.
     struct DeadTransport;
     impl Transport for DeadTransport {
-        fn spawn(
-            &mut self,
-        ) -> std::io::Result<(
-            tokio::process::Child,
-            tokio::process::ChildStdin,
-            tokio::process::ChildStdout,
-        )> {
-            use std::process::Stdio;
-            use tokio::process::Command;
-            let mut cmd = Command::new("false");
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .kill_on_drop(true);
-            let mut child = cmd.spawn()?;
-            let stdin = child.stdin.take().expect("piped stdin");
-            let stdout = child.stdout.take().expect("piped stdout");
-            Ok((child, stdin, stdout))
+        fn spawn(&mut self) -> std::io::Result<remote_workspace_client::Spawned> {
+            spawn_piped(&["false".to_string()])
         }
     }
 
@@ -255,24 +245,8 @@ async fn client_returns_closed_when_server_dies() {
 async fn client_exec_returns_closed_when_server_dies() {
     struct DeadTransport;
     impl Transport for DeadTransport {
-        fn spawn(
-            &mut self,
-        ) -> std::io::Result<(
-            tokio::process::Child,
-            tokio::process::ChildStdin,
-            tokio::process::ChildStdout,
-        )> {
-            use std::process::Stdio;
-            use tokio::process::Command;
-            let mut cmd = Command::new("false");
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .kill_on_drop(true);
-            let mut child = cmd.spawn()?;
-            let stdin = child.stdin.take().expect("piped stdin");
-            let stdout = child.stdout.take().expect("piped stdout");
-            Ok((child, stdin, stdout))
+        fn spawn(&mut self) -> std::io::Result<remote_workspace_client::Spawned> {
+            spawn_piped(&["false".to_string()])
         }
     }
 
@@ -453,4 +427,74 @@ async fn cli_state_base_redirects_state_location() {
         .starts_with(&*root_name));
     assert!(keyed.join("operations.jsonl").exists());
     assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+}
+
+// A server that refuses to start explains itself on stderr and exits. Without
+// that text the client can only report the symptom ("server closed
+// connection"), which is what made a locked workspace undiagnosable.
+#[tokio::test]
+async fn closed_error_carries_what_the_remote_printed() {
+    struct RefusingTransport;
+    impl Transport for RefusingTransport {
+        fn spawn(&mut self) -> std::io::Result<remote_workspace_client::Spawned> {
+            spawn_piped(&[
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo 'noise from a login shell' >&2; \
+                 echo 'Error: state directory is locked by another remote-workspace-server (held by pid 4242)' >&2; \
+                 exit 1"
+                    .to_string(),
+            ])
+        }
+    }
+
+    let client = Client::connect(RefusingTransport, None).await.unwrap();
+    let err = client.stat(".").await.unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("locked by another remote-workspace-server") && text.contains("4242"),
+        "close error lost the remote's reason: {text}"
+    );
+}
+
+// The same, with the far end given time to be thoroughly dead first, so the
+// request fails on the write rather than on the missing reply. Both routes out
+// have to carry the reason; only one of them is a "closed connection" by name.
+#[tokio::test]
+async fn a_request_written_to_a_dead_transport_still_reports_why() {
+    struct RefusingTransport;
+    impl Transport for RefusingTransport {
+        fn spawn(&mut self) -> std::io::Result<remote_workspace_client::Spawned> {
+            spawn_piped(&[
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo 'Error: state directory is locked (held by pid 4242)' >&2; exit 1"
+                    .to_string(),
+            ])
+        }
+    }
+
+    let client = Client::connect(RefusingTransport, None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let text = client.stat(".").await.unwrap_err().to_string();
+    assert!(
+        text.contains("state directory is locked") && text.contains("4242"),
+        "error lost the remote's reason: {text}"
+    );
+}
+
+// Nothing printed, nothing invented: the message stays clean when the far end
+// dies silently.
+#[tokio::test]
+async fn closed_error_stays_bare_when_the_remote_said_nothing() {
+    struct SilentTransport;
+    impl Transport for SilentTransport {
+        fn spawn(&mut self) -> std::io::Result<remote_workspace_client::Spawned> {
+            spawn_piped(&["false".to_string()])
+        }
+    }
+
+    let client = Client::connect(SilentTransport, None).await.unwrap();
+    let err = client.stat(".").await.unwrap_err();
+    assert_eq!(err.to_string(), "server closed connection");
 }

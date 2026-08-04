@@ -55,6 +55,14 @@ struct Args {
     #[arg(long, default_value_t = 7)]
     scratch_max_age_days: u64,
 
+    /// Exit after this many seconds with no request arriving and none running,
+    /// releasing the workspace's state lock. Clients reconnect on demand, so
+    /// the cost of timing out is one SSH connect on the next call; the cost of
+    /// not timing out is a workspace that stays locked for as long as a dead
+    /// SSH session goes unnoticed on this host. 0 disables it.
+    #[arg(long, default_value_t = 900)]
+    idle_timeout_secs: u64,
+
     /// Internal raw data plane: stream stdin into this staging file (created
     /// by upload_prepare on the resident server). Does not open the state
     /// directory, so it cannot conflict with the resident server's lock.
@@ -89,8 +97,13 @@ fn resolve_state_base(state_base: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Lifecycle events are the whole record of a remote server's life, and
+    // RUST_LOG cannot be set through `ssh host '<binary> ...'` anyway, so the
+    // useful level is the default rather than something to opt into.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_writer(std::io::stderr)
         .init();
 
@@ -140,6 +153,8 @@ async fn main() -> anyhow::Result<()> {
         history_limit: (args.history_limit > 0).then_some(args.history_limit),
         scratch_max_age: (args.scratch_max_age_days > 0)
             .then(|| std::time::Duration::from_secs(args.scratch_max_age_days * 86_400)),
+        idle_timeout: (args.idle_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(args.idle_timeout_secs)),
     };
 
     Server::new(opts)?.run_stdio().await?;

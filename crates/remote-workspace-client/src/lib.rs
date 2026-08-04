@@ -7,7 +7,7 @@ use remote_workspace_protocol::{
 };
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, warn};
 
@@ -26,8 +26,12 @@ pub enum ClientError {
     Server(ProtocolError),
     #[error("transport io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("server closed connection")]
-    Closed,
+    /// `detail` is the tail of what the remote printed before dying, already
+    /// formatted with its separator, or empty if it said nothing. A server
+    /// that refuses to start explains itself on stderr and exits; without
+    /// that text this error can only report the symptom.
+    #[error("server closed connection{detail}")]
+    Closed { detail: String },
     #[error("request timed out")]
     Timeout,
     #[error("serde error: {0}")]
@@ -44,10 +48,20 @@ type DispMap = Arc<Mutex<std::collections::HashMap<RequestId, oneshot::Sender<Se
 const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
-/// Spawns the remote process (ssh or local). Implementations return the child
-/// and its stdin/stdout pipes.
+/// A spawned transport process and the pipes the client drives it through.
+pub struct Spawned {
+    pub child: Child,
+    pub stdin: ChildStdin,
+    pub stdout: ChildStdout,
+    /// Piped stderr, drained into the connection's error tail. `None` when the
+    /// transport routes stderr elsewhere, which costs the reason a failed
+    /// connection would otherwise carry.
+    pub stderr: Option<ChildStderr>,
+}
+
+/// Spawns the remote process (ssh or local).
 pub trait Transport: Send {
-    fn spawn(&mut self) -> std::io::Result<(Child, ChildStdin, ChildStdout)>;
+    fn spawn(&mut self) -> std::io::Result<Spawned>;
 }
 
 /// Default transport: spawns the given argv as a subprocess. For SSH use
@@ -58,12 +72,15 @@ pub struct ArgvTransport {
 }
 
 impl Transport for ArgvTransport {
-    fn spawn(&mut self) -> std::io::Result<(Child, ChildStdin, ChildStdout)> {
+    fn spawn(&mut self) -> std::io::Result<Spawned> {
         let mut cmd = Command::new(&self.argv[0]);
         cmd.args(&self.argv[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            // Piped, not inherited: over SSH this carries the remote server's
+            // own diagnosis of why it is about to exit, and inheriting it
+            // scatters that into the host's log where the caller never sees it.
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         // Die with the parent: if the consumer (CLI/MCP) is killed -- even
         // with SIGKILL, where no destructor runs -- the transport child must
@@ -78,8 +95,84 @@ impl Transport for ArgvTransport {
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
-        Ok((child, stdin, stdout))
+        let stderr = child.stderr.take();
+        Ok(Spawned {
+            child,
+            stdin,
+            stdout,
+            stderr,
+        })
     }
+}
+
+/// Bounded tail of the transport's stderr, so a closed connection can say what
+/// the far end printed on its way out instead of only that it closed.
+struct StderrTail {
+    lines: Mutex<std::collections::VecDeque<String>>,
+    finished: std::sync::atomic::AtomicBool,
+    finished_notify: tokio::sync::Notify,
+}
+
+const STDERR_TAIL_LINES: usize = 8;
+const STDERR_LINE_LIMIT: usize = 400;
+/// How long `text` waits for the stderr reader to reach EOF. stdout and stderr
+/// close together when the far end dies, so the reason is often still in
+/// flight at the moment the missing reply surfaces as an error.
+const STDERR_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+impl StderrTail {
+    fn new() -> Self {
+        Self {
+            lines: Mutex::new(std::collections::VecDeque::new()),
+            finished: std::sync::atomic::AtomicBool::new(false),
+            finished_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn push(&self, line: &str) {
+        let line = line.trim_end();
+        if line.is_empty() {
+            return;
+        }
+        let mut g = self.lines.lock().await;
+        if g.len() == STDERR_TAIL_LINES {
+            g.pop_front();
+        }
+        g.push_back(clip(line, STDERR_LINE_LIMIT));
+    }
+
+    fn finish(&self) {
+        self.finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.finished_notify.notify_waiters();
+    }
+
+    /// The tail, after giving the reader a moment to finish. Keeps the last
+    /// lines rather than the first: shells on the far end print their own
+    /// noise at startup, and what matters is the last thing said.
+    async fn text(&self) -> String {
+        if !self.finished.load(std::sync::atomic::Ordering::SeqCst) {
+            // Registering before the re-check closes the window where the
+            // reader finishes between them; the timeout bounds the rest.
+            let notified = self.finished_notify.notified();
+            if !self.finished.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = tokio::time::timeout(STDERR_DRAIN_GRACE, notified).await;
+            }
+        }
+        let g = self.lines.lock().await;
+        g.iter().cloned().collect::<Vec<_>>().join("; ")
+    }
+}
+
+fn clip(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 pub struct Client {
@@ -89,6 +182,7 @@ pub struct Client {
     /// later request on this Client fails immediately instead of hanging.
     closed: Arc<std::sync::atomic::AtomicBool>,
     closed_notify: Arc<tokio::sync::Notify>,
+    stderr: Arc<StderrTail>,
     log: Option<Arc<ClientLog>>,
 }
 
@@ -97,7 +191,12 @@ impl Client {
         mut transport: T,
         log: Option<ClientLog>,
     ) -> Result<Self, ClientError> {
-        let (mut _child, stdin, stdout) = transport.spawn()?;
+        let Spawned {
+            mut child,
+            stdin,
+            stdout,
+            stderr,
+        } = transport.spawn()?;
         // Keep the child alive for the connection lifetime by leaking its
         // handle into a detached task that also reaps it on drop. We hold it
         // via the reader task.
@@ -106,6 +205,34 @@ impl Client {
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let closed_notify = Arc::new(tokio::sync::Notify::new());
         let log = log.map(Arc::new);
+        let tail = Arc::new(StderrTail::new());
+
+        match stderr {
+            // Drained continuously, not on demand: an unread pipe fills at
+            // 64 KiB and blocks the far end mid-write.
+            Some(stderr) => {
+                let tail = tail.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stderr);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                // Also traced, so nothing the far end says is
+                                // lost to the tail's bound when someone is
+                                // watching with RUST_LOG.
+                                debug!(line = %line.trim_end(), "transport stderr");
+                                tail.push(&line).await;
+                            }
+                        }
+                    }
+                    tail.finish();
+                });
+            }
+            None => tail.finish(),
+        }
 
         let reader_reply = reply_map.clone();
         let drain_reply = reply_map.clone();
@@ -120,7 +247,7 @@ impl Client {
             drain_waiters(&drain_reply).await;
             reader_notify.notify_waiters();
             // When stdout ends, the child has exited.
-            let _ = _child.wait().await;
+            let _ = child.wait().await;
         });
 
         Ok(Self {
@@ -128,8 +255,21 @@ impl Client {
             reply_map,
             closed,
             closed_notify,
+            stderr: tail,
             log,
         })
+    }
+
+    /// The close error, carrying whatever the far end printed before dying.
+    async fn closed_error(&self) -> ClientError {
+        let tail = self.stderr.text().await;
+        ClientError::Closed {
+            detail: if tail.is_empty() {
+                String::new()
+            } else {
+                format!(": {tail}")
+            },
+        }
     }
 
     /// True once the transport has EOF'd. A closed Client never recovers;
@@ -178,7 +318,7 @@ impl Client {
         timeout: std::time::Duration,
     ) -> Result<(RequestId, ServerMessage), ClientError> {
         if self.is_closed() {
-            return Err(ClientError::Closed);
+            return Err(self.closed_error().await);
         }
         let request_id = self.next_request_id();
         let req = Request {
@@ -193,9 +333,22 @@ impl Client {
         }
         {
             let mut w = self.stdin.lock().await;
-            w.write_all(line.as_bytes()).await?;
-            w.write_all(b"\n").await?;
-            w.flush().await?;
+            let written = async {
+                w.write_all(line.as_bytes()).await?;
+                w.write_all(b"\n").await?;
+                w.flush().await
+            }
+            .await;
+            if let Err(e) = written {
+                // A refused server exits before the first request is even
+                // written, so this -- not the missing reply -- is where its
+                // death usually surfaces. It is the same event as a close and
+                // owes the caller the same explanation.
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    return Err(self.closed_error().await);
+                }
+                return Err(ClientError::Io(e));
+            }
         }
         // Race the reply against connection close and a hard request timeout:
         // if the server/SSH disappears, the reader drains reply_map (closing
@@ -203,12 +356,15 @@ impl Client {
         // Either way we never block indefinitely.
         let msg = tokio::select! {
             biased;
-            () = self.wait_closed() => return Err(ClientError::Closed),
+            () = self.wait_closed() => return Err(self.closed_error().await),
             () = tokio::time::sleep(timeout) => {
                 self.reply_map.lock().await.remove(&request_id);
                 return Err(ClientError::Timeout);
             }
-            m = rx => m.map_err(|_| ClientError::Closed)?,
+            m = rx => match m {
+                Ok(m) => m,
+                Err(_) => return Err(self.closed_error().await),
+            },
         };
         if let Some(l) = &self.log {
             l.log_response(&request_id, &msg).await;

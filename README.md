@@ -171,6 +171,15 @@ destructive command inside the workspace cannot take the operation log with it.
 state directory is always safe. Growth is bounded by `--history-limit`
 (default 1000) and `gc`.
 
+One server serves a workspace root at a time, so a workspace in use by another
+session is refused with the pid holding it. A server also exits on its own
+after `--idle-timeout-secs` (default 900) with no request arriving and none
+running, releasing the lock; the next tool call reconnects. Without that, a
+session that dies with its network -- a closed laptop, a dropped VPN -- leaves
+the remote server waiting on a connection nobody will ever close again, and the
+workspace looks occupied until the host's TCP keepalives give up hours later.
+`<state>/server.jsonl` on the remote records each start, refusal, and exit.
+
 ## CLI
 
 | Command | Purpose |

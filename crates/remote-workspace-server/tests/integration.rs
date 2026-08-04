@@ -74,6 +74,7 @@ async fn harness_at_with_owned(
         config_path,
         history_limit: None,
         scratch_max_age: None,
+        idle_timeout: None,
     })
     .unwrap();
 
@@ -2027,6 +2028,7 @@ async fn corrupted_middle_log_line_fails_startup() {
         config_path: None,
         history_limit: None,
         scratch_max_age: None,
+        idle_timeout: None,
     });
     assert!(
         result.is_err(),
@@ -2069,6 +2071,7 @@ async fn corrupted_trailing_log_line_tolerated() {
         config_path: None,
         history_limit: None,
         scratch_max_age: None,
+        idle_timeout: None,
     });
     assert!(
         server.is_ok(),
@@ -2394,6 +2397,7 @@ async fn crash_mid_utf8_codepoint_tail_recovered() {
         config_path: None,
         history_limit: None,
         scratch_max_age: None,
+        idle_timeout: None,
     });
     assert!(
         server.is_ok(),
@@ -2591,6 +2595,7 @@ async fn startup_prune_respects_history_limit() {
         config_path: None,
         history_limit: Some(1),
         scratch_max_age: None,
+        idle_timeout: None,
     })
     .unwrap();
     let ops = server.store.history(None);
@@ -2826,6 +2831,7 @@ async fn server_startup_rejects_config_with_unknown_fields() {
             config_path: Some(config_path),
             history_limit: None,
             scratch_max_age: None,
+            idle_timeout: None,
         });
         assert!(result.is_err(), "config must be rejected at startup: {bad}");
     }
@@ -2898,4 +2904,203 @@ async fn legacy_undo_state_still_loads_and_sheds_its_blobs() {
         } => assert_eq!(w.operation_id, "op-3"),
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+// ---- idle timeout ----
+
+/// A server on `state_dir` with an idle timeout, wired to raw duplex pipes.
+/// Returns the write half (holding it open is what makes the connection look
+/// alive but silent, exactly as a dead SSH session does), a reader over its
+/// replies, and the task running it.
+fn spawn_idle_server(
+    root: &std::path::Path,
+    state_dir: PathBuf,
+    idle: std::time::Duration,
+) -> (
+    tokio::io::DuplexStream,
+    BufReader<tokio::io::DuplexStream>,
+    tokio::task::JoinHandle<()>,
+) {
+    let server = Server::new(ServerOptions {
+        root: root.to_path_buf(),
+        state_dir,
+        config_path: None,
+        history_limit: None,
+        scratch_max_age: None,
+        idle_timeout: Some(idle),
+    })
+    .unwrap();
+    let (client_tx, client_rx) = tokio::io::duplex(1 << 20);
+    let (server_tx, server_rx) = tokio::io::duplex(1 << 20);
+    let task = tokio::spawn(async move {
+        server.run(client_rx, server_tx).await.unwrap();
+    });
+    (client_tx, BufReader::new(server_rx), task)
+}
+
+fn session_events(state_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(state_dir.join("server.jsonl")).unwrap();
+    text.lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+// The whole point of the timeout: a connection that is open but silent -- the
+// remote end of an SSH session whose client vanished -- must not hold the
+// state lock forever.
+#[tokio::test]
+async fn idle_timeout_exits_and_releases_the_state_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path().join(".remote-workspace");
+    let (_writer, _reader, task) = spawn_idle_server(
+        root.path(),
+        state_dir.clone(),
+        std::time::Duration::from_millis(200),
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("server must exit on its own while the connection is still open")
+        .unwrap();
+
+    // The lock is gone with it: a fresh server takes the same state directory.
+    let reopened = Server::new(ServerOptions {
+        root: root.path().to_path_buf(),
+        state_dir: state_dir.clone(),
+        config_path: None,
+        history_limit: None,
+        scratch_max_age: None,
+        idle_timeout: None,
+    });
+    assert!(
+        reopened.is_ok(),
+        "state lock still held after an idle exit: {:?}",
+        reopened.err()
+    );
+    drop(reopened);
+
+    let events = session_events(&state_dir);
+    assert_eq!(events[0]["event"], "started");
+    let exit = events.iter().find(|e| e["event"] == "exit").unwrap();
+    assert_eq!(exit["reason"], "idle_timeout");
+    assert_eq!(exit["requests"], 0);
+}
+
+// A single exec may legitimately run for an hour with the client silent. The
+// timeout measures idleness, not silence, so it must not kill the request it
+// is waiting on -- and must re-arm once that request is done.
+#[tokio::test]
+async fn idle_timeout_spares_a_request_still_running() {
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path().join(".remote-workspace");
+    let (mut writer, mut reader, task) = spawn_idle_server(
+        root.path(),
+        state_dir.clone(),
+        std::time::Duration::from_millis(300),
+    );
+
+    let mut line = serde_json::to_string(&req(
+        "slow",
+        RequestBody::Exec {
+            argv: vec!["sleep".into(), "0.9".into()],
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(10_000),
+        },
+    ))
+    .unwrap();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+
+    // Three idle windows pass while the command runs; the reply still arrives.
+    let mut reply = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_line(&mut reply),
+    )
+    .await
+    .expect("server exited while its own exec was still running")
+    .unwrap();
+    match serde_json::from_str::<ServerMessage>(reply.trim()).unwrap() {
+        ServerMessage::Result {
+            result: ResultBody::Exec(r),
+            ..
+        } => assert_eq!(r.termination, ExecTermination::Exited { code: 0 }),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // Now genuinely idle: the timer re-arms and the server exits on its own.
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("server must exit once the request it was waiting on finished")
+        .unwrap();
+    let events = session_events(&state_dir);
+    let exit = events.iter().find(|e| e["event"] == "exit").unwrap();
+    assert_eq!(exit["reason"], "idle_timeout");
+    assert_eq!(exit["requests"], 1);
+}
+
+// EOF must still be the ordinary way out, and must be distinguishable in the
+// record from an idle exit -- they mean different things about the client.
+#[tokio::test]
+async fn stdin_eof_is_recorded_as_its_own_exit_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path().join(".remote-workspace");
+    let (writer, _reader, task) = spawn_idle_server(
+        root.path(),
+        state_dir.clone(),
+        std::time::Duration::from_secs(3600),
+    );
+    drop(writer);
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("server must exit on EOF")
+        .unwrap();
+    let exit = session_events(&state_dir)
+        .into_iter()
+        .find(|e| e["event"] == "exit")
+        .unwrap();
+    assert_eq!(exit["reason"], "stdin_eof");
+}
+
+// A refused start is the moment a workspace looks occupied, so it has to leave
+// a trace on the remote naming who held the lock.
+#[tokio::test]
+async fn a_refused_start_is_recorded_with_the_holder() {
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path().join(".remote-workspace");
+    let holder = Server::new(ServerOptions {
+        root: root.path().to_path_buf(),
+        state_dir: state_dir.clone(),
+        config_path: None,
+        history_limit: None,
+        scratch_max_age: None,
+        idle_timeout: None,
+    })
+    .unwrap();
+
+    let refused = Server::new(ServerOptions {
+        root: root.path().to_path_buf(),
+        state_dir: state_dir.clone(),
+        config_path: None,
+        history_limit: None,
+        scratch_max_age: None,
+        idle_timeout: None,
+    });
+    let message = refused
+        .expect_err("second server must be refused")
+        .to_string();
+    assert!(message.contains("locked"), "unexpected error: {message}");
+
+    let denied = session_events(&state_dir)
+        .into_iter()
+        .find(|e| e["event"] == "lock_denied")
+        .expect("refusal must be recorded");
+    assert_eq!(
+        denied["holder_pid"].as_str().unwrap(),
+        std::process::id().to_string(),
+        "the recorded holder must be the process actually holding the lock"
+    );
+    drop(holder);
 }
