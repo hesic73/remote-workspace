@@ -16,6 +16,9 @@ pub const LIST_MAX_LIMIT: usize = 1000;
 /// Upper bound on create/edit text inputs, on the file being edited, and on
 /// the resulting file. Larger or binary files go through upload_file.
 pub const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound on replacements in one `edit`. Each is separately bounded by
+/// MAX_TEXT_BYTES; this bounds the request as a whole.
+pub const MAX_EDITS: usize = 100;
 
 pub fn list(
     ws: &Workspace,
@@ -203,63 +206,55 @@ fn is_well_formed_hash(hash: &str) -> bool {
     }
 }
 
-/// Validate base_hash and return the current hash. If `base_hash` is given and
-/// does not match the file's current content, returns StaleFile.
-fn check_base_hash(
-    abs: &Path,
-    base_hash: &Option<String>,
-) -> Result<Option<String>, ProtocolError> {
-    if let Some(expected) = base_hash {
-        if !is_well_formed_hash(expected) {
-            return Err(ProtocolError::new(
-                ErrorCode::InvalidRequest,
-                format!(
-                    "base_hash {expected:?} is not a hash; pass the sha256:... value returned by read_file"
-                ),
-            ));
-        }
+/// The content the caller decided to overwrite still being what is on disk.
+/// Taken as late as possible -- with the replacement already staged -- because
+/// everything before it (reading, building the result, appending to the log) is
+/// time in which `exec`, which deliberately runs without the mutation guard, or
+/// any process on the host can write to the same path. Once the rename lands,
+/// that write is gone.
+fn verify_unchanged(abs: &Path, expected: &str, client_path: &str) -> Result<(), ProtocolError> {
+    let now = hash_file(abs)?;
+    if now.as_deref() != Some(expected) {
+        return Err(ProtocolError::new(
+            ErrorCode::StaleFile,
+            format!("{client_path} changed while the edit was being prepared"),
+        )
+        .with_hashes(
+            expected.to_string(),
+            now.unwrap_or_else(|| FILE_ABSENT_HASH.into()),
+        ));
     }
-    let current = hash_file(abs)?;
-    if let Some(expected) = base_hash {
-        match &current {
-            Some(actual) if actual == expected => Ok(current),
-            Some(actual) => Err(ProtocolError::new(
-                ErrorCode::StaleFile,
-                "file changed since base_hash",
-            )
-            .with_hashes(expected.clone(), actual.clone())),
-            None => Err(ProtocolError::new(
-                ErrorCode::StaleFile,
-                "file does not exist but base_hash was given",
-            )
-            .with_hashes(expected.clone(), "sha256:".into())),
-        }
-    } else {
-        Ok(current)
-    }
+    Ok(())
 }
 
-/// Atomically write bytes to abs: temp file in the same directory, then
-/// persist via rename. Preserves the original file's mode when overwriting an
-/// existing file (so a 0755 script stays 0755). Returns (old_hash, new_hash).
-fn atomic_write_bytes(
-    abs: &Path,
-    content: &[u8],
-) -> Result<(Option<String>, String), ProtocolError> {
+/// Stands in for "no file" where a hash is expected.
+const FILE_ABSENT_HASH: &str = "sha256:";
+
+/// A replacement written to a temp file beside its target, ready to be renamed
+/// over it.
+///
+/// Staging is separate from installing so the caller can take its last look at
+/// the target with the new content already on disk: only the rename then
+/// separates that look from the write it authorizes. It also makes each failure
+/// unambiguous -- everything up to `install` leaves the workspace untouched.
+struct StagedWrite {
+    tmp: tempfile::NamedTempFile,
+    new_hash: String,
+}
+
+/// Write `content` to a temp file in the target's directory, preserving the
+/// target's mode if it exists (so a 0755 script stays 0755).
+fn stage_write(abs: &Path, content: &[u8]) -> Result<StagedWrite, ProtocolError> {
     let parent = abs
         .parent()
         .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidRequest, "path has no parent"))?;
     std::fs::create_dir_all(parent)
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("mkdir failed: {e}")))?;
-    let old_hash = hash_file(abs)?;
-    let new_hash = crate::hash::hash_bytes(content);
     let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
         ProtocolError::new(ErrorCode::IoError, format!("temp file create failed: {e}"))
     })?;
     std::fs::write(tmp.path(), content)
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("temp write failed: {e}")))?;
-    // Preserve the original file's permissions (and best-effort ownership) so
-    // a write does not silently strip an executable bit or chmod.
     if let Ok(orig_meta) = std::fs::metadata(abs) {
         use std::os::unix::fs::PermissionsExt;
         let mode = orig_meta.permissions().mode();
@@ -267,55 +262,256 @@ fn atomic_write_bytes(
             |e| ProtocolError::new(ErrorCode::IoError, format!("chmod temp failed: {e}")),
         )?;
     }
-    tmp.persist(abs).map_err(|e| {
-        ProtocolError::new(ErrorCode::IoError, format!("atomic persist failed: {e}"))
-    })?;
-    // Sync the parent directory so the rename is durable on journaling/COW
-    // filesystems.
-    crate::fsync::fsync_file_or_dir(abs).map_err(|e| {
-        ProtocolError::new(ErrorCode::IoError, format!("fsync after write failed: {e}"))
-    })?;
-    Ok((old_hash, new_hash))
+    Ok(StagedWrite {
+        tmp,
+        new_hash: crate::hash::hash_bytes(content),
+    })
+}
+
+/// The `create` half of the write-ahead sequence: record the intent, install
+/// exclusively, record the result. Returns the operation id and the hash.
+fn write_ahead_create(
+    store: &OperationStore,
+    request_id: &str,
+    path: &str,
+    abs: &Path,
+    content: &[u8],
+) -> Result<(String, String), ProtocolError> {
+    let new_hash = crate::hash::hash_bytes(content);
+    let op_id = store.prepare_fs_record(
+        request_id,
+        OperationKind::Create,
+        path,
+        None,
+        new_hash.clone(),
+    )?;
+    if let Err(f) = atomic_create_bytes(abs, content, path) {
+        // Any create that did not happen withdraws its marker. Leaving one
+        // behind is not safe merely because the path is empty right now:
+        // recovery runs later, and by then any writer -- another request, a
+        // command, a person -- may have put the requested bytes there, which
+        // recovery would read as this request's own completed create and turn
+        // its recorded error into a success.
+        if !f.changed {
+            store.abort_prepared(&op_id)?;
+        }
+        return Err(f.error);
+    }
+    store.commit_fs_record(
+        &op_id,
+        request_id,
+        OperationKind::Create,
+        path,
+        None,
+        new_hash.clone(),
+    )?;
+    Ok((op_id, new_hash))
+}
+
+/// The `delete` half of the write-ahead sequence. Returns the operation id.
+fn write_ahead_delete(
+    store: &OperationStore,
+    request_id: &str,
+    path: &str,
+    abs: &Path,
+    before_hash: &Option<String>,
+) -> Result<String, ProtocolError> {
+    let op_id = store.prepare_fs_record(
+        request_id,
+        OperationKind::Delete,
+        path,
+        before_hash.clone(),
+        FILE_ABSENT_HASH.into(),
+    )?;
+    if let Err(e) = std::fs::remove_file(abs) {
+        // Withdrawn whatever went wrong: a delete that failed because the file
+        // was already gone leaves recovery looking at an absent file, which for
+        // a delete marker reads as "it worked" -- crediting this request with
+        // someone else's removal and replacing its recorded error with a
+        // success. If the file is instead still there, recovery would drop the
+        // marker anyway, so withdrawing it changes nothing.
+        store.abort_prepared(&op_id)?;
+        return Err(ProtocolError::new(
+            ErrorCode::IoError,
+            format!("remove failed: {e}"),
+        ));
+    }
+    if let Some(parent) = abs.parent() {
+        crate::fsync::fsync_dir(parent).map_err(|e| {
+            ProtocolError::new(ErrorCode::IoError, format!("fsync after delete: {e}"))
+        })?;
+    }
+    store.commit_fs_record(
+        &op_id,
+        request_id,
+        OperationKind::Delete,
+        path,
+        before_hash.clone(),
+        FILE_ABSENT_HASH.into(),
+    )?;
+    Ok(op_id)
+}
+
+/// The `edit` half: record the intent, take the last look, install, record the
+/// result. The order of these four is the whole correctness argument, and it is
+/// one function so the unwinding stays with it: a refusal after the marker is
+/// written has to take the marker with it, or recovery will later judge that
+/// marker against whatever the file holds and can synthesize a commit for a
+/// mutation that never happened.
+///
+/// Returns the operation id and the installed hash.
+fn write_ahead_install(
+    store: &OperationStore,
+    request_id: &str,
+    path: &str,
+    abs: &Path,
+    before: &str,
+    staged: StagedWrite,
+) -> Result<(String, String), ProtocolError> {
+    let new_hash = staged.new_hash.clone();
+    let op_id = store.prepare_fs_record(
+        request_id,
+        OperationKind::Edit,
+        path,
+        Some(before.to_string()),
+        new_hash.clone(),
+    )?;
+    // The last look, with the replacement already staged: one syscall stands
+    // between it and the rename. It cannot be made atomic -- POSIX offers no
+    // "rename only if the target still hashes to X", and the writers this
+    // guards against (`exec`, anything else on the host) hold no lock to
+    // coordinate with -- so this narrows the window to its floor rather than
+    // closing it.
+    if let Err(e) = verify_unchanged(abs, before, path) {
+        store.abort_prepared(&op_id)?;
+        return Err(e);
+    }
+    if let Err(f) = staged.install(abs) {
+        // Only a rename that never happened withdraws the marker. A durability
+        // failure after it leaves the marker for the next start, which re-hashes
+        // the file and completes the record -- committing it here instead would
+        // claim a change survived a crash when the sync that guarantees it is
+        // exactly what failed. Such a marker is not resolvable in-session and
+        // is deliberately exempt from pruning, so a filesystem whose fsync keeps
+        // failing accumulates one line per attempt until the next start. That is
+        // the WAL doing its job on a disk that is not.
+        if !f.changed {
+            store.abort_prepared(&op_id)?;
+        }
+        return Err(f.error);
+    }
+    store.commit_fs_record(
+        &op_id,
+        request_id,
+        OperationKind::Edit,
+        path,
+        Some(before.to_string()),
+        new_hash.clone(),
+    )?;
+    Ok((op_id, new_hash))
+}
+
+/// A failed install, and whether it left the workspace changed.
+///
+/// The distinction is what decides the prepared marker's fate: a marker kept
+/// for a mutation that never happened can later be matched against a file some
+/// other writer produced and synthesized into a commit that never occurred,
+/// while a marker withdrawn for a mutation that DID happen loses the record of
+/// a real change. Neither is recoverable from afterwards, so the failing step
+/// has to say which it was.
+#[derive(Debug)]
+struct InstallFailure {
+    changed: bool,
+    error: ProtocolError,
+}
+
+impl StagedWrite {
+    /// Rename into place, then sync the parent so the rename survives a crash
+    /// on journaling/COW filesystems.
+    fn install(self, abs: &Path) -> Result<String, InstallFailure> {
+        self.tmp.persist(abs).map_err(|e| InstallFailure {
+            changed: false,
+            error: ProtocolError::new(ErrorCode::IoError, format!("atomic persist failed: {e}")),
+        })?;
+        crate::fsync::fsync_file_or_dir(abs).map_err(|e| InstallFailure {
+            changed: true,
+            error: ProtocolError::new(ErrorCode::IoError, format!("fsync after write failed: {e}")),
+        })?;
+        Ok(self.new_hash)
+    }
 }
 
 /// Atomically install a NEW file at abs without ever replacing an existing
 /// one: temp file in the same directory, then hard_link into place (which
 /// fails with AlreadyExists instead of clobbering, even against a concurrent
 /// creator such as a command run in the workspace).
-fn atomic_create_bytes(abs: &Path, content: &[u8], client_path: &str) -> Result<(), ProtocolError> {
-    let parent = abs
-        .parent()
-        .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidRequest, "path has no parent"))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("mkdir failed: {e}")))?;
-    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
-        ProtocolError::new(ErrorCode::IoError, format!("temp file create failed: {e}"))
+fn atomic_create_bytes(
+    abs: &Path,
+    content: &[u8],
+    client_path: &str,
+) -> Result<(), InstallFailure> {
+    // Only the link creates the FILE, and only the sync after it can fail with
+    // the file already there -- which is what the marker's fate turns on. Note
+    // that a failure before the link can still leave parent directories behind:
+    // they are made unconditionally, and removing them again would race every
+    // other writer that may have started using them.
+    let not_yet = |e: ProtocolError| InstallFailure {
+        changed: false,
+        error: e,
+    };
+    let parent = abs.parent().ok_or_else(|| {
+        not_yet(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "path has no parent",
+        ))
     })?;
-    std::fs::write(tmp.path(), content)
-        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("temp write failed: {e}")))?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        not_yet(ProtocolError::new(
+            ErrorCode::IoError,
+            format!("mkdir failed: {e}"),
+        ))
+    })?;
+    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+        not_yet(ProtocolError::new(
+            ErrorCode::IoError,
+            format!("temp file create failed: {e}"),
+        ))
+    })?;
+    std::fs::write(tmp.path(), content).map_err(|e| {
+        not_yet(ProtocolError::new(
+            ErrorCode::IoError,
+            format!("temp write failed: {e}"),
+        ))
+    })?;
     // Temp files are 0600; a fresh workspace file should get conventional
     // permissions instead of inheriting that.
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644)).map_err(
-            |e| ProtocolError::new(ErrorCode::IoError, format!("chmod temp failed: {e}")),
+            |e| {
+                not_yet(ProtocolError::new(
+                    ErrorCode::IoError,
+                    format!("chmod temp failed: {e}"),
+                ))
+            },
         )?;
     }
     std::fs::hard_link(tmp.path(), abs).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
+        not_yet(if e.kind() == std::io::ErrorKind::AlreadyExists {
             ProtocolError::new(
                 ErrorCode::AlreadyExists,
                 format!("already exists: {client_path}; modify existing files with edit"),
             )
         } else {
             ProtocolError::new(ErrorCode::IoError, format!("link into place failed: {e}"))
-        }
+        })
     })?;
-    crate::fsync::fsync_file_or_dir(abs).map_err(|e| {
-        ProtocolError::new(
+    crate::fsync::fsync_file_or_dir(abs).map_err(|e| InstallFailure {
+        changed: true,
+        error: ProtocolError::new(
             ErrorCode::IoError,
             format!("fsync after create failed: {e}"),
-        )
+        ),
     })?;
     Ok(())
 }
@@ -347,27 +543,7 @@ pub fn create(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let new_hash = crate::hash::hash_bytes(content.as_bytes());
-    // WAL step 1: durably record the prepared marker BEFORE touching the
-    // workspace, so a crash mid-mutation is recoverable on startup.
-    let op_id = store.prepare_fs_record(
-        request_id,
-        OperationKind::Create,
-        path,
-        None,
-        new_hash.clone(),
-    )?;
-    // WAL step 2: exclusive atomic install.
-    atomic_create_bytes(&abs, content.as_bytes(), path)?;
-    // WAL step 3: commit.
-    store.commit_fs_record(
-        &op_id,
-        request_id,
-        OperationKind::Create,
-        path,
-        None,
-        new_hash.clone(),
-    )?;
+    let (op_id, new_hash) = write_ahead_create(store, request_id, path, &abs, content.as_bytes())?;
     Ok(ResultBody::Mutation(MutationResult {
         operation_id: op_id,
         old_hash: None,
@@ -375,10 +551,22 @@ pub fn create(
     }))
 }
 
-/// Replace an exact occurrence of `old_text` with `new_text` in an existing
-/// UTF-8 file. The complete new content is built (and validated) before any
-/// mutation; installation reuses the atomic-rename path and preserves mode.
-#[allow(clippy::too_many_arguments)]
+/// Position of a replacement in the list, for error messages. A lone
+/// replacement needs no index and reads better without one.
+fn edit_prefix(index: usize, total: usize) -> String {
+    if total == 1 {
+        String::new()
+    } else {
+        format!("edit {} of {}: ", index + 1, total)
+    }
+}
+
+/// Apply exact text replacements to an existing UTF-8 file.
+///
+/// The replacements are applied in order, each to the result of the one before
+/// it, and the complete new content is built and validated before anything is
+/// written. One atomic rename installs it, so a failure at any position leaves
+/// the file byte-for-byte unchanged and the whole list is one operation.
 pub fn edit(
     ws: &Workspace,
     store: &OperationStore,
@@ -386,27 +574,42 @@ pub fn edit(
     request_id: &str,
     path: &str,
     base_hash: &str,
-    old_text: &str,
-    new_text: &str,
-    replace_all: bool,
+    edits: &[remote_workspace_protocol::EditSpec],
 ) -> Result<ResultBody, ProtocolError> {
-    if old_text.is_empty() {
+    if edits.is_empty() {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
-            "old_text must not be empty",
+            "edits must not be empty",
         ));
     }
-    if old_text == new_text {
+    if edits.len() > MAX_EDITS {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
-            "old_text and new_text are identical; nothing to change",
+            format!("edits must not exceed {MAX_EDITS} replacements"),
         ));
     }
-    if old_text.len() > MAX_TEXT_BYTES || new_text.len() > MAX_TEXT_BYTES {
-        return Err(ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            format!("old_text/new_text exceed {MAX_TEXT_BYTES} bytes"),
-        ));
+    // Every argument is checked before the file is touched at all, so a
+    // malformed replacement late in the list costs nothing.
+    for (i, e) in edits.iter().enumerate() {
+        let at = edit_prefix(i, edits.len());
+        if e.old_text.is_empty() {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                format!("{at}old_text must not be empty"),
+            ));
+        }
+        if e.old_text == e.new_text {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                format!("{at}old_text and new_text are identical; nothing to change"),
+            ));
+        }
+        if e.old_text.len() > MAX_TEXT_BYTES || e.new_text.len() > MAX_TEXT_BYTES {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                format!("{at}old_text/new_text exceed {MAX_TEXT_BYTES} bytes"),
+            ));
+        }
     }
     let abs = ws.resolve(path)?;
     // Enforce the size cap from metadata, before hashing or reading: a file
@@ -430,62 +633,98 @@ pub fn edit(
         }
         Err(e) => return Err(ProtocolError::new(ErrorCode::IoError, format!("{e}"))),
     }
-    let current = check_base_hash(&abs, &Some(base_hash.to_string()))?;
+    if !is_well_formed_hash(base_hash) {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "base_hash {base_hash:?} is not a hash; pass the sha256:... value returned by read_file"
+            ),
+        ));
+    }
     let original = std::fs::read(&abs)
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("read failed: {e}")))?;
+    // base_hash is checked against the bytes actually read, not against a
+    // separate hash of the file. Hashing it separately would leave a gap in
+    // which the content could change and change back, so the replacements
+    // would be built from a version the caller never pinned and the check
+    // would still pass.
+    let current = crate::hash::hash_bytes(&original);
+    if current != base_hash {
+        return Err(
+            ProtocolError::new(ErrorCode::StaleFile, "file changed since base_hash")
+                .with_hashes(base_hash.to_string(), current),
+        );
+    }
     let original_str = String::from_utf8(original).map_err(|_| {
         ProtocolError::new(
             ErrorCode::InvalidRequest,
             "file is not valid UTF-8; editing binary files is unsupported",
         )
     })?;
-    let matches = original_str.matches(old_text).count();
-    if matches == 0 {
-        return Err(ProtocolError::new(
-            ErrorCode::NoMatch,
-            format!(
-                "old_text not found in {path}; re-read the file and copy the current text exactly"
-            ),
-        ));
+    // Each replacement sees what the previous ones produced, so a later one
+    // may legitimately match text an earlier one introduced -- and its match
+    // count must be taken against that content, not the original.
+    let mut new_content = original_str;
+    for (i, e) in edits.iter().enumerate() {
+        let at = edit_prefix(i, edits.len());
+        let matches = new_content.matches(&e.old_text).count();
+        if matches == 0 {
+            return Err(ProtocolError::new(
+                ErrorCode::NoMatch,
+                format!(
+                    "{at}old_text not found in {path}; re-read the file and copy the current \
+                     text exactly"
+                ),
+            ));
+        }
+        if matches > 1 && !e.replace_all {
+            return Err(ProtocolError::new(
+                ErrorCode::AmbiguousMatch,
+                format!(
+                    "{at}old_text occurs {matches} times in {path}; extend it with surrounding \
+                     context to make it unique, or pass replace_all=true"
+                ),
+            ));
+        }
+        // Checked BEFORE allocating, not after: replacements compound, so a
+        // handful of growing ones (`a` -> `aa`, replace_all) reaches terabytes
+        // long before a check on the result could reject it. The count is
+        // exact, so this is the size the replacement would produce.
+        let replaced = if e.replace_all { matches } else { 1 };
+        let projected = new_content
+            .len()
+            .saturating_sub(replaced.saturating_mul(e.old_text.len()))
+            .saturating_add(replaced.saturating_mul(e.new_text.len()));
+        if projected > MAX_TEXT_BYTES {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                format!("{at}resulting file would exceed {MAX_TEXT_BYTES} bytes"),
+            ));
+        }
+        new_content = if e.replace_all {
+            new_content.replace(&e.old_text, &e.new_text)
+        } else {
+            new_content.replacen(&e.old_text, &e.new_text, 1)
+        };
     }
-    if matches > 1 && !replace_all {
-        return Err(ProtocolError::new(
-            ErrorCode::AmbiguousMatch,
-            format!(
-                "old_text occurs {matches} times in {path}; extend it with surrounding context \
-                 to make it unique, or pass replace_all=true"
-            ),
-        ));
-    }
-    let new_content = if replace_all {
-        original_str.replace(old_text, new_text)
-    } else {
-        original_str.replacen(old_text, new_text, 1)
-    };
-    if new_content.len() > MAX_TEXT_BYTES {
+    // A single replacement from a value to itself is already refused as
+    // nothing to change; replacements that undo each other are the same
+    // request spelled across several entries, and refusing them keeps a
+    // guarantee the WAL cannot otherwise express. A record whose before and
+    // after hashes are equal is one recovery has to read as "the rename never
+    // happened", so an edit that DID land would be dropped from history and
+    // its request handed back for retry.
+    if crate::hash::hash_bytes(new_content.as_bytes()) == current {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
-            format!("resulting file would exceed {MAX_TEXT_BYTES} bytes"),
+            format!("the replacements leave {path} unchanged; nothing to do"),
         ));
     }
-    let new_hash = crate::hash::hash_bytes(new_content.as_bytes());
-    let op_id = store.prepare_fs_record(
-        request_id,
-        OperationKind::Edit,
-        path,
-        current.clone(),
-        new_hash.clone(),
-    )?;
-    let old_hash = current.clone();
-    atomic_write_bytes(&abs, new_content.as_bytes())?;
-    store.commit_fs_record(
-        &op_id,
-        request_id,
-        OperationKind::Edit,
-        path,
-        old_hash.clone(),
-        new_hash.clone(),
-    )?;
+    // Staged before the marker is written, so a failure to even write the
+    // replacement leaves nothing behind to interpret.
+    let staged = stage_write(&abs, new_content.as_bytes())?;
+    let (op_id, new_hash) = write_ahead_install(store, request_id, path, &abs, &current, staged)?;
+    let old_hash = Some(current);
     Ok(ResultBody::Mutation(MutationResult {
         operation_id: op_id,
         old_hash,
@@ -517,28 +756,7 @@ pub fn delete(
     }
     // For a delete, "expected after" is the empty-file hash sentinel, matching
     // the deleted state (file absent).
-    let op_id = store.prepare_fs_record(
-        request_id,
-        OperationKind::Delete,
-        path,
-        before_hash.clone(),
-        "sha256:".into(),
-    )?;
-    std::fs::remove_file(&abs)
-        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("remove failed: {e}")))?;
-    if let Some(parent) = abs.parent() {
-        crate::fsync::fsync_dir(parent).map_err(|e| {
-            ProtocolError::new(ErrorCode::IoError, format!("fsync after delete: {e}"))
-        })?;
-    }
-    store.commit_fs_record(
-        &op_id,
-        request_id,
-        OperationKind::Delete,
-        path,
-        before_hash.clone(),
-        "sha256:".into(),
-    )?;
+    let op_id = write_ahead_delete(store, request_id, path, &abs, &before_hash)?;
     Ok(ResultBody::Mutation(MutationResult {
         operation_id: op_id,
         old_hash: before_hash,
@@ -584,6 +802,220 @@ fn entry_for(client_path: &str, abs: &Path, meta: &std::fs::Metadata) -> FileEnt
             writable: mode & 0o200 != 0,
             executable: mode & 0o111 != 0,
         }),
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use remote_workspace_protocol::AnyOperationRecord;
+    use tempfile::tempdir;
+
+    // The guarantee `edit` rests on: between deciding what to overwrite and the
+    // rename that does it, a write can land from `exec` or any host process.
+    // Only a check taken with the replacement already staged can still refuse.
+    // Reachable only from inside the crate -- from outside, the base_hash check
+    // rejects a changed file long before this point.
+    #[test]
+    fn a_target_that_changed_under_a_staged_write_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "as the caller last saw it\n").unwrap();
+        let expected = crate::hash::hash_file(&path).unwrap().unwrap();
+
+        let staged = stage_write(&path, b"the edit\n").unwrap();
+        // Someone else got there first, after the replacement was staged.
+        std::fs::write(&path, "written by something else\n").unwrap();
+
+        let err = verify_unchanged(&path, &expected, "f.txt")
+            .expect_err("must refuse to overwrite a file that changed");
+        assert_eq!(err.code, ErrorCode::StaleFile);
+        // Refusing means not installing; the staged file is simply dropped.
+        drop(staged);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "written by something else\n",
+            "the concurrent write must survive"
+        );
+    }
+
+    #[test]
+    fn a_target_that_is_gone_is_refused_too() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "here\n").unwrap();
+        let expected = crate::hash::hash_file(&path).unwrap().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let err = verify_unchanged(&path, &expected, "f.txt").expect_err("must refuse");
+        assert_eq!(err.code, ErrorCode::StaleFile);
+    }
+
+    #[test]
+    fn an_unchanged_target_is_accepted_and_installed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        let expected = crate::hash::hash_file(&path).unwrap().unwrap();
+
+        let staged = stage_write(&path, b"after\n").unwrap();
+        verify_unchanged(&path, &expected, "f.txt").unwrap();
+        let new_hash = staged.install(&path).unwrap();
+        assert_eq!(new_hash, crate::hash::hash_bytes(b"after\n"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+    }
+
+    // Drives the real refusal path -- `write_ahead_install`, exactly as `edit`
+    // calls it -- rather than re-enacting the sequence: the point is that the
+    // marker is withdrawn by THAT code, so removing the withdrawal must break
+    // this test.
+    #[test]
+    fn a_refused_install_withdraws_its_prepared_marker() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("f.txt");
+        std::fs::write(&path, "v1\n").unwrap();
+        let before = crate::hash::hash_bytes(b"v1\n");
+        let store = OperationStore::new(dir.path().join("state")).unwrap();
+
+        let staged = stage_write(&path, b"v2\n").unwrap();
+        // The other writer left exactly what this install intended, which is
+        // the content recovery cannot tell apart from a completed rename.
+        std::fs::write(&path, "v2\n").unwrap();
+
+        let err = write_ahead_install(&store, "req-1", "f.txt", &path, &before, staged)
+            .expect_err("must refuse to install over a changed file");
+        assert_eq!(err.code, ErrorCode::StaleFile);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "v2\n",
+            "the other writer's content must survive"
+        );
+
+        // Reopening replays the log: the marker must come back withdrawn, so
+        // recovery has nothing to synthesize.
+        drop(store);
+        let ws = Workspace::new(root, dir.path().join("scratch")).unwrap();
+        let reopened = OperationStore::new(dir.path().join("state")).unwrap();
+        let actions = reopened.recover(&ws).unwrap();
+        assert!(
+            actions.is_empty(),
+            "a withdrawn marker must give recovery nothing to do: {actions:?}"
+        );
+        assert!(
+            reopened.history(None).is_empty(),
+            "a refused install must not appear in history"
+        );
+    }
+
+    /// A store and workspace over one temp dir, reopened by `recovered_after`.
+    fn store_at(dir: &std::path::Path) -> OperationStore {
+        OperationStore::new(dir.join("state")).unwrap()
+    }
+
+    /// Replay the log into a fresh store and run recovery, which is the only
+    /// time markers are reloaded -- and the moment a marker left behind by a
+    /// failed mutation would be turned into a phantom operation.
+    fn recovered_after(dir: &std::path::Path, store: OperationStore) -> Vec<AnyOperationRecord> {
+        drop(store);
+        let ws = Workspace::new(dir.join("ws"), dir.join("scratch")).unwrap();
+        let reopened = store_at(dir);
+        reopened.recover(&ws).unwrap();
+        reopened.history(None)
+    }
+
+    fn ws_dir() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        dir
+    }
+
+    // Losing the create race to another process that wrote the SAME bytes is
+    // the case recovery cannot tell apart from this request's own completed
+    // create. Called directly because through `create` the early existence
+    // check wins first; the branch that matters is the one after the marker.
+    #[test]
+    fn a_create_that_lost_the_race_withdraws_its_marker() {
+        let dir = ws_dir();
+        let abs = dir.path().join("ws/f.txt");
+        std::fs::write(&abs, "same bytes\n").unwrap();
+        let store = store_at(dir.path());
+
+        let err = write_ahead_create(&store, "req-1", "f.txt", &abs, b"same bytes\n")
+            .expect_err("must lose to the existing file");
+        assert_eq!(err.code, ErrorCode::AlreadyExists);
+
+        assert!(
+            recovered_after(dir.path(), store).is_empty(),
+            "a create that never happened must not appear in history"
+        );
+    }
+
+    // A delete that failed because the file was already gone leaves recovery
+    // looking at an absent file -- which for a delete marker reads as success.
+    #[test]
+    fn a_delete_that_failed_withdraws_its_marker() {
+        let dir = ws_dir();
+        let abs = dir.path().join("ws/gone.txt");
+        let store = store_at(dir.path());
+
+        let err = write_ahead_delete(
+            &store,
+            "req-1",
+            "gone.txt",
+            &abs,
+            &Some(crate::hash::hash_bytes(b"whatever\n")),
+        )
+        .expect_err("removing a file that is not there must fail");
+        assert_eq!(err.code, ErrorCode::IoError);
+
+        assert!(
+            recovered_after(dir.path(), store).is_empty(),
+            "a delete that never happened must not appear in history"
+        );
+    }
+
+    // The companion: a delete that DID happen is still recovered, so the
+    // withdrawal above cannot be blamed for losing real work.
+    #[test]
+    fn a_delete_interrupted_after_the_removal_is_still_recovered() {
+        let dir = ws_dir();
+        let abs = dir.path().join("ws/f.txt");
+        std::fs::write(&abs, "doomed\n").unwrap();
+        let store = store_at(dir.path());
+        let op_id = store
+            .prepare_fs_record(
+                "req-1",
+                OperationKind::Delete,
+                "f.txt",
+                Some(crate::hash::hash_bytes(b"doomed\n")),
+                FILE_ABSENT_HASH.into(),
+            )
+            .unwrap();
+        // The removal landed; the commit did not.
+        std::fs::remove_file(&abs).unwrap();
+
+        let history = recovered_after(dir.path(), store);
+        assert!(
+            history.iter().any(|r| r.operation_id() == op_id),
+            "a crash between removal and commit must still be recovered"
+        );
+    }
+
+    // A write must not silently strip an executable bit.
+    #[test]
+    fn installing_over_a_file_preserves_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.sh");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stage_write(&path, b"#!/bin/sh\necho hi\n")
+            .unwrap()
+            .install(&path)
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
     }
 }
 

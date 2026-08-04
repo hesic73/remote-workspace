@@ -120,6 +120,27 @@ canonical way to perform each:
   deletes the matched text. A full-file rewrite passes the entire current
   content as `old_text`, keeping destructive replacement explicit.
 
+  One `edit` carries a **list** of replacements, applied in order, each to the
+  result of the one before it -- so a replacement may match text an earlier one
+  produced, and its match count is taken against that content rather than the
+  original. The list is one operation: the content is built and fully validated
+  in memory, then installed by a single rename, so a failure at any position
+  leaves the file byte-for-byte unchanged and the log gets one record with one
+  before/after pair. This is why the list exists at all -- three separate
+  `edit` calls are three separately interruptible mutations, and a failure in
+  the third leaves the file in a state no caller asked for. Errors name the
+  failing position (`edit 2 of 3`) when there is more than one. Bounded at 100
+  replacements per call, each separately bounded like any other text input.
+
+  Creating a file is still `create` alone: an empty `old_text` is a bad
+  argument here, not a shorthand for "write this file". One intent, one
+  operation applies to the list form too.
+
+```json
+{"request_id":"r2","op":"edit","path":"src/main.py","base_hash":"sha256:abc","edits":[{"old_text":"x = 1","new_text":"x = 2"},{"old_text":"def f(","new_text":"def g("}]}
+{"request_id":"r2","type":"write","operation_id":"op-7","old_hash":"sha256:abc","new_hash":"sha256:def"}
+```
+
 `edit` requires a `base_hash`. The server checks the current hash first and
 rejects with `STALE_FILE` (carrying `expected_hash`/`actual_hash`) if the
 file changed under you. Mutations build the complete new content, then
@@ -378,7 +399,7 @@ stable probe that mutates nothing, needs no config, and never starts the JSONL
 server:
 
 ```json
-{"software_version": "0.2.0", "protocol_version": 1}
+{"software_version": "0.5.0", "protocol_version": 3}
 ```
 
 `software_version` identifies the release and its CI artifact;

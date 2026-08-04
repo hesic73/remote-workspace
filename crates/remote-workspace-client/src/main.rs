@@ -312,8 +312,18 @@ async fn async_main_real() -> Result<()> {
             new_text,
             replace_all,
         } => {
+            // One replacement per invocation: a shell is the wrong place to
+            // author a list, and the agent-facing surface is the MCP tool.
             let res = client
-                .edit(&path, &base_hash, &old_text, &new_text, replace_all)
+                .edit(
+                    &path,
+                    &base_hash,
+                    vec![remote_workspace_protocol::EditSpec {
+                        old_text,
+                        new_text,
+                        replace_all,
+                    }],
+                )
                 .await?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }

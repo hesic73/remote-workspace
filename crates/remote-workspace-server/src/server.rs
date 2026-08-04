@@ -17,6 +17,13 @@ use crate::workspace::Workspace;
 
 const HISTORY_DEFAULT_LIMIT: usize = 50;
 const HISTORY_MAX_LIMIT: usize = 100;
+/// How long, after stdin ends, handlers still running get to finish and write
+/// their replies. Deliberately short: shutdown must not become the reason a
+/// successor cannot start, and a request that needs longer than this is not
+/// one worth holding the connection open for.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long the abort that follows a timed-out drain gets to take effect.
+const ABORT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub struct Server {
     pub workspace: Arc<Workspace>,
@@ -152,52 +159,99 @@ impl Server {
 
     pub async fn run<R, W>(self, read: R, write: W) -> std::io::Result<()>
     where
-        R: tokio::io::AsyncRead + Unpin + Send,
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let idle_timeout = self.idle_timeout;
         let session_log = self.session_log.clone();
         let started = std::time::Instant::now();
         let server = Arc::new(self);
-        let mut reader = BufReader::new(read);
         let stdout: Arc<tokio::sync::Mutex<W>> = Arc::new(tokio::sync::Mutex::new(write));
-        let mut line = String::new();
-        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Reading happens in its own task and is never raced against anything.
+        // `read_line` is not cancellation-safe -- bytes it has already consumed
+        // are LOST when its future is dropped, which would silently truncate a
+        // request that arrived in pieces -- so the idle timeout must not be
+        // able to interrupt it. Receiving from this channel is cancel-safe, and
+        // its capacity of one keeps the backpressure of reading a line at a
+        // time.
+        let (lines_tx, mut lines) = tokio::sync::mpsc::channel::<std::io::Result<String>>(1);
+        let reading = tokio::spawn(async move {
+            let mut reader = BufReader::new(read);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    // EOF: dropping the sender is what reports it.
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if lines_tx.send(Ok(line)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = lines_tx.send(Err(e)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        // Owns every handler task, which answers all three questions asked
+        // about them: how many are still running (the idle timeout's), when the
+        // last one finishes (shutdown's), and how to let go of the ones that
+        // never will -- dropping the set aborts them, releasing the `Arc<Server>`
+        // they hold and with it the state lock.
+        let mut handlers = tokio::task::JoinSet::new();
         let mut served: u64 = 0;
+        let mut read_error: Option<std::io::Error> = None;
+        let mut idle_since = tokio::time::Instant::now();
 
         let reason = loop {
-            // `read_line` appends and is cancel-safe in that sense: a line the
-            // idle timeout interrupts part-way stays in `line` and is finished
-            // by the next call, so the buffer is cleared only once a whole
-            // line has been consumed.
-            let read = match idle_timeout {
-                Some(d) => tokio::time::timeout(d, reader.read_line(&mut line)).await,
-                None => Ok(reader.read_line(&mut line).await),
-            };
-            let n = match read {
-                Ok(r) => r?,
-                Err(_elapsed) => {
-                    // A single `exec` may legitimately run for an hour without
-                    // the client sending anything, so idleness means no work in
-                    // flight either -- otherwise the timeout would kill the
-                    // very request it is waiting on.
-                    if in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                        break "idle_timeout";
+            // Idleness is time since the last thing that happened -- a line
+            // arriving OR a handler finishing -- not time since the last read.
+            // Measured from the read alone, a request that completes just
+            // before the deadline is followed by an exit milliseconds later,
+            // closing a connection the client has every reason to believe is
+            // still good because it just got its reply on it.
+            let event = match idle_timeout {
+                None => lines.recv().await,
+                Some(d) => tokio::select! {
+                    biased;
+                    ev = lines.recv() => ev,
+                    // Armed only while something is running: on an empty set
+                    // `join_next` returns immediately and would spin.
+                    _ = handlers.join_next(), if !handlers.is_empty() => {
+                        idle_since = tokio::time::Instant::now();
+                        continue;
                     }
-                    continue;
-                }
+                    _ = tokio::time::sleep_until(idle_since + d) => {
+                        // A single `exec` may legitimately run for an hour
+                        // without the client sending anything, so idleness
+                        // means no work in flight either -- otherwise the
+                        // timeout would kill the very request it waits on.
+                        if handlers.is_empty() {
+                            break "idle_timeout";
+                        }
+                        idle_since = tokio::time::Instant::now();
+                        continue;
+                    }
+                },
             };
-            if n == 0 {
-                break "stdin_eof";
-            }
+            let line = match event {
+                Some(Ok(line)) => line,
+                // Broken input is a shutdown like any other: it must still
+                // drain and record its exit, so the error travels out rather
+                // than returning from here.
+                Some(Err(e)) => {
+                    read_error = Some(e);
+                    break "read_error";
+                }
+                None => break "stdin_eof",
+            };
+            idle_since = tokio::time::Instant::now();
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                line.clear();
                 continue;
             }
-            let parsed = serde_json::from_str::<Request>(trimmed);
-            line.clear();
-            let req = match parsed {
+            let req = match serde_json::from_str::<Request>(trimmed) {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = ServerMessage::Error {
@@ -212,16 +266,58 @@ impl Server {
                 }
             };
             served += 1;
-            // Counted here rather than inside the task, so there is no window
-            // in which an accepted request is invisible to the idle check.
-            let flight = InFlight::enter(&in_flight);
             let server = server.clone();
             let stdout = stdout.clone();
-            tokio::spawn(async move {
-                let _flight = flight;
+            handlers.spawn(async move {
                 server.handle(req, stdout).await;
             });
+            // Finished handlers stay in the set until collected, so reap on the
+            // way past: a long session serves thousands of requests and the set
+            // must not grow with them.
+            reap(&mut handlers);
         };
+
+        // Handlers run in their own tasks, so returning straight from the loop
+        // would drop whatever is still running: a mutation already applied to
+        // the workspace would never report its result, and the caller could not
+        // tell whether it landed. Stdin ending does not imply stdout has --
+        // a client that closes its end of the pipe is still listening -- so
+        // finishing the reply is worth a short wait. Bounded, because it must
+        // stay well inside the successor's grace for the state lock, and
+        // because a long `exec` is not something to wait for here: its request
+        // is resolved by recovery on the next start.
+        let drained = tokio::time::timeout(SHUTDOWN_DRAIN, async {
+            while handlers.join_next().await.is_some() {}
+        })
+        .await
+        .is_ok();
+        // Whatever is left is asked to stop rather than carried along: each
+        // task holds an `Arc<Server>`, and with it the state lock. `exec`
+        // children die with their task (kill_on_drop).
+        //
+        // Aborting only *requests* cancellation, which a handler acts on no
+        // earlier than its next yield -- a `gc` sweeping a large tree is
+        // synchronous from one end to the other. So this is bounded, not
+        // guaranteed: a handler still working when the grace expires keeps the
+        // lock until it finishes, and a successor starting in that window is
+        // correctly refused, because the work the lock protects really is still
+        // running. In the shipped binary the process exit right after this
+        // releases the lock either way; `drained` records which happened.
+        handlers.abort_all();
+        let _ = tokio::time::timeout(ABORT_GRACE, async {
+            while handlers.join_next().await.is_some() {}
+        })
+        .await;
+        // The reader is blocked in a read that only a closed input can end, and
+        // dropping the receiving half does not wake it. Nothing is going to be
+        // read again, so it is aborted rather than left holding the stream for
+        // as long as the runtime lives -- which for an embedder is not the
+        // process exit the shipped binary can rely on.
+        reading.abort();
+        // Awaited, because aborting only asks: until the task is polled again
+        // it still holds the input stream, and returning from here is supposed
+        // to mean it does not.
+        let _ = tokio::time::timeout(ABORT_GRACE, reading).await;
 
         let uptime_ms = started.elapsed().as_millis() as u64;
         session_log.record(
@@ -230,10 +326,20 @@ impl Server {
                 "reason": reason,
                 "uptime_ms": uptime_ms,
                 "requests": served,
+                "drained": drained,
             }),
         );
-        tracing::info!(reason, uptime_ms, requests = served, "server exiting");
-        Ok(())
+        tracing::info!(
+            reason,
+            uptime_ms,
+            requests = served,
+            drained,
+            "server exiting"
+        );
+        match read_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     async fn handle<W: tokio::io::AsyncWrite + Unpin + Send>(
@@ -383,9 +489,7 @@ impl Server {
             RequestBody::Edit {
                 path,
                 base_hash,
-                old_text,
-                new_text,
-                replace_all,
+                edits,
             } => {
                 let guard = self.store.write_guard().await;
                 let result = fs_ops::edit(
@@ -395,9 +499,7 @@ impl Server {
                     &request_id,
                     &path,
                     &base_hash,
-                    &old_text,
-                    &new_text,
-                    replace_all,
+                    &edits,
                 );
                 drop(guard);
                 self.finish(&request_id, result)
@@ -767,23 +869,12 @@ impl Server {
     }
 }
 
-/// Counts a request from the moment it is accepted until its handler task
-/// ends, including a handler that panics. Only a count that never drifts up
-/// can be trusted by the idle timeout, since a phantom in-flight request would
-/// keep the server -- and the workspace's state lock -- alive indefinitely.
-struct InFlight(Arc<std::sync::atomic::AtomicUsize>);
-
-impl InFlight {
-    fn enter(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self(counter.clone())
-    }
-}
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
+/// Collect every handler that has finished, so what is left in the set is what
+/// is still running. A panicking handler is collected too (as an `Err`), which
+/// is what keeps the count from drifting up -- and an over-count would mean the
+/// idle timeout never fires and the workspace stays locked forever.
+fn reap<T: 'static>(handlers: &mut tokio::task::JoinSet<T>) {
+    while handlers.try_join_next().is_some() {}
 }
 
 enum FinishResult {

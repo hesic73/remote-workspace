@@ -22,6 +22,7 @@ parking_lot = "0.12"
 libc = "0.2"
 
 [dev-dependencies]
+libc = "0.2"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "io-util"] }
 remote-workspace-protocol.workspace = true

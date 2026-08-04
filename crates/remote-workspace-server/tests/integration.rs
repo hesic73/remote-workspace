@@ -360,9 +360,11 @@ async fn stale_hash_rejected() {
         RequestBody::Edit {
             path: "f.txt".into(),
             base_hash: hash.clone(),
-            old_text: "v1".into(),
-            new_text: "v2".into(),
-            replace_all: false,
+            edits: vec![EditSpec {
+                old_text: "v1".into(),
+                new_text: "v2".into(),
+                replace_all: false,
+            }],
         },
     ));
     let _ = h.recv().await;
@@ -373,9 +375,11 @@ async fn stale_hash_rejected() {
         RequestBody::Edit {
             path: "f.txt".into(),
             base_hash: hash,
-            old_text: "v2".into(),
-            new_text: "v3".into(),
-            replace_all: false,
+            edits: vec![EditSpec {
+                old_text: "v2".into(),
+                new_text: "v3".into(),
+                replace_all: false,
+            }],
         },
     ));
     let m = h.recv().await;
@@ -427,9 +431,11 @@ async fn edit_atomic_all_or_nothing() {
         RequestBody::Edit {
             path: "p.txt".into(),
             base_hash: hash.clone(),
-            old_text: "b".into(),
-            new_text: "BEE".into(),
-            replace_all: false,
+            edits: vec![EditSpec {
+                old_text: "b".into(),
+                new_text: "BEE".into(),
+                replace_all: false,
+            }],
         },
     ));
     let _ = h.recv().await;
@@ -446,9 +452,11 @@ async fn edit_atomic_all_or_nothing() {
         RequestBody::Edit {
             path: "p.txt".into(),
             base_hash: current_hash,
-            old_text: "not-present".into(),
-            new_text: "X".into(),
-            replace_all: false,
+            edits: vec![EditSpec {
+                old_text: "not-present".into(),
+                new_text: "X".into(),
+                replace_all: false,
+            }],
         },
     ));
     let m = h.recv().await;
@@ -750,9 +758,11 @@ async fn history_and_operation_get() {
         RequestBody::Edit {
             path: "h.txt".into(),
             base_hash: hash_of("1"),
-            old_text: "1".into(),
-            new_text: "2".into(),
-            replace_all: false,
+            edits: vec![EditSpec {
+                old_text: "1".into(),
+                new_text: "2".into(),
+                replace_all: false,
+            }],
         },
     ));
     let op2 = match h.recv().await {
@@ -1161,9 +1171,11 @@ async fn edit_preserves_executable_bit() {
         RequestBody::Edit {
             path: "run.sh".into(),
             base_hash: hash_of("#!/bin/sh\necho hi\n"),
-            old_text: "echo hi".into(),
-            new_text: "echo bye".into(),
-            replace_all: false,
+            edits: vec![EditSpec {
+                old_text: "echo hi".into(),
+                new_text: "echo bye".into(),
+                replace_all: false,
+            }],
         },
     ));
     let m = h.recv().await;
@@ -1220,9 +1232,11 @@ async fn read_hash_consistent_with_base_hash() {
         RequestBody::Edit {
             path: "c.txt".into(),
             base_hash: hash,
-            old_text: "alpha".into(),
-            new_text: "beta".into(),
-            replace_all: false,
+            edits: vec![EditSpec {
+                old_text: "alpha".into(),
+                new_text: "beta".into(),
+                replace_all: false,
+            }],
         },
     ));
     let m = h.recv().await;
@@ -1364,9 +1378,11 @@ async fn recovery_synthesizes_commit_when_rename_done() {
         RequestBody::Edit {
             path: "f.txt".into(),
             base_hash: after_hash.clone(),
-            old_text: "new".into(),
-            new_text: "DIFFERENT".into(),
-            replace_all: false,
+            edits: vec![EditSpec {
+                old_text: "new".into(),
+                new_text: "DIFFERENT".into(),
+                replace_all: false,
+            }],
         },
     ));
     let m = h.recv().await;
@@ -1447,9 +1463,11 @@ async fn recovery_drops_when_rename_not_done() {
         RequestBody::Edit {
             path: "f.txt".into(),
             base_hash: before_hash.clone(),
-            old_text: "old".into(),
-            new_text: "new".into(),
-            replace_all: false,
+            edits: vec![EditSpec {
+                old_text: "old".into(),
+                new_text: "new".into(),
+                replace_all: false,
+            }],
         },
     ));
     let m = h.recv().await;
@@ -1588,9 +1606,11 @@ async fn aborted_marker_prevents_zombie_prepared() {
             RequestBody::Edit {
                 path: "f.txt".into(),
                 base_hash: before_hash,
-                old_text: "before".into(),
-                new_text: "after".into(),
-                replace_all: false,
+                edits: vec![EditSpec {
+                    old_text: "before".into(),
+                    new_text: "after".into(),
+                    replace_all: false,
+                }],
             },
         ));
         let _ = h.recv().await;
@@ -2500,9 +2520,11 @@ async fn gc_prunes_operations_and_requests() {
                 RequestBody::Edit {
                     path: "f.txt".into(),
                     base_hash: hash_of(old_c),
-                    old_text: old_c.into(),
-                    new_text: new_c.into(),
-                    replace_all: false,
+                    edits: vec![EditSpec {
+                        old_text: old_c.into(),
+                        new_text: new_c.into(),
+                        replace_all: false,
+                    }],
                 },
             ));
             let _ = h.recv().await;
@@ -2543,9 +2565,11 @@ async fn gc_prunes_operations_and_requests() {
             RequestBody::Edit {
                 path: "f.txt".into(),
                 base_hash: hash_of("v3"),
-                old_text: "v3".into(),
-                new_text: "v4".into(),
-                replace_all: false,
+                edits: vec![EditSpec {
+                    old_text: "v3".into(),
+                    new_text: "v4".into(),
+                    replace_all: false,
+                }],
             },
         ));
         match h.recv().await {
@@ -2580,9 +2604,11 @@ async fn startup_prune_respects_history_limit() {
                 RequestBody::Edit {
                     path: "f.txt".into(),
                     base_hash: hash_of(old_c),
-                    old_text: old_c.into(),
-                    new_text: new_c.into(),
-                    replace_all: false,
+                    edits: vec![EditSpec {
+                        old_text: old_c.into(),
+                        new_text: new_c.into(),
+                        replace_all: false,
+                    }],
                 },
             ));
             let _ = h.recv().await;
@@ -2987,10 +3013,13 @@ async fn idle_timeout_exits_and_releases_the_state_lock() {
 }
 
 // A single exec may legitimately run for an hour with the client silent. The
-// timeout measures idleness, not silence, so it must not kill the request it
-// is waiting on -- and must re-arm once that request is done.
+// timeout measures idleness, not silence, so it must not kill the request it is
+// waiting on -- and the clock must restart FROM THAT REQUEST'S COMPLETION, not
+// from the last read. Checked by behaviour rather than by timing: the second
+// request is sent at a point where a read-anchored clock would already have
+// closed the connection, and it has to be served.
 #[tokio::test]
-async fn idle_timeout_spares_a_request_still_running() {
+async fn idle_timeout_spares_a_request_and_restarts_from_its_completion() {
     let root = tempfile::tempdir().unwrap();
     let state_dir = root.path().join(".remote-workspace");
     let (mut writer, mut reader, task) = spawn_idle_server(
@@ -3002,7 +3031,7 @@ async fn idle_timeout_spares_a_request_still_running() {
     let mut line = serde_json::to_string(&req(
         "slow",
         RequestBody::Exec {
-            argv: vec!["sleep".into(), "0.9".into()],
+            argv: vec!["sleep".into(), "0.8".into()],
             cwd: None,
             profile: None,
             timeout_ms: Some(10_000),
@@ -3013,7 +3042,8 @@ async fn idle_timeout_spares_a_request_still_running() {
     writer.write_all(line.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
 
-    // Three idle windows pass while the command runs; the reply still arrives.
+    // The command outlives several idle windows without being killed, and its
+    // reply still arrives.
     let mut reply = String::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -3030,15 +3060,48 @@ async fn idle_timeout_spares_a_request_still_running() {
         other => panic!("unexpected: {other:?}"),
     }
 
-    // Now genuinely idle: the timer re-arms and the server exits on its own.
+    // Sent 150ms after the reply -- past the point a clock anchored to the last
+    // read would have closed the connection (its windows ended at 300/600/900ms,
+    // the last of them once the command was done), and well inside the window a
+    // clock restarted at completion still has to run.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let mut line = serde_json::to_string(&req(
+        "after",
+        RequestBody::List {
+            path: ".".into(),
+            offset: None,
+            limit: None,
+        },
+    ))
+    .unwrap();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut reply = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_line(&mut reply),
+    )
+    .await
+    .expect("server closed: the idle clock did not restart from the completion")
+    .unwrap();
+    assert!(
+        reply.contains("\"after\""),
+        "second request not served: {reply}"
+    );
+
+    // And it still exits on its own once genuinely idle.
     tokio::time::timeout(std::time::Duration::from_secs(10), task)
         .await
-        .expect("server must exit once the request it was waiting on finished")
+        .expect("server must still exit when nothing is happening")
         .unwrap();
-    let events = session_events(&state_dir);
-    let exit = events.iter().find(|e| e["event"] == "exit").unwrap();
+    let exit = session_events(&state_dir)
+        .into_iter()
+        .find(|e| e["event"] == "exit")
+        .unwrap();
     assert_eq!(exit["reason"], "idle_timeout");
-    assert_eq!(exit["requests"], 1);
+    assert_eq!(exit["requests"], 2);
 }
 
 // EOF must still be the ordinary way out, and must be distinguishable in the
@@ -3103,4 +3166,330 @@ async fn a_refused_start_is_recorded_with_the_holder() {
         "the recorded holder must be the process actually holding the lock"
     );
     drop(holder);
+}
+
+// A client closing its end of the pipe does not mean it stopped listening --
+// over SSH, stdin EOF reaches the server while stdout is still open. Returning
+// the moment stdin ends would drop a handler mid-flight, so a mutation already
+// applied to the workspace would never report its result and the caller could
+// not tell whether it landed.
+#[tokio::test]
+async fn a_request_still_running_at_stdin_eof_still_gets_its_reply() {
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path().join(".remote-workspace");
+    let (mut writer, mut reader, task) = spawn_idle_server(
+        root.path(),
+        state_dir.clone(),
+        std::time::Duration::from_secs(3600),
+    );
+
+    let mut line = serde_json::to_string(&req(
+        "slow",
+        RequestBody::Exec {
+            argv: vec!["sh".into(), "-c".into(), "sleep 0.4; echo done".into()],
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(10_000),
+        },
+    ))
+    .unwrap();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+    // EOF arrives while the command is still running.
+    drop(writer);
+
+    let mut reply = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_line(&mut reply),
+    )
+    .await
+    .expect("server exited without replying")
+    .unwrap();
+    match serde_json::from_str::<ServerMessage>(reply.trim()).unwrap() {
+        ServerMessage::Result {
+            result: ResultBody::Exec(r),
+            ..
+        } => {
+            assert_eq!(r.termination, ExecTermination::Exited { code: 0 });
+            assert!(r.stdout.prefix.contains("done"));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("server must still exit")
+        .unwrap();
+    let exit = session_events(&state_dir)
+        .into_iter()
+        .find(|e| e["event"] == "exit")
+        .unwrap();
+    assert_eq!(exit["reason"], "stdin_eof");
+    assert_eq!(
+        exit["drained"], true,
+        "the record must say whether anything was abandoned"
+    );
+}
+
+// The wait is bounded: a command far longer than the drain window is abandoned
+// rather than held onto, because a server on its way out must not keep the
+// state lock from its successor. Recovery resolves the abandoned request.
+#[tokio::test]
+async fn shutdown_does_not_wait_for_a_long_running_command() {
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path().join(".remote-workspace");
+    let (mut writer, _reader, task) = spawn_idle_server(
+        root.path(),
+        state_dir.clone(),
+        std::time::Duration::from_secs(3600),
+    );
+
+    let mut line = serde_json::to_string(&req(
+        "forever",
+        RequestBody::Exec {
+            argv: vec!["sleep".into(), "60".into()],
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(120_000),
+        },
+    ))
+    .unwrap();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+    drop(writer);
+
+    let started = std::time::Instant::now();
+    tokio::time::timeout(std::time::Duration::from_secs(30), task)
+        .await
+        .expect("server must not wait for the command to finish")
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "shutdown waited far too long: {:?}",
+        started.elapsed()
+    );
+    let exit = session_events(&state_dir)
+        .into_iter()
+        .find(|e| e["event"] == "exit")
+        .unwrap();
+    assert_eq!(exit["drained"], false);
+}
+
+// Input that breaks rather than ends is still a shutdown: it has to drain and
+// record its exit like any other, or a mutation that landed just before the
+// connection broke reports nothing and leaves no trace of why.
+#[tokio::test]
+async fn a_broken_input_stream_still_drains_and_records_its_exit() {
+    struct BrokenAfterFirstRead(Option<Vec<u8>>);
+    impl tokio::io::AsyncRead for BrokenAfterFirstRead {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match self.0.take() {
+                Some(bytes) => {
+                    buf.put_slice(&bytes);
+                    std::task::Poll::Ready(Ok(()))
+                }
+                None => std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset",
+                ))),
+            }
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path().join(".remote-workspace");
+    let server = Server::new(ServerOptions {
+        root: root.path().to_path_buf(),
+        state_dir: state_dir.clone(),
+        config_path: None,
+        history_limit: None,
+        scratch_max_age: None,
+        idle_timeout: None,
+    })
+    .unwrap();
+
+    let mut line = serde_json::to_string(&req(
+        "slow",
+        RequestBody::Exec {
+            argv: vec!["sh".into(), "-c".into(), "sleep 0.4; echo done".into()],
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(10_000),
+        },
+    ))
+    .unwrap();
+    line.push('\n');
+    let (server_tx, server_rx) = tokio::io::duplex(1 << 20);
+    let task = tokio::spawn(async move {
+        server
+            .run(BrokenAfterFirstRead(Some(line.into_bytes())), server_tx)
+            .await
+    });
+
+    // The reply is written despite the read side having failed.
+    let mut reader = BufReader::new(server_rx);
+    let mut reply = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_line(&mut reply),
+    )
+    .await
+    .expect("server abandoned the handler on a read error")
+    .unwrap();
+    assert!(reply.contains("\"slow\""), "unexpected reply: {reply}");
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("server must exit")
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "a read error must still surface as an error"
+    );
+
+    let exit = session_events(&state_dir)
+        .into_iter()
+        .find(|e| e["event"] == "exit")
+        .expect("a broken stream must still record its exit");
+    assert_eq!(exit["reason"], "read_error");
+    assert_eq!(exit["drained"], true);
+}
+
+// A handler that outlives the drain must be let go of, not carried: it holds an
+// Arc<Server>, so keeping it would keep the state directory locked against the
+// next server long after this one reported itself gone.
+#[tokio::test]
+async fn an_abandoned_handler_does_not_keep_the_state_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path().join(".remote-workspace");
+    let (mut writer, _reader, task) = spawn_idle_server(
+        root.path(),
+        state_dir.clone(),
+        std::time::Duration::from_secs(3600),
+    );
+
+    let mut line = serde_json::to_string(&req(
+        "forever",
+        RequestBody::Exec {
+            argv: vec!["sleep".into(), "60".into()],
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(120_000),
+        },
+    ))
+    .unwrap();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+    drop(writer);
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), task)
+        .await
+        .expect("server must exit without waiting for the command")
+        .unwrap();
+
+    // The successor takes the lock immediately -- it must not have to burn its
+    // grace period waiting for a task the previous server walked away from.
+    let successor = Server::new(ServerOptions {
+        root: root.path().to_path_buf(),
+        state_dir,
+        config_path: None,
+        history_limit: None,
+        scratch_max_age: None,
+        idle_timeout: None,
+    });
+    assert!(
+        successor.is_ok(),
+        "state lock still held by an abandoned handler: {:?}",
+        successor.err()
+    );
+}
+
+// A request that arrives in pieces spanning idle-timeout expiries must still
+// be executed whole. `read_line` loses bytes it has already consumed when its
+// future is dropped, so letting the timeout interrupt it silently truncated a
+// request into something that parses as garbage -- or, worse, as a different
+// valid request. A handler runs throughout so the expiries fire without the
+// server exiting, which is the situation that made the loss reachable.
+#[tokio::test]
+async fn a_request_split_across_idle_expiries_is_not_truncated() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("f.txt"), "hello\n").unwrap();
+    let state_dir = root.path().join(".remote-workspace");
+    let (mut writer, mut reader, task) = spawn_idle_server(
+        root.path(),
+        state_dir,
+        std::time::Duration::from_millis(150),
+    );
+
+    // Keeps the server alive across the expiries below.
+    let mut busy = serde_json::to_string(&req(
+        "busy",
+        RequestBody::Exec {
+            argv: vec!["sleep".into(), "0.9".into()],
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(10_000),
+        },
+    ))
+    .unwrap();
+    busy.push('\n');
+    writer.write_all(busy.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let line = serde_json::to_string(&req(
+        "split",
+        RequestBody::Read {
+            path: "f.txt".into(),
+            offset: None,
+            limit: None,
+        },
+    ))
+    .unwrap();
+    let (head, tail) = line.split_at(line.len() / 2);
+    writer.write_all(head.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+    // Several idle windows expire with half a request consumed.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    writer
+        .write_all(format!("{tail}\n").as_bytes())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+
+    // Both replies must arrive, and the split one must be the request that was
+    // actually sent.
+    let mut saw_read = false;
+    for _ in 0..2 {
+        let mut reply = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reader.read_line(&mut reply),
+        )
+        .await
+        .expect("no reply: the split request was lost")
+        .unwrap();
+        match serde_json::from_str::<ServerMessage>(reply.trim()).unwrap() {
+            ServerMessage::Result {
+                request_id,
+                result: ResultBody::Read(r),
+            } => {
+                assert_eq!(request_id, "split");
+                assert_eq!(r.content, "hello\n");
+                saw_read = true;
+            }
+            ServerMessage::Result { .. } => {}
+            other => panic!("request was truncated or mangled: {other:?}"),
+        }
+    }
+    assert!(saw_read, "the split request never produced its result");
+    drop(writer);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
 }

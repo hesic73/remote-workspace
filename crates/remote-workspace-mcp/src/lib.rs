@@ -129,13 +129,7 @@ pub struct CreateFileInput {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct EditFileInput {
-    #[schemars(description = "Workspace name")]
-    pub workspace: String,
-    #[schemars(description = "File path in the workspace, or @scratch/...")]
-    pub path: String,
-    #[schemars(description = "Current file hash, as returned by read_file")]
-    pub base_hash: String,
+pub struct EditInput {
     #[schemars(description = "Exact text to replace, including whitespace")]
     pub old_text: String,
     #[schemars(description = "Replacement text; empty string deletes old_text")]
@@ -146,6 +140,20 @@ pub struct EditFileInput {
         description = "Replace every occurrence instead of failing when old_text is not unique (default: false)"
     )]
     pub replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EditFileInput {
+    #[schemars(description = "Workspace name")]
+    pub workspace: String,
+    #[schemars(description = "File path in the workspace, or @scratch/...")]
+    pub path: String,
+    #[schemars(description = "Current file hash, as returned by read_file")]
+    pub base_hash: String,
+    #[schemars(
+        description = "Replacements to apply in order, each to the result of the one before it. All succeed or the file is left untouched."
+    )]
+    pub edits: Vec<EditInput>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -573,7 +581,7 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Modify an existing text file by exact text replacement, atomically. old_text must match the current content exactly: zero occurrences fail with NO_MATCH, several with AMBIGUOUS_MATCH unless replace_all is set. An edit against a stale base_hash fails with STALE_FILE; re-read and retry."
+        description = "Modify an existing text file by exact text replacement, atomically. Pass one or more edits: they are applied in order, each to the result of the one before it, and either all of them land or the file is left untouched. Each old_text must match the content it is applied to exactly: zero occurrences fail with NO_MATCH, several with AMBIGUOUS_MATCH unless replace_all is set. One base_hash covers the whole call; a stale one fails with STALE_FILE, so re-read and retry."
     )]
     async fn edit_file(
         &self,
@@ -581,28 +589,28 @@ impl RemoteWorkspaceServer {
             workspace,
             path,
             base_hash,
-            old_text,
-            new_text,
-            replace_all,
+            edits,
         }): Parameters<EditFileInput>,
     ) -> CallToolResult {
         let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        match client
-            .edit(
-                &path,
-                &base_hash,
-                &old_text,
-                &new_text,
-                replace_all.unwrap_or(false),
-            )
-            .await
-        {
+        let count = edits.len();
+        let edits = edits
+            .into_iter()
+            .map(|e| remote_workspace_client::EditSpec {
+                old_text: e.old_text,
+                new_text: e.new_text,
+                replace_all: e.replace_all.unwrap_or(false),
+            })
+            .collect();
+        match client.edit(&path, &base_hash, edits).await {
             Ok(w) => ok(format!(
-                "Edited {path} in workspace '{workspace}'. operation_id={}, new_hash={}",
-                w.operation_id, w.new_hash
+                "Edited {path} in workspace '{workspace}' ({count} replacement{}). operation_id={}, new_hash={}",
+                if count == 1 { "" } else { "s" },
+                w.operation_id,
+                w.new_hash
             )),
             Err(e) => err(format!("{e}")),
         }

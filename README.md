@@ -48,8 +48,8 @@ Adding workspace 'robot'
   SSH                    connected
   Remote platform        linux-x86_64
   Workspace root         valid
-  Server                 installed 0.1.0
-  Protocol               2
+  Server                 installed 0.5.0
+  Protocol               3
   Workspace probe        passed
   Fleet configuration    updated
 Workspace 'robot' is ready.

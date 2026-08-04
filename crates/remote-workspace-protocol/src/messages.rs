@@ -12,6 +12,24 @@ pub struct Request {
     pub body: RequestBody,
 }
 
+/// One replacement inside an `Edit`.
+///
+/// A list of these is applied **in order, each to the result of the one before
+/// it**, and the file is written once at the end. So a replacement may match
+/// text an earlier one produced, and a failure anywhere -- at any position in
+/// the list -- leaves the file byte-for-byte unchanged.
+///
+/// `old_text` must occur in the content the preceding replacements produced:
+/// zero occurrences fail with NO_MATCH, several with AMBIGUOUS_MATCH unless
+/// `replace_all` is set. An empty `new_text` deletes the matched text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditSpec {
+    pub old_text: String,
+    pub new_text: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RequestBody {
@@ -38,16 +56,13 @@ pub enum RequestBody {
         path: String,
         content: String,
     },
-    /// Replace an exact occurrence of `old_text` with `new_text` in an
-    /// existing text file. Zero matches fail with NO_MATCH; multiple matches
-    /// fail with AMBIGUOUS_MATCH unless `replace_all` is set.
+    /// Apply exact text replacements to an existing text file. `base_hash`
+    /// pins the content the FIRST replacement is stated against; each later one
+    /// is stated against what the ones before it produced. See `EditSpec`.
     Edit {
         path: String,
         base_hash: String,
-        old_text: String,
-        new_text: String,
-        #[serde(default)]
-        replace_all: bool,
+        edits: Vec<EditSpec>,
     },
     Exec {
         argv: Vec<String>,

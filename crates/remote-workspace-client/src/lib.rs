@@ -1,6 +1,10 @@
 use std::process::Stdio;
 use std::sync::Arc;
 
+// EditSpec is re-exported: callers build an `edit` without having to depend on
+// the protocol crate directly.
+pub use remote_workspace_protocol::EditSpec;
+
 use remote_workspace_protocol::{
     ErrorCode, ExecResult, FileEntry, ListResult, MutationResult, OperationDetails, ProtocolError,
     ReadResult, Request, RequestBody, RequestId, RequestStatusResult, ServerMessage,
@@ -453,23 +457,21 @@ impl Client {
         }
     }
 
-    /// Replace an exact occurrence of `old_text` with `new_text` in an
-    /// existing file. `base_hash` is required for optimistic concurrency.
+    /// Apply exact text replacements to an existing file, in order, each to
+    /// the result of the one before it. `base_hash` is required for optimistic
+    /// concurrency and pins the content the first replacement is stated
+    /// against.
     pub async fn edit(
         &self,
         path: &str,
         base_hash: &str,
-        old_text: &str,
-        new_text: &str,
-        replace_all: bool,
+        edits: Vec<EditSpec>,
     ) -> Result<MutationResult, ClientError> {
         let (_, msg) = self
             .send_request(RequestBody::Edit {
                 path: path.into(),
                 base_hash: base_hash.into(),
-                old_text: old_text.into(),
-                new_text: new_text.into(),
-                replace_all,
+                edits,
             })
             .await?;
         match Self::unpack(msg)? {

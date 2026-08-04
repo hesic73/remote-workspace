@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use remote_workspace_client::{Client, Transport};
+use remote_workspace_client::{Client, EditSpec, Transport};
 use remote_workspace_protocol::{ExecTermination, ListKind};
 
 /// Path to the built remote-workspace-server binary.
@@ -42,6 +42,15 @@ fn spawn_piped(argv: &[String]) -> std::io::Result<remote_workspace_client::Spaw
         stdout,
         stderr,
     })
+}
+
+/// A single replacement, which is what most of these tests exercise.
+fn spec(old_text: &str, new_text: &str) -> EditSpec {
+    EditSpec {
+        old_text: old_text.into(),
+        new_text: new_text.into(),
+        replace_all: false,
+    }
 }
 
 async fn make_client(root: &Path) -> Client {
@@ -97,7 +106,7 @@ async fn end_to_end_edit_with_base_hash() {
 
     let w = client.create("f.txt", "a\nb\nc\n").await.unwrap();
     let edited = client
-        .edit("f.txt", &w.new_hash, "b\n", "BEE\n", false)
+        .edit("f.txt", &w.new_hash, vec![spec("b\n", "BEE\n")])
         .await
         .unwrap();
     assert_ne!(edited.new_hash, w.new_hash);
@@ -115,7 +124,7 @@ async fn end_to_end_stale_hash_errors() {
     // caller last saw.
     let stale = format!("sha256:{}", "de".repeat(32));
     let err = client
-        .edit("f.txt", &stale, "v1", "v2", false)
+        .edit("f.txt", &stale, vec![spec("v1", "v2")])
         .await
         .unwrap_err();
     match err {
@@ -138,7 +147,7 @@ async fn end_to_end_stale_hash_errors() {
     // caller must fix the argument, not re-read and retry.
     for bogus in ["auto", "sha256:REPLACE", "sha256:deadbeef"] {
         let err = client
-            .edit("f.txt", bogus, "v1", "v2", false)
+            .edit("f.txt", bogus, vec![spec("v1", "v2")])
             .await
             .unwrap_err();
         match err {
@@ -182,7 +191,7 @@ async fn end_to_end_history_records_each_mutation() {
     let client = make_client(dir.path()).await;
     let w = client.create("u.txt", "first\n").await.unwrap();
     let edit = client
-        .edit("u.txt", &w.new_hash, "first\n", "second\n", false)
+        .edit("u.txt", &w.new_hash, vec![spec("first\n", "second\n")])
         .await
         .unwrap();
 
@@ -275,7 +284,7 @@ async fn end_to_end_gc_prunes_history() {
     let mut hash = client.create("a.txt", "1").await.unwrap().new_hash;
     for (old, new) in [("1", "2"), ("2", "3")] {
         hash = client
-            .edit("a.txt", &hash, old, new, false)
+            .edit("a.txt", &hash, vec![spec(old, new)])
             .await
             .unwrap()
             .new_hash;

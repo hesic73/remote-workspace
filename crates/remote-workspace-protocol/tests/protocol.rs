@@ -65,32 +65,52 @@ fn edit_round_trips() {
         body: RequestBody::Edit {
             path: "src/main.py".into(),
             base_hash: "sha256:abc123".into(),
-            old_text: "old".into(),
-            new_text: "new".into(),
-            replace_all: false,
+            edits: vec![remote_workspace_protocol::EditSpec {
+                old_text: "old".into(),
+                new_text: "new".into(),
+                replace_all: false,
+            }],
         },
     };
     let line = serde_json::to_string(&req).unwrap();
     assert_eq!(
         line,
-        r#"{"request_id":"r3","op":"edit","path":"src/main.py","base_hash":"sha256:abc123","old_text":"old","new_text":"new","replace_all":false}"#
+        r#"{"request_id":"r3","op":"edit","path":"src/main.py","base_hash":"sha256:abc123","edits":[{"old_text":"old","new_text":"new","replace_all":false}]}"#
     );
     round_trip(&req);
 
-    // replace_all defaults to false when omitted on the wire.
+    // replace_all defaults to false per edit when omitted on the wire.
     let req: Request = serde_json::from_value(json!({
+        "request_id": "r",
+        "op": "edit",
+        "path": "p",
+        "base_hash": "sha256:a",
+        "edits": [{"old_text": "x", "new_text": "y"}],
+    }))
+    .unwrap();
+    match req.body {
+        RequestBody::Edit { edits, .. } => {
+            assert_eq!(edits.len(), 1);
+            assert!(!edits[0].replace_all);
+        }
+        _ => panic!("wrong body"),
+    }
+}
+
+// The single-replacement shape of protocol 2 must be refused outright, not
+// read as an edit with an empty list: that would report success having changed
+// nothing. This is what the protocol bump gates.
+#[test]
+fn the_protocol_2_edit_shape_no_longer_deserializes() {
+    let old = json!({
         "request_id": "r",
         "op": "edit",
         "path": "p",
         "base_hash": "sha256:a",
         "old_text": "x",
         "new_text": "y",
-    }))
-    .unwrap();
-    match req.body {
-        RequestBody::Edit { replace_all, .. } => assert!(!replace_all),
-        _ => panic!("wrong body"),
-    }
+    });
+    assert!(serde_json::from_value::<Request>(old).is_err());
 }
 
 #[test]

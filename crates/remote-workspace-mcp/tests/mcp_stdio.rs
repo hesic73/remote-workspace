@@ -590,14 +590,16 @@ fn mcp_full_tool_surface() {
     // A non-matching old_text is a structured NO_MATCH error.
     let (e, text) = s.tool(
         "edit_file",
-        serde_json::json!({"workspace": "test", "path": "f.txt", "base_hash": hash, "old_text": "nope", "new_text": "x"}),
+        serde_json::json!({"workspace": "test", "path": "f.txt", "base_hash": hash,
+            "edits": [{"old_text": "nope", "new_text": "x"}]}),
     );
     assert!(e, "no-match edit must be isError=true");
     assert!(text.contains("NoMatch"), "unexpected text: {text}");
 
     let (e, text) = s.tool(
         "edit_file",
-        serde_json::json!({"workspace": "test", "path": "f.txt", "base_hash": hash, "old_text": "l2\n", "new_text": "L2\n"}),
+        serde_json::json!({"workspace": "test", "path": "f.txt", "base_hash": hash,
+            "edits": [{"old_text": "l2\n", "new_text": "L2\n"}]}),
     );
     assert!(!e, "edit failed: {text}");
     assert!(
@@ -611,6 +613,66 @@ fn mcp_full_tool_surface() {
     );
     assert!(!e);
     assert!(text.starts_with("l1\nL2\n"), "edit not applied: {text}");
+
+    // Several replacements in one call, applied in order and landing together.
+    let hash_of = |s: &mut McpSession| -> String {
+        s.tool(
+            "read_file",
+            serde_json::json!({"workspace": "test", "path": "f.txt"}),
+        )
+        .1
+        .rsplit_once("[hash: ")
+        .expect("read result must carry the hash")
+        .1
+        .trim_end_matches(']')
+        .trim()
+        .to_string()
+    };
+    let hash = hash_of(&mut s);
+    let (e, text) = s.tool(
+        "edit_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt", "base_hash": hash,
+        "edits": [
+            {"old_text": "l1\n", "new_text": "L1\n"},
+            {"old_text": "L2\n", "new_text": "L2!\n"}
+        ]}),
+    );
+    assert!(!e, "multi-edit failed: {text}");
+    assert!(
+        text.contains("2 replacements"),
+        "result must say how many landed: {text}"
+    );
+    let (_, text) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt"}),
+    );
+    assert!(text.starts_with("L1\nL2!\n"), "edits not applied: {text}");
+
+    // One bad replacement rejects the whole call, leaving the file as it was.
+    // The base_hash is current, so this fails on the replacement itself rather
+    // than on staleness.
+    let hash = hash_of(&mut s);
+    let (e, text) = s.tool(
+        "edit_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt", "base_hash": hash,
+        "edits": [
+            {"old_text": "L1\n", "new_text": "x\n"},
+            {"old_text": "absent", "new_text": "y"}
+        ]}),
+    );
+    assert!(e, "a list with a bad replacement must fail");
+    assert!(
+        text.contains("edit 2 of 2"),
+        "error must locate the failing replacement: {text}"
+    );
+    let (_, after) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt"}),
+    );
+    assert!(
+        after.starts_with("L1\nL2!\n"),
+        "rejected list must not partially apply: {after}"
+    );
 
     // Delete, then verify it is gone.
     let (e, text) = s.tool(
@@ -634,7 +696,8 @@ fn mcp_full_tool_surface() {
     assert!(!e);
     let (e, text) = s.tool(
         "edit_file",
-        serde_json::json!({"workspace": "test", "path": "g.txt", "base_hash": "auto", "old_text": "x", "new_text": "y"}),
+        serde_json::json!({"workspace": "test", "path": "g.txt", "base_hash": "auto",
+            "edits": [{"old_text": "x", "new_text": "y"}]}),
     );
     assert!(e, "an invented base_hash must be an error");
     assert!(

@@ -76,8 +76,11 @@ struct RequestLogLine {
 ///   requests.jsonl     one line per request lifecycle
 ///   scratch/           agent-visible runtime artifacts
 ///
-/// The async `write_lock` serializes all mutating handlers, so the in-memory
-/// tables and the on-disk logs never interleave across concurrent requests.
+/// The async `write_lock` serializes mutating handlers, so their in-memory
+/// tables and workspace effects do not interleave. It does NOT cover the logs:
+/// request-table entries and exec records are appended without it, so handler
+/// tasks reach the files concurrently. That is what `log_append` is for, and
+/// why `prune` -- which replaces the files wholesale -- takes it too.
 #[derive(Clone)]
 pub struct OperationStore {
     log_dir: PathBuf,
@@ -87,6 +90,13 @@ pub struct OperationStore {
     records: Arc<Mutex<Vec<AnyOperationRecord>>>,
     requests: Arc<Mutex<HashMap<String, RequestEntry>>>,
     write_lock: Arc<AsyncMutex<()>>,
+    /// Serializes physical appends to both logs. Distinct from `write_lock`,
+    /// which serializes mutating handlers: request-table and exec records are
+    /// appended without it, so handler tasks do reach the logs concurrently.
+    log_append: Arc<Mutex<()>>,
+    /// Set when a partial line could not be rolled back. Nothing may be
+    /// appended after a fragment, so this stops trying -- see `append_line`.
+    log_torn: Arc<std::sync::atomic::AtomicBool>,
     /// Exclusive flock on `<log_dir>/lock`, held for the store's lifetime so a
     /// second server on the same state directory fails fast instead of
     /// corrupting the shared logs (interleaved appends, colliding op ids).
@@ -173,7 +183,16 @@ impl OperationStore {
         } else {
             append_missing_newline(&ops_lines, &operations_path)?;
         }
-        let mut records: Vec<AnyOperationRecord> = by_id.into_values().collect();
+        // Aborted markers have done their work by the time the log is read:
+        // they exist only to stop the load from resurrecting the prepared line
+        // they supersede, which is exactly what collapsing by id above just
+        // did. Keeping them would give WAL bookkeeping a place in the table
+        // `prune` treats as history, where an internal marker could take a
+        // retained slot from an operation a caller asked to keep.
+        let mut records: Vec<AnyOperationRecord> = by_id
+            .into_values()
+            .filter(|r| !matches!(r, AnyOperationRecord::Aborted(_)))
+            .collect();
         records.sort_by_key(|r| r.timestamp_ms());
 
         let mut requests = HashMap::new();
@@ -216,6 +235,8 @@ impl OperationStore {
             records: Arc::new(Mutex::new(records)),
             requests: Arc::new(Mutex::new(requests)),
             write_lock: Arc::new(AsyncMutex::new(())),
+            log_append: Arc::new(Mutex::new(())),
+            log_torn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             _dir_lock: Arc::new(dir_lock),
         })
     }
@@ -293,7 +314,7 @@ impl OperationStore {
             };
             match outcome {
                 RecoveryOutcome::NoOp => {
-                    self.drop_prepared(&p.operation_id)?;
+                    self.abort_prepared(&p.operation_id)?;
                     actions.push(RecoveryAction::Dropped {
                         operation_id: p.operation_id.clone(),
                     });
@@ -371,21 +392,32 @@ impl OperationStore {
         Ok(actions)
     }
 
-    fn drop_prepared(&self, operation_id: &str) -> Result<(), ProtocolError> {
-        let mut g = self.records.lock();
-        // Remove from in-memory table.
-        g.retain(|r| {
-            !(r.operation_id() == operation_id && matches!(r, AnyOperationRecord::Prepared(_)))
-        });
-        drop(g);
-        // Persist a durable aborted marker so the prepared record doesn't
-        // resurrect on the next restart (the append-only log still contains
-        // the original prepared line).
-        self.append_any_record(AnyOperationRecord::Aborted(AbortedRecord {
-            operation_id: operation_id.to_string(),
-            timestamp_ms: now_ms(),
-        }))?;
-        Ok(())
+    /// Supersede a prepared marker with a durable aborted one, for a mutation
+    /// that was decided against after the marker was written. Without it,
+    /// recovery would judge the marker against whatever the file holds later
+    /// and could synthesize a commit for a mutation that never happened.
+    ///
+    /// Callers return this error in place of the one that made them withdraw:
+    /// a log that cannot be written is the more serious fault, and reporting
+    /// the refusal instead would claim the withdrawal was recorded when it was
+    /// not.
+    pub fn abort_prepared(&self, operation_id: &str) -> Result<(), ProtocolError> {
+        // Durable first. The log is what recovery reads, so dropping the marker
+        // from memory before the aborted record is on disk would leave a
+        // failed append looking withdrawn to this process while the next server
+        // still finds the prepared line.
+        self.append_record_tracked(
+            AnyOperationRecord::Aborted(AbortedRecord {
+                operation_id: operation_id.to_string(),
+                timestamp_ms: now_ms(),
+            }),
+            |g| {
+                g.retain(|r| {
+                    !(r.operation_id() == operation_id
+                        && matches!(r, AnyOperationRecord::Prepared(_)))
+                })
+            },
+        )
     }
 
     /// Append a real committed FsOperationRecord for a prepared op whose
@@ -404,14 +436,13 @@ impl OperationStore {
             timestamp_ms: now_ms(),
         };
         let any = AnyOperationRecord::Fs(record.clone());
-        self.append_any_record(any.clone())?;
-        let mut g = self.records.lock();
-        if let Some(slot) = g.iter_mut().find(|r| r.operation_id() == p.operation_id) {
-            *slot = any;
-        } else {
-            g.push(any);
-        }
-        drop(g);
+        let op_id = p.operation_id.clone();
+        self.append_record_tracked(any.clone(), move |g| {
+            match g.iter_mut().find(|r| r.operation_id() == op_id) {
+                Some(slot) => *slot = any,
+                None => g.push(any),
+            }
+        })?;
         // Reconstruct the terminal result so replay/status work after restart.
         let msg = self.reconstruct_result(&AnyOperationRecord::Fs(record));
         self.remember_result(&p.request_id, msg)?;
@@ -430,7 +461,7 @@ impl OperationStore {
         p: &remote_workspace_protocol::PreparedRecord,
         reason: &str,
     ) -> Result<(), ProtocolError> {
-        self.drop_prepared(&p.operation_id)?;
+        self.abort_prepared(&p.operation_id)?;
         let err = ProtocolError::new(
             ErrorCode::StaleFile,
             format!(
@@ -453,12 +484,20 @@ impl OperationStore {
         request_id: &str,
         op: &str,
     ) -> Result<Option<RequestEntry>, ProtocolError> {
-        let g = self.requests.lock();
-        if let Some(entry) = g.get(request_id).cloned() {
+        // Known already: no need to serialize with anything.
+        if let Some(entry) = self.requests.lock().get(request_id).cloned() {
             return Ok(Some(entry));
         }
-        drop(g);
-
+        // Otherwise decide and record under one lock. Deciding first and
+        // appending after would let two callers racing on one request_id both
+        // write an InProgress line -- and the loser's, landing after the
+        // winner's terminal one, is the line a restart would read, undoing a
+        // result that had already been reported and making the request
+        // executable a second time.
+        let _appends = self.log_append.lock();
+        if let Some(entry) = self.requests.lock().get(request_id).cloned() {
+            return Ok(Some(entry));
+        }
         // Persist FIRST; only update memory on success.
         self.append_request_line(RequestLogLine {
             request_id: request_id.to_string(),
@@ -467,13 +506,7 @@ impl OperationStore {
             result_error: None,
             op: Some(op.to_string()),
         })?;
-
-        let mut g = self.requests.lock();
-        // Double-check: someone may have claimed while we were writing.
-        if let Some(entry) = g.get(request_id).cloned() {
-            return Ok(Some(entry));
-        }
-        g.insert(
+        self.requests.lock().insert(
             request_id.to_string(),
             RequestEntry {
                 status: RequestStatus::InProgress,
@@ -489,23 +522,25 @@ impl OperationStore {
         request_id: &str,
         msg: ServerMessage,
     ) -> Result<(), ProtocolError> {
-        self.append_request_line(RequestLogLine {
-            request_id: request_id.to_string(),
-            status: RequestStatus::Done,
-            result_done: Some(msg.clone()),
-            result_error: None,
-            op: None,
-        })?;
-        let mut g = self.requests.lock();
-        g.insert(
-            request_id.to_string(),
-            RequestEntry {
+        self.append_request_tracked(
+            RequestLogLine {
+                request_id: request_id.to_string(),
                 status: RequestStatus::Done,
-                result: Some(StoredResult::Done(msg)),
+                result_done: Some(msg.clone()),
+                result_error: None,
                 op: None,
             },
-        );
-        Ok(())
+            |g| {
+                g.insert(
+                    request_id.to_string(),
+                    RequestEntry {
+                        status: RequestStatus::Done,
+                        result: Some(StoredResult::Done(msg)),
+                        op: None,
+                    },
+                );
+            },
+        )
     }
 
     pub fn remember_error(
@@ -513,23 +548,25 @@ impl OperationStore {
         request_id: &str,
         err: ProtocolError,
     ) -> Result<(), ProtocolError> {
-        self.append_request_line(RequestLogLine {
-            request_id: request_id.to_string(),
-            status: RequestStatus::Error,
-            result_done: None,
-            result_error: Some(err.clone()),
-            op: None,
-        })?;
-        let mut g = self.requests.lock();
-        g.insert(
-            request_id.to_string(),
-            RequestEntry {
+        self.append_request_tracked(
+            RequestLogLine {
+                request_id: request_id.to_string(),
                 status: RequestStatus::Error,
-                result: Some(StoredResult::Error(err)),
+                result_done: None,
+                result_error: Some(err.clone()),
                 op: None,
             },
-        );
-        Ok(())
+            |g| {
+                g.insert(
+                    request_id.to_string(),
+                    RequestEntry {
+                        status: RequestStatus::Error,
+                        result: Some(StoredResult::Error(err)),
+                        op: None,
+                    },
+                );
+            },
+        )
     }
 
     pub fn lookup_request(&self, request_id: &str) -> Option<RequestEntry> {
@@ -562,7 +599,40 @@ impl OperationStore {
             expected_after_hash,
             timestamp_ms: now_ms(),
         };
-        self.append_any_record(AnyOperationRecord::Prepared(prepared))?;
+        let appends = self.log_append.lock();
+        match self.append_record_locked(AnyOperationRecord::Prepared(prepared.clone())) {
+            Ok(()) => {}
+            Err(AppendFailure::Unsynced(e)) => {
+                // The line is in the log even though the sync meant to make it
+                // durable failed, and the caller is about to abandon the
+                // mutation. Supersede it, or a later start could read it as
+                // work that was under way and credit this request with whatever
+                // the file holds by then. Best effort by necessity: on a disk
+                // that just refused a sync there is nothing better left to try,
+                // and the error being returned already says so.
+                let _ = self.append_record_locked(AnyOperationRecord::Aborted(AbortedRecord {
+                    operation_id: op_id,
+                    timestamp_ms: now_ms(),
+                }));
+                return Err(e);
+            }
+            Err(AppendFailure::Incomplete(e)) => {
+                // Nothing may follow a possibly-partial line: an unterminated
+                // tail is what the loader discards, and writing after it would
+                // make the pair a terminated line that cannot parse, which it
+                // must refuse instead.
+                return Err(e);
+            }
+        }
+        // Also into the in-memory table, which is what `prune` rewrites the log
+        // from: a marker missing there is erased by any `gc` that runs before
+        // the next start, taking with it the only record that a mutation was
+        // under way. `history` filters WAL markers out, so this stays invisible
+        // to callers, and `prune` never removes one however small its `keep`.
+        self.records
+            .lock()
+            .push(AnyOperationRecord::Prepared(prepared));
+        drop(appends);
         Ok(op_id)
     }
 
@@ -589,32 +659,33 @@ impl OperationStore {
             after_hash,
             timestamp_ms: now_ms(),
         };
-        self.append_any_record(AnyOperationRecord::Fs(record.clone()))?;
-        // Update the in-memory table so future history calls see the commit.
-        let mut g = self.records.lock();
-        if let Some(existing) = g.iter_mut().find(|r| r.operation_id() == operation_id) {
-            *existing = AnyOperationRecord::Fs(record.clone());
-        } else {
-            g.push(AnyOperationRecord::Fs(record.clone()));
-        }
+        let tracked = record.clone();
+        self.append_record_tracked(AnyOperationRecord::Fs(record.clone()), move |g| {
+            // The commit supersedes this operation's prepared marker.
+            match g
+                .iter_mut()
+                .find(|r| r.operation_id() == tracked.operation_id)
+            {
+                Some(existing) => *existing = AnyOperationRecord::Fs(tracked),
+                None => g.push(AnyOperationRecord::Fs(tracked)),
+            }
+        })?;
         Ok(record)
     }
 
     pub fn append_exec_record(&self, record: ExecOperationRecord) -> Result<(), ProtocolError> {
-        self.append_any_record(AnyOperationRecord::Exec(record.clone()))?;
-        self.records.lock().push(AnyOperationRecord::Exec(record));
-        Ok(())
+        self.append_record_tracked(AnyOperationRecord::Exec(record.clone()), |g| {
+            g.push(AnyOperationRecord::Exec(record))
+        })
     }
 
     pub fn append_transfer_record(
         &self,
         record: remote_workspace_protocol::TransferOperationRecord,
     ) -> Result<(), ProtocolError> {
-        self.append_any_record(AnyOperationRecord::Transfer(record.clone()))?;
-        self.records
-            .lock()
-            .push(AnyOperationRecord::Transfer(record));
-        Ok(())
+        self.append_record_tracked(AnyOperationRecord::Transfer(record.clone()), |g| {
+            g.push(AnyOperationRecord::Transfer(record))
+        })
     }
 
     pub fn find_record(&self, operation_id: &str) -> Option<AnyOperationRecord> {
@@ -783,10 +854,31 @@ impl OperationStore {
     /// Dropping a request entry shrinks the idempotency window: replaying a
     /// pruned request_id re-executes instead of returning the stored result.
     pub fn prune(&self, keep: usize) -> Result<PruneStats, ProtocolError> {
+        // Replacing a log is an append's opposite number and has to exclude
+        // them the same way: a handler that appends between the snapshot below
+        // and the rename would have its record replaced away, having already
+        // been told the operation succeeded. `append_line` takes no other lock
+        // while it holds this one, so taking it first here cannot cycle.
+        let _appends = self.log_append.lock();
         let mut records = self.records.lock();
         let mut requests = self.requests.lock();
-        let removed_operations = records.len().saturating_sub(keep);
-        records.drain(..removed_operations);
+        // A prepared marker is pending state, not history: it is the only thing
+        // that lets the next start work out what became of a mutation whose
+        // outcome is still unknown -- a rename that landed but could not be
+        // made durable, say. So `keep` counts history only, and no value of it,
+        // zero included, prunes a marker away.
+        let prunable = records.iter().filter(|r| !is_pending(r)).count();
+        let mut to_remove = prunable.saturating_sub(keep);
+        let before_records = records.len();
+        records.retain(|r| {
+            if to_remove > 0 && !is_pending(r) {
+                to_remove -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        let removed_operations = before_records - records.len();
         let retained_ids: std::collections::HashSet<&str> =
             records.iter().filter_map(record_request_id).collect();
         let before_requests = requests.len();
@@ -798,8 +890,12 @@ impl OperationStore {
         // it is the only thing preventing operation-id reuse after a restart.
         let counter = *self.next_id.lock();
         let counter_path = self.log_dir.join("op-counter");
-        std::fs::write(&counter_path, format!("{counter}\n")).map_err(io_to_protocol)?;
-        crate::fsync::fsync_file_or_dir(&counter_path).map_err(io_to_protocol)?;
+        // Written whole or not at all: this file is the only thing keeping a
+        // pruned operation id from being handed out again, and `std::fs::write`
+        // truncates first -- a write that then failed part-way would leave a
+        // smaller number that the loader has no way to recognise as damaged
+        // once the operations it came from have been pruned away.
+        write_atomically(&counter_path, format!("{counter}\n").as_bytes())?;
         rewrite_jsonl(&self.operations_path, records.iter())?;
         let request_lines: Vec<RequestLogLine> = requests
             .iter()
@@ -822,7 +918,9 @@ impl OperationStore {
         Ok(PruneStats {
             removed_operations,
             removed_requests,
-            retained_operations: records.len(),
+            // History only, matching what `keep` counts and what a
+            // caller can actually go on to read.
+            retained_operations: records.iter().filter(|r| !is_pending(r)).count(),
         })
     }
 
@@ -833,40 +931,143 @@ impl OperationStore {
                 format!("failed to serialize request log: {e}"),
             )
         })?;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.requests_path)
-            .map_err(|e| {
-                ProtocolError::new(ErrorCode::IoError, format!("open request log: {e}"))
-            })?;
-        writeln!(f, "{serialized}").map_err(|e| {
-            ProtocolError::new(ErrorCode::IoError, format!("write request log: {e}"))
-        })?;
-        f.sync_all().map_err(|e| {
-            ProtocolError::new(ErrorCode::IoError, format!("fsync request log: {e}"))
-        })?;
+        self.append_line(&self.requests_path, &serialized, "request log")
+            .map_err(|f| match f {
+                AppendFailure::Incomplete(e) | AppendFailure::Unsynced(e) => e,
+            })
+    }
+
+    /// The request-log counterpart of `append_record_tracked`: the durable
+    /// append and the matching change to the request table happen under one
+    /// lock, so `prune` -- which rewrites the file from that table -- cannot
+    /// snapshot it between the two and write back a file missing an entry that
+    /// is already in it.
+    fn append_request_tracked(
+        &self,
+        line: RequestLogLine,
+        apply: impl FnOnce(&mut HashMap<String, RequestEntry>),
+    ) -> Result<(), ProtocolError> {
+        let _appends = self.log_append.lock();
+        self.append_request_line(line)?;
+        apply(&mut self.requests.lock());
         Ok(())
     }
 
-    fn append_any_record(&self, record: AnyOperationRecord) -> Result<(), ProtocolError> {
+    /// Append a record and make the matching change to the in-memory table
+    /// without letting go in between.
+    ///
+    /// `prune` rewrites the file from that table, so the two must never be seen
+    /// apart: a record already durable while the table has yet to hear about it
+    /// is exactly the snapshot a concurrent prune would write back, dropping an
+    /// operation its handler has already been told committed.
+    fn append_record_tracked(
+        &self,
+        record: AnyOperationRecord,
+        apply: impl FnOnce(&mut Vec<AnyOperationRecord>),
+    ) -> Result<(), ProtocolError> {
+        let _appends = self.log_append.lock();
+        self.append_record_locked(record).map_err(|f| match f {
+            AppendFailure::Incomplete(e) | AppendFailure::Unsynced(e) => e,
+        })?;
+        apply(&mut self.records.lock());
+        Ok(())
+    }
+
+    /// The append itself, for callers already holding `log_append`.
+    fn append_record_locked(&self, record: AnyOperationRecord) -> Result<(), AppendFailure> {
         let serialized = serde_json::to_string(&record).map_err(|e| {
-            ProtocolError::new(
+            AppendFailure::Incomplete(ProtocolError::new(
                 ErrorCode::IoError,
                 format!("failed to serialize operation record: {e}"),
-            )
+            ))
         })?;
+        self.append_line(&self.operations_path, &serialized, "op log")
+    }
+
+    /// Append one line to a JSONL log, undoing a write that cannot be
+    /// completed.
+    ///
+    /// The roll-back is the point. These logs are append-only and their loader
+    /// repairs a tail with no newline -- a crash between the write and the
+    /// newline -- by discarding or completing it. What it cannot repair is a
+    /// fragment that a LATER append has welded onto and terminated: that is a
+    /// newline-terminated line which does not parse, and the loader must treat
+    /// it as a corrupted authoritative log and refuse. A server that stays up
+    /// after a partial write (a volume that filled and was then freed, say)
+    /// would produce exactly that.
+    ///
+    /// So a partial write is truncated away. The caller holds `log_append`,
+    /// which is what makes the length taken beforehand still the end of the
+    /// file -- handler tasks append concurrently, and the state flock only
+    /// excludes other processes.
+    /// If even the truncation fails the fragment is there to stay, and this
+    /// store stops appending rather than weld onto it; the next start repairs
+    /// the unterminated tail.
+    fn append_line(
+        &self,
+        path: &std::path::Path,
+        serialized: &str,
+        what: &str,
+    ) -> Result<(), AppendFailure> {
+        let incomplete =
+            |msg: String| AppendFailure::Incomplete(ProtocolError::new(ErrorCode::IoError, msg));
+        if self.log_torn.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(incomplete(format!(
+                "refusing to append to {what}: an earlier partial line could not be undone, \
+                 and appending after it would leave a log the next start cannot read; \
+                 restart the server to repair it"
+            )));
+        }
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.operations_path)
-            .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("open op log: {e}")))?;
-        writeln!(f, "{serialized}")
-            .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("write op log: {e}")))?;
-        f.sync_all()
-            .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("fsync op log: {e}")))?;
+            .open(path)
+            .map_err(|e| incomplete(format!("open {what}: {e}")))?;
+        let len_before = f
+            .metadata()
+            .map_err(|e| incomplete(format!("stat {what}: {e}")))?
+            .len();
+        if let Err(e) = writeln!(f, "{serialized}") {
+            if let Err(t) = f.set_len(len_before) {
+                self.log_torn
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(incomplete(format!(
+                    "write {what}: {e}; the partial line could not be undone ({t}), so this \
+                     server will not append again -- restart to repair"
+                )));
+            }
+            return Err(incomplete(format!("write {what}: {e}")));
+        }
+        f.sync_all().map_err(|e| {
+            AppendFailure::Unsynced(ProtocolError::new(
+                ErrorCode::IoError,
+                format!("fsync {what}: {e}"),
+            ))
+        })?;
         Ok(())
     }
+}
+
+/// How far a failed append got, which decides whether anything may be appended
+/// after it.
+///
+/// A write that failed part-way can leave a line with no newline, and that is
+/// precisely the shape the loader knows how to discard as a crash-truncated
+/// tail. Appending after it would weld the next record onto the fragment and
+/// terminate the pair with a newline, turning a repairable tail into a
+/// newline-terminated line that does not parse -- which the loader must treat
+/// as a corrupted authoritative log and refuse.
+enum AppendFailure {
+    /// The record may be a partial line. Nothing more may be appended.
+    Incomplete(ProtocolError),
+    /// The line is whole on disk; only its durability is unconfirmed.
+    Unsynced(ProtocolError),
+}
+
+/// True for records that describe a mutation still in flight rather than one
+/// that happened. They are reconciled by recovery and must outlive pruning.
+fn is_pending(r: &AnyOperationRecord) -> bool {
+    matches!(r, AnyOperationRecord::Prepared(_))
 }
 
 /// Sentinel value used as `expected_after_hash` when the mutation results in a
@@ -939,6 +1140,22 @@ fn acquire_dir_lock(
 
 /// Replace a JSONL file's contents atomically: write to a temp file in the
 /// same directory, fsync, rename over the original, fsync the directory.
+/// Replace a file's contents whole: write a temp file beside it, sync, rename.
+/// A caller that cannot tolerate a half-written file uses this instead of
+/// `std::fs::write`, which truncates before it writes.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), ProtocolError> {
+    let dir = path.parent().ok_or_else(|| {
+        ProtocolError::new(ErrorCode::IoError, format!("no parent dir for {path:?}"))
+    })?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(io_to_protocol)?;
+    tmp.write_all(bytes).map_err(io_to_protocol)?;
+    tmp.as_file().sync_all().map_err(io_to_protocol)?;
+    tmp.persist(path)
+        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("persist {path:?}: {e}")))?;
+    crate::fsync::fsync_file_or_dir(path).map_err(io_to_protocol)?;
+    Ok(())
+}
+
 fn rewrite_jsonl<T: serde::Serialize>(
     path: &std::path::Path,
     items: impl Iterator<Item = T>,
