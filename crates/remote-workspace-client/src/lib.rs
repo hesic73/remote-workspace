@@ -15,9 +15,39 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, warn};
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Deserialize,
+    serde::Serialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteShell {
+    #[default]
+    Posix,
+    Powershell,
+}
+
+impl std::fmt::Display for RemoteShell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Posix => f.write_str("posix"),
+            Self::Powershell => f.write_str("powershell"),
+        }
+    }
+}
+
 pub mod deploy;
 pub mod fleet;
 mod log_writer;
+mod platform;
 pub mod stats;
 mod transfer;
 
@@ -90,13 +120,12 @@ impl Transport for ArgvTransport {
         // with SIGKILL, where no destructor runs -- the transport child must
         // not outlive it as an orphan holding the remote session (and the
         // server-side state lock) open.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
+        platform::configure_parent_death(&mut cmd);
         let mut child = cmd.spawn()?;
+        if let Err(error) = platform::attach_parent_death(&mut child) {
+            let _ = child.start_kill();
+            return Err(error);
+        }
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take();
@@ -188,6 +217,8 @@ pub struct Client {
     closed_notify: Arc<tokio::sync::Notify>,
     stderr: Arc<StderrTail>,
     log: Option<Arc<ClientLog>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    reader_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Client {
@@ -240,8 +271,14 @@ impl Client {
         let reader_closed = closed.clone();
         let reader_notify = closed_notify.clone();
         let reader_log = log.clone();
-        tokio::spawn(async move {
-            reader_loop(stdout, reader_reply, reader_log).await;
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let reader_task = tokio::spawn(async move {
+            tokio::select! {
+                _ = reader_loop(stdout, reader_reply, reader_log) => {}
+                _ = shutdown_rx => {
+                    let _ = child.start_kill();
+                }
+            }
             // Mark the connection persistently closed so future requests on this
             // Client fail fast, then wake any current waiters.
             reader_closed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -258,7 +295,26 @@ impl Client {
             closed_notify,
             stderr: tail,
             log,
+            shutdown: Some(shutdown),
+            reader_task: Some(reader_task),
         })
+    }
+
+    pub async fn close(self) {
+        self.close_with_grace(std::time::Duration::from_secs(7))
+            .await;
+    }
+
+    pub async fn close_with_grace(mut self, grace: std::time::Duration) {
+        if !self.is_closed() {
+            let _ = tokio::time::timeout(grace, self.wait_closed()).await;
+        }
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(reader_task) = self.reader_task.take() {
+            let _ = reader_task.await;
+        }
     }
 
     /// The close error, carrying whatever the far end printed before dying.
@@ -723,6 +779,35 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+pub fn powershell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+pub(crate) fn remote_argv_command(shell: RemoteShell, argv: &[String]) -> String {
+    match shell {
+        RemoteShell::Posix => argv
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" "),
+        RemoteShell::Powershell => format!(
+            "& {}; exit $LASTEXITCODE",
+            argv.iter()
+                .map(|arg| powershell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+    }
+}
+
 /// Request IDs must be globally unique because the server dedupes on them for
 /// idempotent replay. Timestamp separates processes over time, pid separates
 /// concurrent processes, and the counter separates requests within a process.
@@ -739,7 +824,7 @@ fn unique_id() -> String {
 
 #[cfg(test)]
 mod quote_tests {
-    use super::{shell_quote, Endpoint};
+    use super::{powershell_quote, remote_argv_command, shell_quote, Endpoint, RemoteShell};
 
     #[test]
     fn quotes_empty_spaces_and_metacharacters() {
@@ -748,11 +833,20 @@ mod quote_tests {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("$(rm -rf /);`x`|&"), "'$(rm -rf /);`x`|&'");
         assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+        assert_eq!(powershell_quote("it's"), "'it''s'");
+        assert_eq!(
+            remote_argv_command(
+                RemoteShell::Powershell,
+                &["C:\\Program Files\\server.exe".into(), "it's".into()]
+            ),
+            "& 'C:\\Program Files\\server.exe' 'it''s'; exit $LASTEXITCODE"
+        );
     }
 
     fn ssh_endpoint() -> Endpoint {
         Endpoint::Ssh {
             host: "host".into(),
+            remote_shell: RemoteShell::Posix,
             remote_bin: "remote-workspace-server".into(),
             root: "/data/my project".into(),
             state_base: Some("/data/sicheng/agent state".into()),
@@ -771,6 +865,33 @@ mod quote_tests {
         assert_eq!(
             argv[argv.len() - 1],
             "'remote-workspace-server' '--root' '/data/my project' '--state-base' '/data/sicheng/agent state'"
+        );
+    }
+
+    #[test]
+    fn powershell_ssh_argv_uses_call_operator_and_literal_quotes() {
+        let endpoint = Endpoint::Ssh {
+            host: "windows".into(),
+            remote_shell: RemoteShell::Powershell,
+            remote_bin: r"C:\Program Files\Remote Workspace\server.exe".into(),
+            root: r"C:\work\it's here".into(),
+            state_base: None,
+            config: None,
+        };
+        let argv = endpoint.control_argv();
+        assert_eq!(argv[0], "powershell.exe");
+        assert!(argv.contains(&"-NoProfile".to_string()));
+        assert!(argv.contains(&"-EncodedCommand".to_string()));
+        assert_eq!(
+            endpoint
+                .transfer_receive_argv(r"C:\stage\it's.part", 42)
+                .last()
+                .unwrap(),
+            "& 'C:\\Program Files\\Remote Workspace\\server.exe' '--transfer-receive' 'C:\\stage\\it''s.part' '--expect-size' '42' '--transfer-base64'; exit $LASTEXITCODE"
+        );
+        assert_eq!(
+            endpoint.transfer_send_argv("file.bin").last().unwrap(),
+            "& 'C:\\Program Files\\Remote Workspace\\server.exe' '--transfer-send' 'file.bin' '--root' 'C:\\work\\it''s here' '--transfer-base64'; exit $LASTEXITCODE"
         );
     }
 

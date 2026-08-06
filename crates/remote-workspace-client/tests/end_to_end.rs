@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 
 use remote_workspace_client::{Client, EditSpec, Transport};

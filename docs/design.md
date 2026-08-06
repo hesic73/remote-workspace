@@ -382,6 +382,13 @@ of the boundary: the CLI adds and removes workspaces and installs binaries;
 the MCP exposes only already-configured workspaces; the agent chooses among
 them. There is no `add_workspace`, `install_server`, or reload tool.
 
+Onboarding probes PowerShell first and POSIX second, then records the result as
+`remote_shell = "powershell"` or `remote_shell = "posix"` in the fleet. Every
+later control and transfer connection uses that recorded quoting model without
+probing, retrying, or guessing. `--remote-shell` provides an explicit override
+for hosts whose environment makes automatic detection ambiguous. Fleet entries
+from releases before this field existed retain POSIX behavior.
+
 `add` is onboarding only and refuses a name already in the fleet, so picking up
 a new release is a separate verb:
 

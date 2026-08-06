@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use remote_workspace_client::{ArgvTransport, Client, ClientLog};
+use remote_workspace_client::{ArgvTransport, Client, ClientLog, RemoteShell};
 use remote_workspace_protocol::{ExecOutput, ExecTermination, ListKind};
 use tracing_subscriber::EnvFilter;
 
@@ -23,6 +23,10 @@ struct Cli {
     /// it on the remote PATH.
     #[arg(long, default_value = "remote-workspace-server")]
     remote_bin: String,
+
+    /// Shell used by the SSH server to interpret remote commands.
+    #[arg(long, value_enum, default_value_t)]
+    remote_shell: RemoteShell,
 
     /// Workspace root on the remote host. Required for the connect-based
     /// commands; not used by `workspace add`, which takes its own --root.
@@ -162,6 +166,9 @@ enum WorkspaceCmd {
         /// but never install or overwrite it. Omit to use the managed binary.
         #[arg(long)]
         remote_bin: Option<String>,
+        /// Override remote-shell detection.
+        #[arg(long, value_enum)]
+        remote_shell: Option<RemoteShell>,
         /// Fleet config file to update. Defaults to ~/.remote-workspace/workspaces.toml.
         #[arg(long)]
         fleet: Option<PathBuf>,
@@ -191,8 +198,13 @@ fn main() -> Result<()> {
 }
 
 fn default_log_dir() -> Result<PathBuf> {
-    let home =
-        std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set; pass --log-dir"))?;
+    #[cfg(unix)]
+    const HOME_VAR: &str = "HOME";
+    #[cfg(windows)]
+    const HOME_VAR: &str = "USERPROFILE";
+
+    let home = std::env::var_os(HOME_VAR)
+        .ok_or_else(|| anyhow!("{HOME_VAR} is not set; pass --log-dir"))?;
     Ok(PathBuf::from(home).join(".remote-workspace/log"))
 }
 
@@ -249,6 +261,7 @@ async fn async_main_real() -> Result<()> {
         })?;
         remote_workspace_client::Endpoint::Ssh {
             host,
+            remote_shell: cli.remote_shell,
             remote_bin: cli.remote_bin.clone(),
             root,
             state_base: cli.state_base.clone(),
@@ -257,7 +270,7 @@ async fn async_main_real() -> Result<()> {
     };
 
     let transport = ArgvTransport {
-        argv: endpoint.control_argv(),
+        argv: endpoint.one_shot_control_argv(),
     };
     let client = Client::connect(transport, log)
         .await
@@ -386,6 +399,7 @@ async fn handle_workspace(cmd: &WorkspaceCmd) -> Result<()> {
             config,
             state_base,
             remote_bin,
+            remote_shell,
             fleet,
         } => {
             workspace_add(WorkspaceAddParams {
@@ -396,6 +410,7 @@ async fn handle_workspace(cmd: &WorkspaceCmd) -> Result<()> {
                 config: config.as_deref(),
                 state_base: state_base.as_deref(),
                 remote_bin: remote_bin.as_deref(),
+                remote_shell: *remote_shell,
                 fleet: fleet.clone(),
             })
             .await
@@ -439,10 +454,13 @@ async fn workspace_upgrade(name: Option<&str>, fleet: Option<PathBuf>) -> Result
     let mut done: BTreeSet<String> = BTreeSet::new();
     let mut failures = 0;
     for (ws_name, ws) in selected {
-        let (host, bin) = match &ws.endpoint {
+        let (host, shell, bin) = match &ws.endpoint {
             remote_workspace_client::Endpoint::Ssh {
-                host, remote_bin, ..
-            } => (host, remote_bin),
+                host,
+                remote_shell,
+                remote_bin,
+                ..
+            } => (host, *remote_shell, remote_bin),
             remote_workspace_client::Endpoint::Local { .. } => {
                 println!("{ws_name}: local workspace, nothing to install");
                 continue;
@@ -452,7 +470,7 @@ async fn workspace_upgrade(name: Option<&str>, fleet: Option<PathBuf>) -> Result
             println!("{ws_name}: shares {host}, already handled");
             continue;
         }
-        match upgrade_host(host, bin).await {
+        match upgrade_host(host, shell, bin).await {
             Ok(msg) => println!("{ws_name} [{host}]: {msg}"),
             Err(e) => {
                 failures += 1;
@@ -468,19 +486,19 @@ async fn workspace_upgrade(name: Option<&str>, fleet: Option<PathBuf>) -> Result
 
 /// Upgrade one SSH identity's managed server. A binary at any path other than
 /// the managed one is user-managed and is only reported, never replaced.
-async fn upgrade_host(host: &str, bin: &str) -> Result<String> {
+async fn upgrade_host(host: &str, shell: RemoteShell, bin: &str) -> Result<String> {
     use remote_workspace_client::deploy::{self, ServerStep};
 
-    let platform = deploy::probe_platform(host)?;
+    let platform = deploy::probe_platform(host, shell)?;
     let managed = platform.managed_bin();
     if bin != managed {
-        let v = deploy::check_custom_bin(host, bin)?;
+        let v = deploy::check_custom_bin(host, shell, bin)?;
         return Ok(format!(
             "user-managed {bin} at {} (not modified)",
             v.software_version
         ));
     }
-    match deploy::deploy_managed(host, &platform.os, &platform.arch, &managed)? {
+    match deploy::deploy_managed(host, shell, &platform.os, &platform.arch, &managed)? {
         ServerStep::AlreadyCurrent(v) => Ok(format!("up to date {}", v.software_version)),
         ServerStep::Installed(o) => Ok(match (&o.previous, o.installed) {
             (_, false) => format!("up to date {}", o.current.software_version),
@@ -501,6 +519,7 @@ struct WorkspaceAddParams<'a> {
     config: Option<&'a str>,
     state_base: Option<&'a str>,
     remote_bin: Option<&'a str>,
+    remote_shell: Option<RemoteShell>,
     fleet: Option<PathBuf>,
 }
 
@@ -532,6 +551,7 @@ async fn workspace_add_inner(p: &WorkspaceAddParams<'_>) -> Result<()> {
     let preview = NewEntry {
         name: p.name.into(),
         host: p.host.into(),
+        remote_shell: p.remote_shell.unwrap_or_default(),
         root: p.root.into(),
         bin: None,
         label: None,
@@ -545,18 +565,19 @@ async fn workspace_add_inner(p: &WorkspaceAddParams<'_>) -> Result<()> {
     };
     fleet::check_addable(&existing, &preview)?;
 
-    let platform = deploy::probe_platform(p.host)?;
+    let (remote_shell, platform) = deploy::detect_platform(p.host, p.remote_shell)?;
     println!("  {:<22} connected", "SSH");
+    println!("  {:<22} {}", "Remote shell", remote_shell);
     println!("  {:<22} {}", "Remote platform", platform.label());
     // Record the canonical root, so later additions naming the same directory
     // through a symlink or a trailing slash are caught as duplicates.
-    let root = deploy::validate_root(p.host, p.root)?;
+    let root = deploy::validate_root(p.host, remote_shell, p.root)?;
     println!("  {:<22} valid", "Workspace root");
 
     // A user-managed binary is only checked; the managed one is installed or
     // upgraded as needed.
     let (bin, protocol) = if let Some(custom) = p.remote_bin {
-        let v = deploy::check_custom_bin(p.host, custom)?;
+        let v = deploy::check_custom_bin(p.host, remote_shell, custom)?;
         println!(
             "  {:<22} user-managed {} (not modified)",
             "Server", v.software_version
@@ -564,7 +585,8 @@ async fn workspace_add_inner(p: &WorkspaceAddParams<'_>) -> Result<()> {
         (custom.to_string(), v.protocol_version)
     } else {
         let managed = platform.managed_bin();
-        match deploy::deploy_managed(p.host, &platform.os, &platform.arch, &managed)? {
+        match deploy::deploy_managed(p.host, remote_shell, &platform.os, &platform.arch, &managed)?
+        {
             ServerStep::Installed(o) => {
                 let msg = match &o.previous {
                     _ if !o.installed => format!("up to date {}", o.current.software_version),
@@ -589,6 +611,7 @@ async fn workspace_add_inner(p: &WorkspaceAddParams<'_>) -> Result<()> {
     // already carries check_workspace's own stable code.
     let endpoint = remote_workspace_client::Endpoint::Ssh {
         host: p.host.into(),
+        remote_shell,
         remote_bin: bin.clone(),
         root: root.clone(),
         state_base: p.state_base.map(str::to_string),
@@ -602,6 +625,7 @@ async fn workspace_add_inner(p: &WorkspaceAddParams<'_>) -> Result<()> {
     let entry = NewEntry {
         name: p.name.into(),
         host: p.host.into(),
+        remote_shell,
         root,
         bin: Some(bin),
         label: p.label.map(str::to_string),

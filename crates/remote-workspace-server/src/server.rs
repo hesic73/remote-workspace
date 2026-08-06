@@ -34,8 +34,6 @@ pub struct Server {
     idle_timeout: Option<std::time::Duration>,
     session_log: Arc<SessionLog>,
     /// Pending uploads (staging file created, commit not yet received).
-    /// In-memory only: staging paths must never be persisted, and the staging
-    /// files die with the connection anyway.
     uploads: transfer::UploadRegistry,
 }
 
@@ -147,7 +145,7 @@ impl Server {
             scratch_max_age: opts.scratch_max_age,
             idle_timeout: opts.idle_timeout,
             session_log,
-            uploads: transfer::UploadRegistry::default(),
+            uploads: transfer::UploadRegistry::new(&state_dir)?,
         })
     }
 
@@ -349,11 +347,9 @@ impl Server {
     ) {
         let request_id = req.request_id.clone();
 
-        // upload_prepare's result carries the staging path, which must never be
-        // persisted (requests.jsonl included); upload_abort acts only on the
-        // in-memory registry, which dies with this process. Neither could be
-        // usefully replayed after a reconnect, so both skip the idempotency
-        // store.
+        // Prepare and abort use their own pending-upload registry. They skip
+        // the request idempotency store because replaying prepare would expose
+        // an obsolete staging path and replaying abort has no useful result.
         let unpersisted = match &req.body {
             RequestBody::UploadPrepare { path, overwrite } => Some(transfer::upload_prepare(
                 &self.workspace,

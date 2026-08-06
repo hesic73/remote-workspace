@@ -560,6 +560,7 @@ async fn exec_nonzero_exit_and_stderr() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn exec_output_is_bounded_with_prefix_and_suffix() {
     let mut h = harness().await;
     h.send(&req(
@@ -810,6 +811,7 @@ async fn history_and_operation_get() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn profile_setup_runs_before_command() {
     let cfg = r#"
 [profiles.greet]
@@ -862,6 +864,7 @@ async fn profile_unknown_rejected() {
 
 // symlinked ancestor + nonexistent leaf (the critical escape).
 #[tokio::test]
+#[cfg(unix)]
 async fn symlinked_ancestor_nonexistent_leaf_blocked() {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -1148,6 +1151,7 @@ async fn rejected_exec_recorded_with_disposition() {
 
 // edit of an existing file preserves executable permissions.
 #[tokio::test]
+#[cfg(unix)]
 async fn edit_preserves_executable_bit() {
     use std::os::unix::fs::PermissionsExt;
     let mut h = harness().await;
@@ -1482,6 +1486,7 @@ async fn recovery_drops_when_rename_not_done() {
 // when the request log is unwritable, the server must surface the error to
 // the client rather than silently reporting success with no durable state.
 #[tokio::test]
+#[cfg(unix)]
 async fn read_only_request_log_surfaces_error() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
@@ -1966,6 +1971,7 @@ async fn continuous_output_command_is_killed_at_deadline() {
 // Regression: stdout split across two pipe reads at a UTF-8 codepoint boundary
 // must be reassembled into the correct character, not two replacement chars.
 #[tokio::test]
+#[cfg(unix)]
 async fn cross_chunk_utf8_stdout_reassembled() {
     let mut h = harness().await;
     // Use python to write the raw bytes of "é" (0xC3 0xA9) with a flush and
@@ -2164,6 +2170,7 @@ async fn truncated_log_fixed_then_append_then_restart() {
 // UTF-8 leader (e.g. 0xC3 with no continuation byte) must emit a replacement
 // char on the wire via the flush path, not lose the byte silently.
 #[tokio::test]
+#[cfg(unix)]
 async fn incomplete_trailing_utf8_flushed_on_clean_exit() {
     let mut h = harness().await;
     // Output a single incomplete byte 0xC3 and exit immediately.
@@ -2199,6 +2206,7 @@ async fn incomplete_trailing_utf8_flushed_on_clean_exit() {
 // Regression: invalid UTF-8 byte 0xFF must be emitted as U+FFFD, not silently
 // dropped.
 #[tokio::test]
+#[cfg(unix)]
 async fn invalid_utf8_byte_emitted_as_replacement() {
     let mut h = harness().await;
     h.send(&req(
@@ -2786,7 +2794,10 @@ setup = ""
             ..
         } => {
             assert_eq!(r.termination, ExecTermination::Exited { code: 0 });
+            #[cfg(unix)]
             assert_eq!(r.stdout.prefix.trim(), "exec 'hi'");
+            #[cfg(windows)]
+            assert_eq!(r.stdout.prefix.trim(), "& 'hi'; exit $LASTEXITCODE");
         }
         other => panic!("unexpected: {other:?}"),
     }
@@ -2796,6 +2807,7 @@ setup = ""
 // profile overrides it.
 #[tokio::test]
 async fn default_profile_applies_and_explicit_overrides() {
+    #[cfg(unix)]
     let cfg = r#"
 default_profile = "main"
 
@@ -2806,6 +2818,16 @@ setup = "export MARKER=via-default"
 shell = ["sh", "-c"]
 setup = "export MARKER=via-override"
 "#;
+    #[cfg(windows)]
+    let cfg = r#"
+default_profile = "main"
+
+[profiles.main]
+setup = "$env:MARKER = 'via-default'"
+
+[profiles.other]
+setup = "$env:MARKER = 'via-override'"
+"#;
     let mut h = harness_with_config(Some(cfg)).await;
     for (rid, profile, expected) in [
         ("d", None, "via-default"),
@@ -2814,7 +2836,15 @@ setup = "export MARKER=via-override"
         h.send(&req(
             rid,
             RequestBody::Exec {
+                #[cfg(unix)]
                 argv: vec!["printenv".into(), "MARKER".into()],
+                #[cfg(windows)]
+                argv: vec![
+                    "cmd.exe".into(),
+                    "/C".into(),
+                    "echo".into(),
+                    "%MARKER%".into(),
+                ],
                 cwd: None,
                 profile,
                 timeout_ms: Some(10000),

@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 use crate::deploy::DeployError;
-use crate::{ArgvTransport, Client, Endpoint};
+use crate::{ArgvTransport, Client, Endpoint, RemoteShell};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +19,7 @@ struct WorkspaceEntry {
     /// SSH host (resolvable via ~/.ssh/config); omit to run the server on the
     /// local machine.
     host: Option<String>,
+    remote_shell: Option<RemoteShell>,
     root: String,
     /// Server binary path on that machine. Defaults to `remote-workspace-server`
     /// on PATH. `workspace add` records the absolute managed path here.
@@ -45,6 +45,7 @@ pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Workspace>> {
         anyhow::bail!("fleet config declares no workspaces");
     }
     let mut seen: BTreeMap<(Option<String>, String), String> = BTreeMap::new();
+    let mut host_shells: BTreeMap<String, RemoteShell> = BTreeMap::new();
     let mut out = BTreeMap::new();
     for (name, entry) in file.workspaces {
         if let Some(prev) = seen.insert((entry.host.clone(), entry.root.clone()), name.clone()) {
@@ -57,19 +58,35 @@ pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Workspace>> {
             .bin
             .unwrap_or_else(|| "remote-workspace-server".into());
         let endpoint = match entry.host {
-            Some(host) => Endpoint::Ssh {
-                host,
-                remote_bin: bin,
-                root: entry.root,
-                state_base: entry.state_base,
-                config: entry.config,
-            },
-            None => Endpoint::Local {
-                server_bin: bin,
-                root: entry.root,
-                state_base: entry.state_base,
-                config: entry.config,
-            },
+            Some(host) => {
+                let remote_shell = entry.remote_shell.unwrap_or_default();
+                if let Some(previous) = host_shells.insert(host.clone(), remote_shell) {
+                    if previous != remote_shell {
+                        anyhow::bail!(
+                            "SSH host '{host}' has conflicting remote_shell values: {previous} and {remote_shell}"
+                        );
+                    }
+                }
+                Endpoint::Ssh {
+                    host,
+                    remote_shell,
+                    remote_bin: bin,
+                    root: entry.root,
+                    state_base: entry.state_base,
+                    config: entry.config,
+                }
+            }
+            None => {
+                if entry.remote_shell.is_some() {
+                    anyhow::bail!("workspace '{name}' sets remote_shell without an SSH host");
+                }
+                Endpoint::Local {
+                    server_bin: bin,
+                    root: entry.root,
+                    state_base: entry.state_base,
+                    config: entry.config,
+                }
+            }
         };
         out.insert(
             name,
@@ -89,28 +106,31 @@ pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Workspace>> {
 /// round-trip failed, e.g. bad root or a locked state directory).
 pub async fn check_workspace(endpoint: &Endpoint) -> Result<(), String> {
     let transport = ArgvTransport {
-        argv: endpoint.control_argv(),
+        argv: endpoint.one_shot_control_argv(),
     };
     match Client::connect(transport, None).await {
         Err(e) => Err(format!("connect_failed: {e}")),
-        Ok(c) => match c.stat(".").await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("probe_failed: {e}")),
-        },
+        Ok(c) => {
+            let result = match c.stat(".").await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(format!("probe_failed: {e}")),
+            };
+            c.close().await;
+            result
+        }
     }
 }
 
 /// Default fleet file: `~/.remote-workspace/workspaces.toml`.
 pub fn default_fleet_path() -> anyhow::Result<PathBuf> {
-    let home =
-        std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set; pass --fleet"))?;
-    Ok(PathBuf::from(home).join(".remote-workspace/workspaces.toml"))
+    Ok(crate::platform::home_dir("--fleet")?.join(".remote-workspace/workspaces.toml"))
 }
 
 /// A workspace entry to append to the fleet file.
 pub struct NewEntry {
     pub name: String,
     pub host: String,
+    pub remote_shell: RemoteShell,
     pub root: String,
     /// Absolute server path to record. Present for both managed installs (the
     /// managed path) and user-managed servers (`--remote-bin`).
@@ -197,6 +217,7 @@ pub fn add_workspace_entry(fleet_path: &Path, entry: &NewEntry) -> Result<(), De
 
     let mut tbl = Table::new();
     tbl.insert("host", value(&entry.host));
+    tbl.insert("remote_shell", value(entry.remote_shell.to_string()));
     tbl.insert("root", value(&entry.root));
     if let Some(bin) = &entry.bin {
         tbl.insert("bin", value(bin));
@@ -261,8 +282,9 @@ fn acquire_fleet_lock(fleet_path: &Path) -> Result<std::fs::File, DeployError> {
         .map_err(|e| DeployError::new("fleet_write_failed", format!("open {path:?}: {e}")))?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
+        if try_lock_exclusive(&f)
+            .map_err(|e| DeployError::new("fleet_write_failed", format!("lock {path:?}: {e}")))?
+        {
             return Ok(f);
         }
         if Instant::now() >= deadline {
@@ -275,6 +297,51 @@ fn acquire_fleet_lock(fleet_path: &Path) -> Result<std::fs::File, DeployError> {
     }
 }
 
+#[cfg(unix)]
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+
+    let mut overlapped = unsafe { zeroed() };
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as HANDLE,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == ERROR_LOCK_VIOLATION as i32 => Ok(false),
+        _ => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +350,7 @@ mod tests {
         NewEntry {
             name: name.into(),
             host: host.into(),
+            remote_shell: RemoteShell::Posix,
             root: root.into(),
             bin: Some("/home/u/.local/lib/remote-workspace/remote-workspace-server".into()),
             label: Some("Lab".into()),
@@ -331,5 +399,72 @@ mod tests {
         assert_eq!(dup_target.code, "duplicate_workspace_target");
         // A genuinely new entry is fine.
         check_addable(text, &entry("c", "h3", "/r3")).unwrap();
+    }
+
+    #[test]
+    fn legacy_ssh_entries_default_to_posix_and_new_entries_persist_shell() {
+        let legacy = "[workspaces.old]\nhost = \"linux\"\nroot = \"/work\"\n";
+        let parsed = parse_fleet(legacy).unwrap();
+        assert!(matches!(
+            &parsed["old"].endpoint,
+            Endpoint::Ssh {
+                remote_shell: RemoteShell::Posix,
+                ..
+            }
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.toml");
+        let mut powershell = entry("windows", "win", r"C:\work");
+        powershell.remote_shell = RemoteShell::Powershell;
+        add_workspace_entry(&path, &powershell).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("remote_shell = \"powershell\""));
+        assert!(matches!(
+            &parse_fleet(&text).unwrap()["windows"].endpoint,
+            Endpoint::Ssh {
+                remote_shell: RemoteShell::Powershell,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn local_entry_rejects_remote_shell() {
+        let text = "[workspaces.local]\nroot = \"C:\\\\work\"\nremote_shell = \"powershell\"\n";
+        let error = parse_fleet(text).err().unwrap();
+        assert!(error.to_string().contains("without an SSH host"));
+    }
+
+    #[test]
+    fn one_ssh_host_cannot_declare_two_shells() {
+        let text = "[workspaces.a]\nhost = \"same\"\nroot = \"/a\"\nremote_shell = \"posix\"\n\
+                    [workspaces.b]\nhost = \"same\"\nroot = \"C:\\\\b\"\nremote_shell = \"powershell\"\n";
+        let error = parse_fleet(text).err().unwrap();
+        assert!(error.to_string().contains("conflicting remote_shell"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_is_exclusive_and_released_on_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let first = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        let second = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+
+        assert!(try_lock_exclusive(&first).unwrap());
+        assert!(!try_lock_exclusive(&second).unwrap());
+        drop(first);
+        assert!(try_lock_exclusive(&second).unwrap());
     }
 }

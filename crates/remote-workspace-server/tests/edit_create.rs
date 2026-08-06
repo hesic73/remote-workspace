@@ -80,18 +80,21 @@ fn code(r: Result<ResultBody, ProtocolError>) -> ErrorCode {
 
 #[tokio::test]
 async fn create_refuses_existing_path_and_sets_conventional_mode() {
-    use std::os::unix::fs::PermissionsExt;
     let f = fixture();
     create(&f, "a.txt", "one").await.unwrap();
     assert_eq!(
         std::fs::read_to_string(f.ws.root.join("a.txt")).unwrap(),
         "one"
     );
-    let mode = std::fs::metadata(f.ws.root.join("a.txt"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o644);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(f.ws.root.join("a.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644);
+    }
     assert_eq!(
         code(create(&f, "a.txt", "two").await),
         ErrorCode::AlreadyExists

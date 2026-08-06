@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use remote_workspace_protocol::{
     ErrorCode, ProtocolError, ResultBody, TransferDirection, TransferOperationRecord,
     TransferResult, UploadPrepareResult,
@@ -13,6 +14,7 @@ use crate::store::OperationStore;
 use crate::workspace::Workspace;
 
 pub const TRANSFER_BUF_SIZE: usize = 64 * 1024;
+const BASE64_TRANSFER_BUF_SIZE: usize = 3 * 1024;
 
 /// Staging filename convention: `.remote-workspace-upload.<name>.<random>.part`.
 /// Deliberately unmistakable so stale-staging cleanup can match exactly this
@@ -23,10 +25,7 @@ pub const STAGING_SUFFIX: &str = ".part";
 /// in-progress upload keeps its mtime fresh with every written chunk).
 pub const STALE_STAGING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// A staged upload awaiting commit. Lives only in memory: the staging file and
-/// this entry die with the server process, and a client whose connection
-/// dropped mid-transfer simply re-uploads.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingUpload {
     pub staging: PathBuf,
     pub target: PathBuf,
@@ -34,7 +33,69 @@ pub struct PendingUpload {
     pub overwrite: bool,
 }
 
-pub type UploadRegistry = parking_lot::Mutex<HashMap<String, PendingUpload>>;
+pub struct UploadRegistry {
+    entries: parking_lot::Mutex<HashMap<String, PendingUpload>>,
+    path: PathBuf,
+}
+
+impl UploadRegistry {
+    pub fn new(state_dir: &Path) -> anyhow::Result<Self> {
+        let path = state_dir.join("pending_uploads.json");
+        let mut entries: HashMap<String, PendingUpload> = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| anyhow::anyhow!("parse pending upload registry {path:?}: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "read pending upload registry {path:?}: {e}"
+                ))
+            }
+        };
+        entries.retain(|_, pending| pending.staging.is_file());
+        let registry = Self {
+            entries: parking_lot::Mutex::new(entries),
+            path,
+        };
+        registry.persist()?;
+        Ok(registry)
+    }
+
+    fn persist(&self) -> anyhow::Result<()> {
+        let entries = self.entries.lock();
+        let bytes = serde_json::to_vec(&*entries)?;
+        std::fs::write(&self.path, bytes)?;
+        let file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn insert(&self, id: String, pending: PendingUpload) -> Result<(), ProtocolError> {
+        self.entries.lock().insert(id.clone(), pending);
+        if let Err(error) = self.persist() {
+            self.entries.lock().remove(&id);
+            return Err(ProtocolError::new(
+                ErrorCode::IoError,
+                format!("persist pending upload: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn get(&self, id: &str) -> Option<PendingUpload> {
+        self.entries.lock().get(id).cloned()
+    }
+
+    fn remove(&self, id: &str) -> Result<Option<PendingUpload>, ProtocolError> {
+        let removed = self.entries.lock().remove(id);
+        self.persist().map_err(|error| {
+            ProtocolError::new(
+                ErrorCode::IoError,
+                format!("persist pending upload removal: {error}"),
+            )
+        })?;
+        Ok(removed)
+    }
+}
 
 fn new_transfer_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -125,15 +186,16 @@ pub fn upload_prepare(
         .keep()
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("keep staging file: {e}")))?;
     let transfer_id = new_transfer_id();
-    registry.lock().insert(
-        transfer_id.clone(),
-        PendingUpload {
-            staging: staging.clone(),
-            target: abs,
-            logical_path: path.to_string(),
-            overwrite,
-        },
-    );
+    let pending = PendingUpload {
+        staging: staging.clone(),
+        target: abs,
+        logical_path: path.to_string(),
+        overwrite,
+    };
+    if let Err(error) = registry.insert(transfer_id.clone(), pending) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
     Ok(ResultBody::UploadPrepare(UploadPrepareResult {
         transfer_id,
         staging_path: staging.to_string_lossy().into_owned(),
@@ -151,7 +213,7 @@ pub fn upload_commit(
     sha256: &str,
     duration_ms: u64,
 ) -> Result<ResultBody, ProtocolError> {
-    let entry = registry.lock().get(transfer_id).cloned().ok_or_else(|| {
+    let entry = registry.get(transfer_id).ok_or_else(|| {
         ProtocolError::new(
             ErrorCode::OperationNotFound,
             format!("unknown transfer id: {transfer_id}"),
@@ -211,7 +273,7 @@ pub fn upload_commit(
         duration_ms,
         timestamp_ms: now_ms(),
     })?;
-    registry.lock().remove(transfer_id);
+    registry.remove(transfer_id)?;
     Ok(ResultBody::Transfer(TransferResult {
         operation_id,
         direction: TransferDirection::Upload,
@@ -226,7 +288,7 @@ pub fn upload_abort(
     registry: &UploadRegistry,
     transfer_id: &str,
 ) -> Result<ResultBody, ProtocolError> {
-    let entry = registry.lock().remove(transfer_id).ok_or_else(|| {
+    let entry = registry.remove(transfer_id)?.ok_or_else(|| {
         ProtocolError::new(
             ErrorCode::OperationNotFound,
             format!("unknown transfer id: {transfer_id}"),
@@ -284,6 +346,7 @@ pub fn download_record(
 /// these.
 pub fn in_flight_staging(registry: &UploadRegistry) -> std::collections::HashSet<PathBuf> {
     registry
+        .entries
         .lock()
         .values()
         .map(|p| p.staging.clone())
@@ -375,7 +438,11 @@ pub struct SendTrailer {
 /// `--transfer-receive`: stream stdin into an existing staging file, then
 /// report `{size, sha256}` on stdout. Fails if the byte count differs from
 /// the caller-declared size.
-pub fn run_transfer_receive(staging: &Path, expect_size: u64) -> anyhow::Result<()> {
+pub fn run_transfer_receive(
+    staging: &Path,
+    expect_size: u64,
+    base64_chunks: bool,
+) -> anyhow::Result<()> {
     // The staging file must already exist (created by upload_prepare); its
     // absence means the prepare/commit lifecycle is being bypassed or raced.
     let mut file = std::fs::OpenOptions::new()
@@ -384,17 +451,40 @@ pub fn run_transfer_receive(staging: &Path, expect_size: u64) -> anyhow::Result<
         .open(staging)
         .map_err(|e| anyhow::anyhow!("open staging file {staging:?}: {e}"))?;
     let mut stdin = std::io::stdin().lock();
-    let mut buf = vec![0u8; TRANSFER_BUF_SIZE];
     let mut hasher = Sha256::new();
     let mut total: u64 = 0;
-    loop {
-        let n = stdin.read(&mut buf)?;
-        if n == 0 {
-            break;
+    if base64_chunks {
+        while total < expect_size {
+            let raw_size = ((expect_size - total) as usize).min(BASE64_TRANSFER_BUF_SIZE);
+            let encoded_size = raw_size.div_ceil(3) * 4;
+            let mut encoded = vec![0u8; encoded_size];
+            stdin.read_exact(&mut encoded)?;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&encoded)
+                .map_err(|e| anyhow::anyhow!("invalid Base64 transfer chunk: {e}"))?;
+            if decoded.len() != raw_size {
+                anyhow::bail!(
+                    "Base64 chunk decoded to {} bytes, expected {raw_size}",
+                    decoded.len()
+                );
+            }
+            hasher.update(&decoded);
+            file.write_all(&decoded)?;
+            total += decoded.len() as u64;
         }
-        hasher.update(&buf[..n]);
-        file.write_all(&buf[..n])?;
-        total += n as u64;
+    } else {
+        let mut buf = vec![0u8; TRANSFER_BUF_SIZE];
+        while total < expect_size {
+            let remaining = expect_size - total;
+            let want = (remaining as usize).min(buf.len());
+            let n = stdin.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            file.write_all(&buf[..n])?;
+            total += n as u64;
+        }
     }
     if total != expect_size {
         anyhow::bail!("received {total} bytes but caller declared {expect_size}");
@@ -411,7 +501,12 @@ pub fn run_transfer_receive(staging: &Path, expect_size: u64) -> anyhow::Result<
 /// `--transfer-send`: re-validate the path against the workspace boundary,
 /// then write to stdout: one JSON header line with the size, exactly that
 /// many raw bytes, and one JSON trailer line with the SHA-256.
-pub fn run_transfer_send(root: &Path, state_base: &Path, path: &str) -> anyhow::Result<()> {
+pub fn run_transfer_send(
+    root: &Path,
+    state_base: &Path,
+    path: &str,
+    base64_chunks: bool,
+) -> anyhow::Result<()> {
     let state_dir = crate::state_dir_under(state_base, root)?;
     let ws = Workspace::new(root.to_path_buf(), state_dir.join("scratch"))?;
     let abs = ws.resolve(path).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -430,13 +525,24 @@ pub fn run_transfer_send(root: &Path, state_base: &Path, path: &str) -> anyhow::
     let mut hasher = Sha256::new();
     let mut remaining = size;
     while remaining > 0 {
-        let want = (remaining as usize).min(buf.len());
+        let chunk_size = if base64_chunks {
+            BASE64_TRANSFER_BUF_SIZE
+        } else {
+            buf.len()
+        };
+        let want = (remaining as usize).min(chunk_size);
         let n = file.read(&mut buf[..want])?;
         if n == 0 {
             anyhow::bail!("file shrank during send: {path}");
         }
         hasher.update(&buf[..n]);
-        out.write_all(&buf[..n])?;
+        if base64_chunks {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
+            out.write_all(encoded.as_bytes())?;
+            out.write_all(b"\n")?;
+        } else {
+            out.write_all(&buf[..n])?;
+        }
         remaining -= n as u64;
     }
     let trailer = SendTrailer {
@@ -460,6 +566,39 @@ mod sweep_tests {
     use super::*;
     use std::collections::HashSet;
     use std::time::Duration;
+
+    #[test]
+    fn pending_upload_survives_registry_reload() {
+        let state = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let staging = files.path().join("upload.part");
+        let target = files.path().join("target.bin");
+        std::fs::write(&staging, b"data").unwrap();
+        let registry = UploadRegistry::new(state.path()).unwrap();
+        registry
+            .insert(
+                "transfer-1".into(),
+                PendingUpload {
+                    staging: staging.clone(),
+                    target: target.clone(),
+                    logical_path: "target.bin".into(),
+                    overwrite: false,
+                },
+            )
+            .unwrap();
+        drop(registry);
+
+        let reloaded = UploadRegistry::new(state.path()).unwrap();
+        let pending = reloaded.get("transfer-1").unwrap();
+        assert_eq!(pending.staging, staging);
+        assert_eq!(pending.target, target);
+        reloaded.remove("transfer-1").unwrap();
+        drop(reloaded);
+        assert!(UploadRegistry::new(state.path())
+            .unwrap()
+            .get("transfer-1")
+            .is_none());
+    }
 
     #[test]
     fn sweep_matches_only_the_exact_staging_convention() {

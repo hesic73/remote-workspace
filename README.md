@@ -46,6 +46,7 @@ remote-workspace workspace add robot --host robot@workstation --root /home/robot
 ```text
 Adding workspace 'robot'
   SSH                    connected
+  Remote shell           posix
   Remote platform        linux-x86_64
   Workspace root         valid
   Server                 installed 0.5.0
@@ -121,6 +122,7 @@ and one root each on two machines are the same concept.
 ```toml
 [workspaces.robot]
 host = "robot@workstation"   # omit to run on the local machine
+remote_shell = "posix"       # "powershell" for Windows OpenSSH
 root = "/home/robot/project"
 bin = "/home/robot/.local/lib/remote-workspace/remote-workspace-server"
 label = "ROS workspace"      # optional, shown by list_workspaces
@@ -129,7 +131,10 @@ label = "ROS workspace"      # optional, shown by list_workspaces
 
 Prefer `workspace add` over editing this by hand: it validates the target and
 rewrites the file atomically, preserving your comments and other entries. A
-running MCP picks up changes on its next call -- no restart, and workspaces
+new SSH entry always records its detected shell; entries created by older
+versions without `remote_shell` remain POSIX for compatibility. Use
+`--remote-shell` during `workspace add` only when detection needs an explicit
+answer. A running MCP picks up changes on its next call -- no restart, and workspaces
 whose entry did not change keep their open connections. A file that does not
 parse is never partially applied; calls report `fleet_reload_failed` until it
 is valid again.

@@ -1,14 +1,16 @@
 use std::path::Path;
 use std::process::Stdio;
 
+use base64::Engine as _;
 use remote_workspace_protocol::TransferResult;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use crate::{shell_quote, Client, ClientError};
+use crate::{platform, remote_argv_command, Client, ClientError, RemoteShell};
 
 const TRANSFER_BUF_SIZE: usize = 64 * 1024;
+const POWERSHELL_TRANSFER_BUF_SIZE: usize = 3 * 1024;
 
 /// How long a transfer may move zero bytes before it is called stalled. This is
 /// deliberately NOT a total timeout: a large file over a slow link legitimately
@@ -87,6 +89,7 @@ pub enum Endpoint {
     },
     Ssh {
         host: String,
+        remote_shell: RemoteShell,
         remote_bin: String,
         root: String,
         state_base: Option<String>,
@@ -95,8 +98,30 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
+    fn uses_base64_transfer(&self) -> bool {
+        matches!(
+            self,
+            Endpoint::Ssh {
+                remote_shell: RemoteShell::Powershell,
+                ..
+            }
+        )
+    }
+
     /// Argv for the resident JSONL control-plane server.
     pub fn control_argv(&self) -> Vec<String> {
+        self.control_argv_inner(None)
+    }
+
+    pub fn one_shot_control_argv(&self) -> Vec<String> {
+        self.control_argv_inner(Some(1))
+    }
+
+    pub fn control_argv_with_idle_timeout(&self, seconds: u64) -> Vec<String> {
+        self.control_argv_inner(Some(seconds))
+    }
+
+    fn control_argv_inner(&self, idle_timeout_secs: Option<u64>) -> Vec<String> {
         match self {
             Endpoint::Local {
                 server_bin,
@@ -113,10 +138,14 @@ impl Endpoint {
                     argv.push("--state-base".into());
                     argv.push(b.clone());
                 }
+                if let Some(seconds) = idle_timeout_secs {
+                    argv.extend(["--idle-timeout-secs".into(), seconds.to_string()]);
+                }
                 argv
             }
             Endpoint::Ssh {
                 host,
+                remote_shell,
                 remote_bin,
                 root,
                 state_base,
@@ -131,33 +160,55 @@ impl Endpoint {
                     remote.push("--state-base".into());
                     remote.push(b.clone());
                 }
-                ssh_argv(host, &remote)
+                match remote_shell {
+                    RemoteShell::Posix => {
+                        if let Some(seconds) = idle_timeout_secs {
+                            remote.extend(["--idle-timeout-secs".into(), seconds.to_string()]);
+                        }
+                        ssh_argv(host, *remote_shell, &remote)
+                    }
+                    RemoteShell::Powershell => {
+                        remote.extend(["--idle-timeout-secs".into(), "1".into()]);
+                        powershell_ssh_proxy_argv(host, &remote)
+                    }
+                }
             }
         }
     }
 
     /// Argv for the raw upload receiver (stdin -> staging file).
     pub fn transfer_receive_argv(&self, staging_path: &str, expect_size: u64) -> Vec<String> {
-        let tail = |bin: &str| {
-            vec![
+        let tail = |bin: &str, base64: bool| {
+            let mut argv = vec![
                 bin.to_string(),
                 "--transfer-receive".into(),
                 staging_path.to_string(),
                 "--expect-size".into(),
                 expect_size.to_string(),
-            ]
+            ];
+            if base64 {
+                argv.push("--transfer-base64".into());
+            }
+            argv
         };
         match self {
-            Endpoint::Local { server_bin, .. } => tail(server_bin),
+            Endpoint::Local { server_bin, .. } => tail(server_bin, false),
             Endpoint::Ssh {
-                host, remote_bin, ..
-            } => ssh_argv(host, &tail(remote_bin)),
+                host,
+                remote_shell,
+                remote_bin,
+                ..
+            } => ssh_argv(
+                host,
+                *remote_shell,
+                &tail(remote_bin, *remote_shell == RemoteShell::Powershell),
+            ),
         }
     }
 
     /// Argv for the raw download sender (workspace file -> stdout framing).
     pub fn transfer_send_argv(&self, remote_path: &str) -> Vec<String> {
-        let tail = |bin: &str, root: &str, state_base: &Option<String>| {
+        let tail = |bin: &str, root: &str, state_base: &Option<String>, base64: bool| {
             let mut argv = vec![
                 bin.to_string(),
                 "--transfer-send".into(),
@@ -169,6 +220,9 @@ impl Endpoint {
                 argv.push("--state-base".into());
                 argv.push(b.clone());
             }
+            if base64 {
+                argv.push("--transfer-base64".into());
+            }
             argv
         };
         match self {
@@ -177,14 +231,24 @@ impl Endpoint {
                 root,
                 state_base,
                 ..
-            } => tail(server_bin, root, state_base),
+            } => tail(server_bin, root, state_base, false),
             Endpoint::Ssh {
                 host,
+                remote_shell,
                 remote_bin,
                 root,
                 state_base,
                 ..
-            } => ssh_argv(host, &tail(remote_bin, root, state_base)),
+            } => ssh_argv(
+                host,
+                *remote_shell,
+                &tail(
+                    remote_bin,
+                    root,
+                    state_base,
+                    *remote_shell == RemoteShell::Powershell,
+                ),
+            ),
         }
     }
 }
@@ -209,15 +273,89 @@ pub(crate) fn ssh_prefix(host: &str) -> Vec<String> {
 /// Wrap a remote argv for ssh: every remote-side argument is shell-quoted into
 /// one command string, because ssh joins trailing arguments with spaces and
 /// hands the result to the remote shell.
-fn ssh_argv(host: &str, remote: &[String]) -> Vec<String> {
-    let cmd = remote
-        .iter()
-        .map(|a| shell_quote(a))
-        .collect::<Vec<_>>()
-        .join(" ");
+fn ssh_argv(host: &str, shell: RemoteShell, remote: &[String]) -> Vec<String> {
+    let cmd = remote_argv_command(shell, remote);
     let mut argv = ssh_prefix(host);
     argv.push(cmd);
     argv
+}
+
+fn windows_command_line_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| c.is_whitespace() || c == '"') {
+        return arg.to_string();
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else if c == '"' {
+            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+            quoted.push('"');
+            backslashes = 0;
+        } else {
+            quoted.push_str(&"\\".repeat(backslashes));
+            backslashes = 0;
+            quoted.push(c);
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+fn powershell_encoded_command(script: &str) -> String {
+    let bytes: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn powershell_ssh_proxy_argv(host: &str, remote: &[String]) -> Vec<String> {
+    let remote_command = remote_argv_command(RemoteShell::Powershell, remote);
+    let mut ssh = ssh_prefix(host);
+    ssh.push(remote_command);
+    let arguments = ssh[1..]
+        .iter()
+        .map(|arg| windows_command_line_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ssh_bin = crate::powershell_quote(&ssh[0]);
+    let arguments = crate::powershell_quote(&arguments);
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $utf8 = [System.Text.UTF8Encoding]::new($false); \
+         $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8, $false); \
+         $output = [System.IO.StreamWriter]::new([Console]::OpenStandardOutput(), $utf8); \
+         $output.AutoFlush = $true; \
+         while (($line = $reader.ReadLine()) -ne $null) {{ \
+         $psi = [System.Diagnostics.ProcessStartInfo]::new(); \
+         $psi.FileName = {ssh_bin}; $psi.Arguments = {arguments}; \
+         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; \
+         $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; \
+         $session = [System.Diagnostics.Process]::Start($psi); \
+         $requestBytes = $utf8.GetBytes($line + [char]10); \
+         $session.StandardInput.BaseStream.Write($requestBytes, 0, $requestBytes.Length); $session.StandardInput.Close(); \
+         $sessionOut = [System.IO.StreamReader]::new($session.StandardOutput.BaseStream, $utf8, $false); \
+         $sessionErr = [System.IO.StreamReader]::new($session.StandardError.BaseStream, $utf8, $false); \
+         $response = $sessionOut.ReadLine(); \
+         $exited = $session.WaitForExit(2500); \
+         if (-not $exited) {{ $session.Kill(); $session.WaitForExit() }}; \
+         $errorText = $sessionErr.ReadToEnd(); \
+         if ($null -eq $response -or ($exited -and $session.ExitCode -ne 0)) {{ \
+         [Console]::Error.WriteLine($errorText.Trim()); exit 1 \
+         }}; $output.WriteLine($response) \
+         }}"
+    );
+    vec![
+        "powershell.exe".into(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-EncodedCommand".into(),
+        powershell_encoded_command(&script),
+    ]
 }
 
 #[derive(serde::Deserialize)]
@@ -249,13 +387,55 @@ fn spawn_transfer_child(argv: &[String]) -> std::io::Result<tokio::process::Chil
         .kill_on_drop(true);
     // Die with the parent, like the control-plane transport: a killed consumer
     // must not leave an orphaned ssh streaming bytes.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            Ok(())
-        });
+    platform::configure_parent_death(&mut cmd);
+    let mut child = cmd.spawn()?;
+    if let Err(error) = platform::attach_parent_death(&mut child) {
+        let _ = child.start_kill();
+        return Err(error);
     }
-    cmd.spawn()
+    Ok(child)
+}
+
+#[cfg(windows)]
+fn close_transfer_stdin(stdin: tokio::process::ChildStdin) -> std::io::Result<()> {
+    drop(stdin.into_owned_handle()?);
+    Ok(())
+}
+
+async fn finish_transfer_child(
+    child: &mut tokio::process::Child,
+    powershell_ssh: bool,
+) -> Result<Option<std::process::ExitStatus>, ClientError> {
+    if powershell_ssh {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+            Ok(status) => status
+                .map(Some)
+                .map_err(|e| transfer_err(format!("wait for transfer process: {e}"))),
+            Err(_) => {
+                child
+                    .kill()
+                    .await
+                    .map_err(|e| transfer_err(format!("stop completed transfer process: {e}")))?;
+                child
+                    .wait()
+                    .await
+                    .map_err(|e| transfer_err(format!("reap completed transfer process: {e}")))?;
+                Ok(None)
+            }
+        }
+    } else {
+        child
+            .wait()
+            .await
+            .map(Some)
+            .map_err(|e| transfer_err(format!("wait for transfer process: {e}")))
+    }
+}
+
+#[cfg(not(windows))]
+fn close_transfer_stdin(stdin: tokio::process::ChildStdin) -> std::io::Result<()> {
+    drop(stdin);
+    Ok(())
 }
 
 /// Upload a local file to `remote_path` (workspace-relative or `@scratch/...`)
@@ -316,7 +496,12 @@ async fn stream_to_receiver(
     let mut file = tokio::fs::File::open(local_path)
         .await
         .map_err(|e| transfer_err(format!("open local source {local_path:?}: {e}")))?;
-    let mut buf = vec![0u8; TRANSFER_BUF_SIZE];
+    let buf_size = if endpoint.uses_base64_transfer() {
+        POWERSHELL_TRANSFER_BUF_SIZE
+    } else {
+        TRANSFER_BUF_SIZE
+    };
+    let mut buf = vec![0u8; buf_size];
     let mut hasher = Sha256::new();
     let mut sent: u64 = 0;
     let started = std::time::Instant::now();
@@ -330,8 +515,15 @@ async fn stream_to_receiver(
                 break;
             }
             hasher.update(&buf[..n]);
+            let encoded;
+            let bytes = if endpoint.uses_base64_transfer() {
+                encoded = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
+                encoded.as_bytes()
+            } else {
+                &buf[..n]
+            };
             transfer_step(
-                child_stdin.write_all(&buf[..n]),
+                child_stdin.write_all(bytes),
                 "sending bytes to the receiver",
                 sent,
                 size,
@@ -345,23 +537,17 @@ async fn stream_to_receiver(
                 "local file changed size during upload: sent {sent} bytes, expected {size}"
             )));
         }
-        transfer_step(
-            child_stdin.shutdown(),
-            "closing the receiver stream",
-            sent,
-            size,
-            started,
-        )
-        .await?;
         Ok(())
     }
     .await;
-    drop(child_stdin);
+    let close_result = close_transfer_stdin(child_stdin)
+        .map_err(|e| transfer_err(format!("close receiver stream: {e}")));
     if let Err(e) = stream_result {
         let _ = child.kill().await;
         let _ = child.wait().await;
         return Err(e);
     }
+    close_result?;
 
     // The receiver reports {size, sha256} once it has the whole file. Guard it
     // too: a remote that accepted every byte and then wedged would otherwise
@@ -376,15 +562,6 @@ async fn stream_to_receiver(
         started,
     )
     .await?;
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| transfer_err(format!("wait for receiver: {e}")))?;
-    if !status.success() {
-        return Err(transfer_err(format!(
-            "transfer receiver failed with {status}"
-        )));
-    }
     let remote: ReceiveMetadata = serde_json::from_str(out.trim())
         .map_err(|e| transfer_err(format!("invalid receiver metadata {out:?}: {e}")))?;
     let local_sha = format!("sha256:{}", hex::encode(hasher.finalize()));
@@ -393,6 +570,14 @@ async fn stream_to_receiver(
             "upload verification failed: local {size} bytes {local_sha}, remote {} bytes {}",
             remote.size, remote.sha256
         )));
+    }
+    if let Some(status) = finish_transfer_child(&mut child, endpoint.uses_base64_transfer()).await?
+    {
+        if !status.success() {
+            return Err(transfer_err(format!(
+                "transfer receiver failed with {status}"
+            )));
+        }
     }
     Ok(local_sha)
 }
@@ -457,31 +642,34 @@ pub async fn download_file(
     drop(child.stdin.take());
     let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
 
-    let received = receive_stream(&mut reader, tmp.as_file()).await;
+    let received =
+        receive_stream(&mut reader, tmp.as_file(), endpoint.uses_base64_transfer()).await;
     if received.is_err() {
         // A sender that stalled will never exit on its own, so waiting for it
         // would hang exactly where the stall was supposed to be caught. Killing
         // it first is what turns a detected stall into a returned error.
         let _ = child.kill().await;
     }
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| transfer_err(format!("wait for sender: {e}")))?;
+    let status = finish_transfer_child(&mut child, endpoint.uses_base64_transfer()).await?;
     let (size, sha256) = match received {
         Ok(v) => v,
         Err(e) => {
-            return Err(if status.success() {
+            return Err(if status.as_ref().is_none_or(|status| status.success()) {
                 e
             } else {
-                transfer_err(format!("transfer sender failed with {status}: {e}"))
+                transfer_err(format!(
+                    "transfer sender failed with {}: {e}",
+                    status.unwrap()
+                ))
             })
         }
     };
-    if !status.success() {
-        return Err(transfer_err(format!(
-            "transfer sender failed with {status}"
-        )));
+    if let Some(status) = status {
+        if !status.success() {
+            return Err(transfer_err(format!(
+                "transfer sender failed with {status}"
+            )));
+        }
     }
 
     tmp.as_file()
@@ -512,6 +700,7 @@ pub async fn download_file(
 async fn receive_stream(
     reader: &mut BufReader<tokio::process::ChildStdout>,
     out: &std::fs::File,
+    base64_chunks: bool,
 ) -> Result<(u64, String), ClientError> {
     use std::io::Write;
 
@@ -531,32 +720,68 @@ async fn receive_stream(
     let header: SendHeader = serde_json::from_str(header.trim())
         .map_err(|e| transfer_err(format!("invalid sender header {header:?}: {e}")))?;
 
-    let mut buf = vec![0u8; TRANSFER_BUF_SIZE];
     let mut hasher = Sha256::new();
     let mut remaining = header.size;
     let mut out = out;
-    while remaining > 0 {
-        let want = (remaining as usize).min(buf.len());
-        let received = header.size - remaining;
-        let n = transfer_step(
-            reader.read(&mut buf[..want]),
-            "receiving bytes from the sender",
-            received,
-            header.size,
-            started,
-        )
-        .await?;
-        if n == 0 {
-            return Err(transfer_err(format!(
-                "sender stream ended early at {}: {remaining} of {} bytes missing",
-                progress_note(received, header.size, started.elapsed()),
-                header.size
-            )));
+    if base64_chunks {
+        let mut line = String::new();
+        while remaining > 0 {
+            line.clear();
+            let received = header.size - remaining;
+            let n = transfer_step(
+                reader.read_line(&mut line),
+                "receiving a Base64 chunk from the sender",
+                received,
+                header.size,
+                started,
+            )
+            .await?;
+            if n == 0 {
+                return Err(transfer_err(format!(
+                    "sender stream ended early at {}: {remaining} of {} bytes missing",
+                    progress_note(received, header.size, started.elapsed()),
+                    header.size
+                )));
+            }
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(line.trim_end_matches(['\r', '\n']))
+                .map_err(|e| transfer_err(format!("invalid Base64 transfer chunk: {e}")))?;
+            if decoded.is_empty() || decoded.len() as u64 > remaining {
+                return Err(transfer_err(format!(
+                    "invalid Base64 chunk size {} with {remaining} bytes remaining",
+                    decoded.len()
+                )));
+            }
+            hasher.update(&decoded);
+            out.write_all(&decoded)
+                .map_err(|e| transfer_err(format!("write local temp file: {e}")))?;
+            remaining -= decoded.len() as u64;
         }
-        hasher.update(&buf[..n]);
-        out.write_all(&buf[..n])
-            .map_err(|e| transfer_err(format!("write local temp file: {e}")))?;
-        remaining -= n as u64;
+    } else {
+        let mut buf = vec![0u8; TRANSFER_BUF_SIZE];
+        while remaining > 0 {
+            let want = (remaining as usize).min(buf.len());
+            let received = header.size - remaining;
+            let n = transfer_step(
+                reader.read(&mut buf[..want]),
+                "receiving bytes from the sender",
+                received,
+                header.size,
+                started,
+            )
+            .await?;
+            if n == 0 {
+                return Err(transfer_err(format!(
+                    "sender stream ended early at {}: {remaining} of {} bytes missing",
+                    progress_note(received, header.size, started.elapsed()),
+                    header.size
+                )));
+            }
+            hasher.update(&buf[..n]);
+            out.write_all(&buf[..n])
+                .map_err(|e| transfer_err(format!("write local temp file: {e}")))?;
+            remaining -= n as u64;
+        }
     }
 
     let mut trailer = String::new();

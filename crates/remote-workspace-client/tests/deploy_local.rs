@@ -1,6 +1,11 @@
+#![cfg(unix)]
+
 use std::path::PathBuf;
 
-use remote_workspace_client::deploy::{self, ServerStep};
+use remote_workspace_client::{
+    deploy::{self, ServerStep},
+    RemoteShell,
+};
 
 fn server_bin() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -97,20 +102,29 @@ fn managed_deploy_installs_then_reuses() {
     let host = "loopback";
 
     // Platform probe reads the (fake) remote uname + $HOME.
-    let platform = deploy::probe_platform(host).unwrap();
+    let platform = deploy::probe_platform(host, RemoteShell::Posix).unwrap();
     assert_eq!(platform.os, "linux");
     assert_eq!(platform.home, home.to_string_lossy());
     let managed = platform.managed_bin();
 
     // Root validation: existing dir passes, missing dir fails with a code.
-    let canon = deploy::validate_root(host, &home.to_string_lossy()).unwrap();
+    let canon = deploy::validate_root(host, RemoteShell::Posix, &home.to_string_lossy()).unwrap();
     assert!(!canon.is_empty());
     let missing = home.join("does-not-exist");
-    let err = deploy::validate_root(host, &missing.to_string_lossy()).unwrap_err();
+    let err =
+        deploy::validate_root(host, RemoteShell::Posix, &missing.to_string_lossy()).unwrap_err();
     assert_eq!(err.code, "workspace_root_not_found");
 
     // First deploy installs the managed binary.
-    match deploy::deploy_managed(host, &platform.os, &platform.arch, &managed).unwrap() {
+    match deploy::deploy_managed(
+        host,
+        RemoteShell::Posix,
+        &platform.os,
+        &platform.arch,
+        &managed,
+    )
+    .unwrap()
+    {
         ServerStep::Installed(o) => {
             assert!(o.installed);
             assert!(o.previous.is_none());
@@ -121,7 +135,15 @@ fn managed_deploy_installs_then_reuses() {
     assert!(PathBuf::from(&managed).exists());
 
     // Second deploy sees an equal version and reuses it (no downgrade, no swap).
-    match deploy::deploy_managed(host, &platform.os, &platform.arch, &managed).unwrap() {
+    match deploy::deploy_managed(
+        host,
+        RemoteShell::Posix,
+        &platform.os,
+        &platform.arch,
+        &managed,
+    )
+    .unwrap()
+    {
         ServerStep::AlreadyCurrent(v) => assert_eq!(v.protocol_version, proto),
         ServerStep::Installed(_) => panic!("expected reuse, not reinstall"),
     }
