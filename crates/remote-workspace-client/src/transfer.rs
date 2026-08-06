@@ -287,6 +287,7 @@ fn ssh_argv(host: &str, shell: RemoteShell, remote: &[String]) -> Vec<String> {
     argv
 }
 
+#[cfg(windows)]
 fn powershell_encoded_command(script: &str) -> String {
     let bytes: Vec<u8> = script
         .encode_utf16()
