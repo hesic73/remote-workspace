@@ -287,16 +287,49 @@ fn shell_quote(s: &str) -> String {
 
 #[cfg(windows)]
 fn profile_script(setup: &str, argv: &[String]) -> String {
-    let quoted = argv
+    let executable = argv.first().map(String::as_str).unwrap_or_default();
+    let arguments = argv
         .iter()
-        .map(|arg| format!("'{}'", arg.replace('\'', "''")))
+        .skip(1)
+        .map(|arg| windows_command_line_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    if setup.is_empty() {
-        format!("& {quoted}; exit $LASTEXITCODE")
-    } else {
-        format!("{setup}\n& {quoted}; exit $LASTEXITCODE")
+    let invoke = format!(
+        "try {{ $psi = [System.Diagnostics.ProcessStartInfo]::new(); $psi.FileName = {}; $psi.Arguments = {}; $psi.UseShellExecute = $false; $p = [System.Diagnostics.Process]::Start($psi); $p.WaitForExit(); exit $p.ExitCode }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}",
+        powershell_quote(executable),
+        powershell_quote(&arguments),
+    );
+    format!("{setup}\n{invoke}")
+}
+
+#[cfg(windows)]
+fn powershell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn windows_command_line_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| c.is_whitespace() || c == '"') {
+        return arg.to_string();
     }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else if c == '"' {
+            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+            quoted.push('"');
+            backslashes = 0;
+        } else {
+            quoted.push_str(&"\\".repeat(backslashes));
+            backslashes = 0;
+            quoted.push(c);
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(test)]

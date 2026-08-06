@@ -11,6 +11,7 @@ use crate::{platform, remote_argv_command, Client, ClientError, RemoteShell};
 
 const TRANSFER_BUF_SIZE: usize = 64 * 1024;
 const POWERSHELL_TRANSFER_BUF_SIZE: usize = 3 * 1024;
+const POWERSHELL_REQUEST_IDLE_TIMEOUT_SECS: u64 = 1;
 
 /// How long a transfer may move zero bytes before it is called stalled. This is
 /// deliberately NOT a total timeout: a large file over a slow link legitimately
@@ -168,7 +169,13 @@ impl Endpoint {
                         ssh_argv(host, *remote_shell, &remote)
                     }
                     RemoteShell::Powershell => {
-                        remote.extend(["--idle-timeout-secs".into(), "1".into()]);
+                        // Each proxy iteration closes stdin after one request;
+                        // this timeout is only a bound if Windows OpenSSH fails
+                        // to deliver that EOF to the short-lived server.
+                        remote.extend([
+                            "--idle-timeout-secs".into(),
+                            POWERSHELL_REQUEST_IDLE_TIMEOUT_SECS.to_string(),
+                        ]);
                         powershell_ssh_proxy_argv(host, &remote)
                     }
                 }
@@ -280,30 +287,6 @@ fn ssh_argv(host: &str, shell: RemoteShell, remote: &[String]) -> Vec<String> {
     argv
 }
 
-fn windows_command_line_arg(arg: &str) -> String {
-    if !arg.is_empty() && !arg.chars().any(|c| c.is_whitespace() || c == '"') {
-        return arg.to_string();
-    }
-    let mut quoted = String::from("\"");
-    let mut backslashes = 0;
-    for c in arg.chars() {
-        if c == '\\' {
-            backslashes += 1;
-        } else if c == '"' {
-            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
-            quoted.push('"');
-            backslashes = 0;
-        } else {
-            quoted.push_str(&"\\".repeat(backslashes));
-            backslashes = 0;
-            quoted.push(c);
-        }
-    }
-    quoted.push_str(&"\\".repeat(backslashes * 2));
-    quoted.push('"');
-    quoted
-}
-
 fn powershell_encoded_command(script: &str) -> String {
     let bytes: Vec<u8> = script
         .encode_utf16()
@@ -312,13 +295,23 @@ fn powershell_encoded_command(script: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+#[cfg(not(windows))]
+fn powershell_ssh_proxy_argv(_host: &str, _remote: &[String]) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        "printf '%s\\n' 'PowerShell SSH control endpoints require a Windows client; run the client/MCP on Windows' >&2; exit 1".into(),
+    ]
+}
+
+#[cfg(windows)]
 fn powershell_ssh_proxy_argv(host: &str, remote: &[String]) -> Vec<String> {
     let remote_command = remote_argv_command(RemoteShell::Powershell, remote);
     let mut ssh = ssh_prefix(host);
     ssh.push(remote_command);
     let arguments = ssh[1..]
         .iter()
-        .map(|arg| windows_command_line_arg(arg))
+        .map(|arg| crate::windows_command_line_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
     let ssh_bin = crate::powershell_quote(&ssh[0]);
@@ -339,10 +332,11 @@ fn powershell_ssh_proxy_argv(host: &str, remote: &[String]) -> Vec<String> {
          $session.StandardInput.BaseStream.Write($requestBytes, 0, $requestBytes.Length); $session.StandardInput.Close(); \
          $sessionOut = [System.IO.StreamReader]::new($session.StandardOutput.BaseStream, $utf8, $false); \
          $sessionErr = [System.IO.StreamReader]::new($session.StandardError.BaseStream, $utf8, $false); \
+         $errorTask = $sessionErr.ReadToEndAsync(); \
          $response = $sessionOut.ReadLine(); \
          $exited = $session.WaitForExit(2500); \
          if (-not $exited) {{ $session.Kill(); $session.WaitForExit() }}; \
-         $errorText = $sessionErr.ReadToEnd(); \
+         $errorText = $errorTask.GetAwaiter().GetResult(); \
          if ($null -eq $response -or ($exited -and $session.ExitCode -ne 0)) {{ \
          [Console]::Error.WriteLine($errorText.Trim()); exit 1 \
          }}; $output.WriteLine($response) \
@@ -530,6 +524,16 @@ async fn stream_to_receiver(
                 started,
             )
             .await?;
+            if endpoint.uses_base64_transfer() {
+                transfer_step(
+                    child_stdin.write_all(b"\n"),
+                    "delimiting the Base64 upload chunk",
+                    sent,
+                    size,
+                    started,
+                )
+                .await?;
+            }
             sent += n as u64;
         }
         if sent != size {

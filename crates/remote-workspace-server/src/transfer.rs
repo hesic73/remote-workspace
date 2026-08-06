@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -26,6 +26,7 @@ pub const STAGING_SUFFIX: &str = ".part";
 pub const STALE_STAGING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+/// Prepared upload state persisted so one-request PowerShell sessions can commit it.
 pub struct PendingUpload {
     pub staging: PathBuf,
     pub target: PathBuf,
@@ -63,9 +64,15 @@ impl UploadRegistry {
     fn persist(&self) -> anyhow::Result<()> {
         let entries = self.entries.lock();
         let bytes = serde_json::to_vec(&*entries)?;
-        std::fs::write(&self.path, bytes)?;
-        let file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
-        file.sync_all()?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("pending upload registry has no parent"))?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        temp.write_all(&bytes)?;
+        temp.as_file().sync_all()?;
+        temp.persist(&self.path).map_err(|error| error.error)?;
+        crate::fsync::fsync_dir(parent)?;
         Ok(())
     }
 
@@ -454,17 +461,19 @@ pub fn run_transfer_receive(
     let mut hasher = Sha256::new();
     let mut total: u64 = 0;
     if base64_chunks {
+        let mut encoded = String::new();
         while total < expect_size {
             let raw_size = ((expect_size - total) as usize).min(BASE64_TRANSFER_BUF_SIZE);
-            let encoded_size = raw_size.div_ceil(3) * 4;
-            let mut encoded = vec![0u8; encoded_size];
-            stdin.read_exact(&mut encoded)?;
+            encoded.clear();
+            if stdin.read_line(&mut encoded)? == 0 {
+                break;
+            }
             let decoded = base64::engine::general_purpose::STANDARD
-                .decode(&encoded)
+                .decode(encoded.trim_end_matches(['\r', '\n']))
                 .map_err(|e| anyhow::anyhow!("invalid Base64 transfer chunk: {e}"))?;
-            if decoded.len() != raw_size {
+            if decoded.is_empty() || decoded.len() > raw_size {
                 anyhow::bail!(
-                    "Base64 chunk decoded to {} bytes, expected {raw_size}",
+                    "Base64 chunk decoded to {} bytes with at most {raw_size} expected",
                     decoded.len()
                 );
             }

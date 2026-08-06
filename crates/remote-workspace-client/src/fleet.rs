@@ -217,7 +217,10 @@ pub fn add_workspace_entry(fleet_path: &Path, entry: &NewEntry) -> Result<(), De
 
     let mut tbl = Table::new();
     tbl.insert("host", value(&entry.host));
-    tbl.insert("remote_shell", value(entry.remote_shell.to_string()));
+    // Keep POSIX entries readable by clients predating the optional key.
+    if entry.remote_shell == RemoteShell::Powershell {
+        tbl.insert("remote_shell", value(entry.remote_shell.to_string()));
+    }
     tbl.insert("root", value(&entry.root));
     if let Some(bin) = &entry.bin {
         tbl.insert("bin", value(bin));
@@ -308,6 +311,7 @@ fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
         Some(libc::EWOULDBLOCK) => Ok(false),
+        Some(libc::EINTR) => Ok(false),
         _ => Err(error),
     }
 }
@@ -402,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ssh_entries_default_to_posix_and_new_entries_persist_shell() {
+    fn legacy_ssh_entries_default_to_posix_and_only_powershell_entries_persist_shell() {
         let legacy = "[workspaces.old]\nhost = \"linux\"\nroot = \"/work\"\n";
         let parsed = parse_fleet(legacy).unwrap();
         assert!(matches!(
@@ -412,6 +416,13 @@ mod tests {
                 ..
             }
         ));
+
+        let posix_dir = tempfile::tempdir().unwrap();
+        let posix_path = posix_dir.path().join("workspaces.toml");
+        add_workspace_entry(&posix_path, &entry("linux", "linux", "/work")).unwrap();
+        assert!(!std::fs::read_to_string(posix_path)
+            .unwrap()
+            .contains("remote_shell"));
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workspaces.toml");

@@ -30,9 +30,10 @@ cargo build --release
 # target/release/remote-workspace-mcp     MCP server for coding agents
 ```
 
-You do not need to copy the server to the remote host yourself -- `workspace
-add` does that. Released servers are static musl binaries, so they run on any
-Linux of the same architecture regardless of glibc version.
+For Linux x86_64 targets, `workspace add` copies the released static musl
+server automatically. Windows releases currently contain the client and MCP,
+not a server artifact: build `remote-workspace-server.exe` on the Windows host,
+place it there yourself, and pass its absolute path with `--remote-bin`.
 
 ## Quick start
 
@@ -122,7 +123,7 @@ and one root each on two machines are the same concept.
 ```toml
 [workspaces.robot]
 host = "robot@workstation"   # omit to run on the local machine
-remote_shell = "posix"       # "powershell" for Windows OpenSSH
+# remote_shell = "powershell" # required only for Windows OpenSSH
 root = "/home/robot/project"
 bin = "/home/robot/.local/lib/remote-workspace/remote-workspace-server"
 label = "ROS workspace"      # optional, shown by list_workspaces
@@ -130,14 +131,20 @@ label = "ROS workspace"      # optional, shown by list_workspaces
 ```
 
 Prefer `workspace add` over editing this by hand: it validates the target and
-rewrites the file atomically, preserving your comments and other entries. A
-new SSH entry always records its detected shell; entries created by older
-versions without `remote_shell` remain POSIX for compatibility. Use
+rewrites the file atomically, preserving your comments and other entries. Only
+PowerShell entries record `remote_shell`; omitting it means POSIX and keeps
+newly-added Linux workspaces readable by 0.5.0 clients. Use
 `--remote-shell` during `workspace add` only when detection needs an explicit
 answer. A running MCP picks up changes on its next call -- no restart, and workspaces
 whose entry did not change keep their open connections. A file that does not
 parse is never partially applied; calls report `fleet_reload_failed` until it
 is valid again.
+
+PowerShell SSH endpoints require the client and MCP to run on Windows. They use
+one short SSH/server process per request, so requests to one workspace are
+serialized and pay SSH startup cost. Install the newer client and MCP on every
+machine sharing a fleet before adding a PowerShell entry; older clients reject
+that new key.
 
 ### Execution profiles
 

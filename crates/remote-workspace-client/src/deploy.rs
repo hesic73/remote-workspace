@@ -44,7 +44,7 @@ impl std::error::Error for DeployError {}
 
 type Result<T> = std::result::Result<T, DeployError>;
 
-/// Remote platform, as probed via `uname` plus the remote `$HOME`.
+/// Remote OS, architecture, and home directory reported by its configured shell.
 #[derive(Debug, Clone)]
 pub struct Platform {
     pub os: String,
@@ -82,7 +82,9 @@ fn artifact_target(os: &str, arch: &str) -> Result<String> {
         ("linux", "x86_64") => Ok("linux-x86_64-musl".into()),
         _ => Err(DeployError::new(
             "unsupported_remote_platform",
-            format!("no prebuilt server artifact for {os}-{arch} (supported: linux-x86_64)"),
+            format!(
+                "no prebuilt server artifact for {os}-{arch} (managed installs support linux-x86_64); build and place remote-workspace-server on the host, then pass --remote-bin"
+            ),
         )),
     }
 }
@@ -382,13 +384,13 @@ pub fn detect_platform(
         return probe_platform(host, shell).map(|platform| (shell, platform));
     }
 
-    let powershell_error = match probe_platform(host, RemoteShell::Powershell) {
-        Ok(platform) => return Ok((RemoteShell::Powershell, platform)),
+    let posix_error = match probe_platform(host, RemoteShell::Posix) {
+        Ok(platform) => return Ok((RemoteShell::Posix, platform)),
         Err(error) => error,
     };
-    match probe_platform(host, RemoteShell::Posix) {
-        Ok(platform) => Ok((RemoteShell::Posix, platform)),
-        Err(posix_error) => Err(DeployError::new(
+    match probe_platform(host, RemoteShell::Powershell) {
+        Ok(platform) => Ok((RemoteShell::Powershell, platform)),
+        Err(powershell_error) => Err(DeployError::new(
             "remote_probe_failed",
             format!(
                 "neither POSIX nor PowerShell probing succeeded; POSIX: {}; PowerShell: {}. Pass --remote-shell explicitly after configuring the SSH default shell",
@@ -532,6 +534,9 @@ fn upload_and_install(
     artifact: &CachedArtifact,
     managed_bin: &str,
 ) -> Result<InstallOutcome> {
+    // Managed deployment currently resolves only POSIX artifacts. Keep this
+    // boundary here as well so adding a Windows artifact cannot accidentally
+    // enter POSIX upload/install commands.
     let libdir = managed_bin
         .rsplit_once('/')
         .map(|(d, _)| d.to_string())
@@ -660,6 +665,12 @@ pub fn deploy_managed(
         }
         Preflight::NeedInstall => {
             let artifact = resolve_artifact(client_version, os, arch)?;
+            if shell != RemoteShell::Posix {
+                return Err(DeployError::new(
+                    "unsupported_remote_platform",
+                    "managed server installation requires a POSIX remote shell; place a server binary on the host and pass --remote-bin",
+                ));
+            }
             let outcome = upload_and_install(host, &artifact, managed_bin)?;
             Ok(ServerStep::Installed(outcome))
         }

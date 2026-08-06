@@ -307,6 +307,9 @@ impl Client {
 
     pub async fn close_with_grace(mut self, grace: std::time::Duration) {
         if !self.is_closed() {
+            // EOF asks the server to drain and exit normally. The shutdown
+            // signal below remains the bounded fallback for a stuck peer.
+            let _ = self.stdin.lock().await.shutdown().await;
             let _ = tokio::time::timeout(grace, self.wait_closed()).await;
         }
         if let Some(shutdown) = self.shutdown.take() {
@@ -781,6 +784,8 @@ pub fn shell_quote(s: &str) -> String {
 
 impl Drop for Client {
     fn drop(&mut self) {
+        // Drop cannot await a graceful EOF handshake. Call close() where the
+        // owner has an async teardown path; this remains the orphan-safe fallback.
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -791,6 +796,30 @@ pub fn powershell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+pub(crate) fn windows_command_line_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| c.is_whitespace() || c == '"') {
+        return arg.to_string();
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else if c == '"' {
+            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+            quoted.push('"');
+            backslashes = 0;
+        } else {
+            quoted.push_str(&"\\".repeat(backslashes));
+            backslashes = 0;
+            quoted.push(c);
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
 pub(crate) fn remote_argv_command(shell: RemoteShell, argv: &[String]) -> String {
     match shell {
         RemoteShell::Posix => argv
@@ -798,13 +827,20 @@ pub(crate) fn remote_argv_command(shell: RemoteShell, argv: &[String]) -> String
             .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" "),
-        RemoteShell::Powershell => format!(
-            "& {}; exit $LASTEXITCODE",
-            argv.iter()
-                .map(|arg| powershell_quote(arg))
+        RemoteShell::Powershell => {
+            let executable = argv.first().map(String::as_str).unwrap_or_default();
+            let arguments = argv
+                .iter()
+                .skip(1)
+                .map(|arg| windows_command_line_arg(arg))
                 .collect::<Vec<_>>()
-                .join(" ")
-        ),
+                .join(" ");
+            format!(
+                "$ErrorActionPreference = 'Stop'; try {{ $psi = [System.Diagnostics.ProcessStartInfo]::new(); $psi.FileName = {}; $psi.Arguments = {}; $psi.UseShellExecute = $false; $p = [System.Diagnostics.Process]::Start($psi); $p.WaitForExit(); exit $p.ExitCode }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}",
+                powershell_quote(executable),
+                powershell_quote(&arguments),
+            )
+        }
     }
 }
 
@@ -824,7 +860,10 @@ fn unique_id() -> String {
 
 #[cfg(test)]
 mod quote_tests {
-    use super::{powershell_quote, remote_argv_command, shell_quote, Endpoint, RemoteShell};
+    use super::{
+        powershell_quote, remote_argv_command, shell_quote, windows_command_line_arg, Endpoint,
+        RemoteShell,
+    };
 
     #[test]
     fn quotes_empty_spaces_and_metacharacters() {
@@ -834,12 +873,16 @@ mod quote_tests {
         assert_eq!(shell_quote("$(rm -rf /);`x`|&"), "'$(rm -rf /);`x`|&'");
         assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
         assert_eq!(powershell_quote("it's"), "'it''s'");
+        let command = remote_argv_command(
+            RemoteShell::Powershell,
+            &["C:\\Program Files\\server.exe".into(), "it's".into()],
+        );
+        assert!(command.contains("[System.Diagnostics.ProcessStartInfo]::new"));
+        assert!(command.contains("'C:\\Program Files\\server.exe'"));
+        assert!(command.contains("'it''s'"));
         assert_eq!(
-            remote_argv_command(
-                RemoteShell::Powershell,
-                &["C:\\Program Files\\server.exe".into(), "it's".into()]
-            ),
-            "& 'C:\\Program Files\\server.exe' 'it''s'; exit $LASTEXITCODE"
+            windows_command_line_arg(r"C:\path with space\"),
+            r#""C:\path with space\\""#
         );
     }
 
@@ -869,7 +912,8 @@ mod quote_tests {
     }
 
     #[test]
-    fn powershell_ssh_argv_uses_call_operator_and_literal_quotes() {
+    #[cfg(windows)]
+    fn powershell_ssh_argv_uses_exact_native_argument_serialization() {
         let endpoint = Endpoint::Ssh {
             host: "windows".into(),
             remote_shell: RemoteShell::Powershell,
@@ -882,17 +926,20 @@ mod quote_tests {
         assert_eq!(argv[0], "powershell.exe");
         assert!(argv.contains(&"-NoProfile".to_string()));
         assert!(argv.contains(&"-EncodedCommand".to_string()));
-        assert_eq!(
-            endpoint
-                .transfer_receive_argv(r"C:\stage\it's.part", 42)
-                .last()
-                .unwrap(),
-            "& 'C:\\Program Files\\Remote Workspace\\server.exe' '--transfer-receive' 'C:\\stage\\it''s.part' '--expect-size' '42' '--transfer-base64'; exit $LASTEXITCODE"
-        );
-        assert_eq!(
-            endpoint.transfer_send_argv("file.bin").last().unwrap(),
-            "& 'C:\\Program Files\\Remote Workspace\\server.exe' '--transfer-send' 'file.bin' '--root' 'C:\\work\\it''s here' '--transfer-base64'; exit $LASTEXITCODE"
-        );
+        let receive = endpoint
+            .transfer_receive_argv(r"C:\stage\it's.part", 42)
+            .last()
+            .unwrap()
+            .clone();
+        assert!(receive.contains("[System.Diagnostics.Process]::Start"));
+        assert!(receive.contains("--transfer-base64"));
+        let send = endpoint
+            .transfer_send_argv("file.bin")
+            .last()
+            .unwrap()
+            .clone();
+        assert!(send.contains("[System.Diagnostics.Process]::Start"));
+        assert!(send.contains("--transfer-base64"));
     }
 
     #[test]

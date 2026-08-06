@@ -1,10 +1,9 @@
-#![cfg(windows)]
-
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
+#[cfg(windows)]
 fn idle_timeout_exits_even_while_stdin_pipe_remains_open() {
     let workspace = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -104,7 +103,8 @@ fn base64_transfer_receiver_finishes_without_stdin_eof() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(b"ZGF0YQ==").unwrap();
+    // Two short, independently framed chunks exercise partial sender reads.
+    stdin.write_all(b"ZGE=\ndGE=\n").unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

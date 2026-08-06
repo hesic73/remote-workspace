@@ -9,6 +9,7 @@ pub(crate) fn try_lock_exclusive(file: &std::fs::File, _offset: u64) -> std::io:
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
         Some(libc::EWOULDBLOCK) => Ok(false),
+        Some(libc::EINTR) => Ok(false),
         _ => Err(error),
     }
 }

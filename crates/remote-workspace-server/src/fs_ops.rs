@@ -1029,10 +1029,7 @@ mod read_tests {
     fn ws_with(path: &str, content: &str) -> (tempfile::TempDir, Workspace) {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join(path), content).unwrap();
-        let w = Workspace {
-            root: dir.path().to_path_buf(),
-            scratch_root: dir.path().join("scratch"),
-        };
+        let w = Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
         (dir, w)
     }
 
@@ -1098,10 +1095,7 @@ mod read_tests {
         let dir = tempdir().unwrap();
         let big = vec![b'x'; MAX_TEXT_BYTES + 1024];
         std::fs::write(dir.path().join("big.log"), &big).unwrap();
-        let w = Workspace {
-            root: dir.path().to_path_buf(),
-            scratch_root: dir.path().join("scratch"),
-        };
+        let w = Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
         let offset = MAX_TEXT_BYTES as u64;
         match read(&w, "big.log", Some(offset), Some(64)).unwrap() {
             ResultBody::Read(r) => {

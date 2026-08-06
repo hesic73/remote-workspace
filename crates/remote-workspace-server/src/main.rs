@@ -177,6 +177,8 @@ async fn main() -> anyhow::Result<()> {
 
     let result = Server::new(opts)?.run_stdio().await;
     #[cfg(windows)]
+    // Tokio runtime teardown can retain Windows pipe/runtime worker state after
+    // stdio has completed; framing is flushed before this explicit process exit.
     match result {
         Ok(()) => std::process::exit(0),
         Err(error) => {
@@ -193,6 +195,8 @@ async fn main() -> anyhow::Result<()> {
 
 fn finish_transfer(result: anyhow::Result<()>) -> anyhow::Result<()> {
     #[cfg(windows)]
+    // Transfer functions flush their stdout before returning; avoid the same
+    // Windows runtime teardown hang as the control path.
     match result {
         Ok(()) => std::process::exit(0),
         Err(error) => {

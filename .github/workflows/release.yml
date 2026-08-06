@@ -54,8 +54,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Test Windows client and MCP
-        run: cargo test -p remote-workspace-client -p remote-workspace-mcp
+      - name: Test Windows workspace
+        run: cargo test --workspace
 
       - name: Build Windows client and MCP artifacts
         run: scripts/build-release.sh x86_64-pc-windows-msvc dist

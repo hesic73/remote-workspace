@@ -41,31 +41,40 @@ pub(crate) fn attach_parent_death(child: &mut Child) -> std::io::Result<()> {
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
-    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    static JOB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-    let job = unsafe { CreateJobObjectW(null(), null()) };
-    if job.is_null() {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let configured = unsafe {
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const _,
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
+    let job = if let Some(job) = JOB.get() {
+        *job as HANDLE
+    } else {
+        let created = unsafe { CreateJobObjectW(null(), null()) };
+        if created.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let configured = unsafe {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(
+                created,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(created) };
+            return Err(error);
+        }
+        match JOB.set(created as usize) {
+            Ok(()) => created,
+            Err(_) => {
+                unsafe { CloseHandle(created) };
+                *JOB.get().expect("job initialized by another thread") as HANDLE
+            }
+        }
     };
-    if configured == 0 {
-        let error = std::io::Error::last_os_error();
-        unsafe { CloseHandle(job) };
-        return Err(error);
-    }
 
     let Some(process) = child.raw_handle() else {
-        unsafe { CloseHandle(job) };
         return Err(std::io::Error::other(
             "spawned process has no Windows handle",
         ));
@@ -73,22 +82,11 @@ pub(crate) fn attach_parent_death(child: &mut Child) -> std::io::Result<()> {
     let assigned = unsafe { AssignProcessToJobObject(job, process as HANDLE) };
     if assigned == 0 {
         let error = std::io::Error::last_os_error();
-        unsafe { CloseHandle(job) };
         return Err(error);
     }
 
-    let job_value = job as usize;
-    if let Err(error) = std::thread::Builder::new()
-        .name("remote-workspace-child-job".into())
-        .spawn(move || unsafe {
-            let job = job_value as HANDLE;
-            WaitForSingleObject(job, INFINITE);
-            CloseHandle(job);
-        })
-    {
-        unsafe { CloseHandle(job) };
-        return Err(error);
-    }
+    // The process-lifetime handle is intentionally retained. Windows closes it
+    // if this client exits for any reason, which kills every assigned child.
     Ok(())
 }
 

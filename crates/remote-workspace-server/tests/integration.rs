@@ -2797,7 +2797,10 @@ setup = ""
             #[cfg(unix)]
             assert_eq!(r.stdout.prefix.trim(), "exec 'hi'");
             #[cfg(windows)]
-            assert_eq!(r.stdout.prefix.trim(), "& 'hi'; exit $LASTEXITCODE");
+            assert!(r
+                .stdout
+                .prefix
+                .contains("[System.Diagnostics.ProcessStartInfo]::new"));
         }
         other => panic!("unexpected: {other:?}"),
     }

@@ -5,6 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use remote_workspace_protocol::{should_replace, InstallOutcome, VersionInfo, PROTOCOL_VERSION};
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
 use crate::fsync::fsync_dir;
 
 const LOCK_GRACE: Duration = Duration::from_secs(30);
@@ -44,11 +45,18 @@ pub fn run_install_to(managed: &Path, expect_sha256: Option<&str>) -> Result<()>
     let previous = probe_installed(managed);
     let installed = should_replace(previous.as_ref(), &desired);
     if installed {
-        // Rename of a running executable is safe on Linux: existing processes
-        // keep the old inode, new spawns get the new file.
-        std::fs::rename(&self_path, managed)
-            .with_context(|| format!("install {self_path:?} -> {managed:?}"))?;
-        let _ = fsync_dir(libdir);
+        #[cfg(windows)]
+        bail!(
+            "managed self-install is not supported on Windows; install the server manually and use --remote-bin"
+        );
+        #[cfg(unix)]
+        {
+            // Rename of a running executable is safe on Linux: existing processes
+            // keep the old inode, new spawns get the new file.
+            std::fs::rename(&self_path, managed)
+                .with_context(|| format!("install {self_path:?} -> {managed:?}"))?;
+            let _ = fsync_dir(libdir);
+        }
     } else {
         // Keep the newer/equal server; drop our now-unused upload.
         let _ = std::fs::remove_file(&self_path);

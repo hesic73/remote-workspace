@@ -44,9 +44,7 @@ impl Workspace {
             ));
         }
         validate_platform_path(raw)?;
-        let base = base.canonicalize().map_err(|e| {
-            ProtocolError::new(ErrorCode::IoError, format!("failed to resolve root: {e}"))
-        })?;
+        let base = base.clone();
 
         // Reject any `..` components outright. This is simpler and stricter
         // than canonicalize-and-prefix-check, and matches the design intent
@@ -106,6 +104,9 @@ fn validate_platform_path(_path: &Path) -> Result<(), ProtocolError> {
 
 #[cfg(windows)]
 fn validate_platform_path(path: &Path) -> Result<(), ProtocolError> {
+    // Apply the same strict namespace to reads and writes. Windows normally
+    // aliases trailing dots/spaces and device names, so accepting legacy names
+    // here would make path identity ambiguous.
     for component in path.components() {
         let Component::Normal(name) = component else {
             continue;
