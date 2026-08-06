@@ -2429,8 +2429,7 @@ async fn crash_mid_utf8_codepoint_tail_recovered() {
     let after = std::fs::read_to_string(&ops_path).unwrap();
     assert!(
         after.ends_with('\n'),
-        "repaired file must end with newline, got: {:?}",
-        after
+        "repaired file must end with newline, got: {after:?}"
     );
     assert!(
         after.contains("op-1"),
@@ -2474,7 +2473,7 @@ async fn prepared_and_committed_same_id_reconcile_to_one() {
         "after_hash": "sha256:8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
         "timestamp_ms": 3,
     });
-    std::fs::write(&ops_path, format!("{op1}\n{}\n{}\n", prepared, committed)).unwrap();
+    std::fs::write(&ops_path, format!("{op1}\n{prepared}\n{committed}\n")).unwrap();
     std::fs::write(&req_path, "").unwrap();
 
     let mut h = harness_at_with(root.path(), log_dir, None).await;
