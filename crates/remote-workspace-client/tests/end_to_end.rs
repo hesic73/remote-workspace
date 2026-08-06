@@ -60,8 +60,7 @@ async fn make_client(root: &Path) -> Client {
     let bin = server_bin();
     if !bin.exists() {
         panic!(
-            "server binary not found at {:?}; run `cargo build -p remote-workspace-server` first",
-            bin
+            "server binary not found at {bin:?}; run `cargo build -p remote-workspace-server` first"
         );
     }
     let argv = vec![
