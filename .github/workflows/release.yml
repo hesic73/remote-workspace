@@ -1,6 +1,7 @@
 name: release
 
 on:
+  pull_request:
   push:
     tags: ["v*"]
   # Build-only dry run, so the artifacts can be verified before a tag exists.
