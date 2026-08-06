@@ -331,10 +331,10 @@ pub fn probe_platform(host: &str, shell: RemoteShell) -> Result<Platform> {
 }
 
 fn platform_script(shell: RemoteShell) -> String {
+    let m = MARKER;
     match shell {
         RemoteShell::Posix => format!(
-            "printf '{m}os=%s\\n{m}arch=%s\\n{m}home=%s\\n' \"$(uname -s)\" \"$(uname -m)\" \"$HOME\"\n",
-            m = MARKER
+            "printf '{m}os=%s\\n{m}arch=%s\\n{m}home=%s\\n' \"$(uname -s)\" \"$(uname -m)\" \"$HOME\"\n"
         ),
         RemoteShell::Powershell => format!(
             "if ($env:OS -ne 'Windows_NT') {{ exit 3 }}\n\
@@ -345,8 +345,7 @@ fn platform_script(shell: RemoteShell) -> String {
              }}\n\
              [Console]::Out.WriteLine('{m}os=windows')\n\
              [Console]::Out.WriteLine('{m}arch=' + $arch)\n\
-             [Console]::Out.WriteLine('{m}home=' + $env:USERPROFILE)\n",
-            m = MARKER
+             [Console]::Out.WriteLine('{m}home=' + $env:USERPROFILE)\n"
         ),
     }
 }
