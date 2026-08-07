@@ -393,9 +393,11 @@ of the boundary: the CLI adds and removes workspaces and installs binaries;
 the MCP exposes only already-configured workspaces; the agent chooses among
 them. There is no `add_workspace`, `install_server`, or reload tool.
 
-Onboarding probes POSIX first and PowerShell second. PowerShell is recorded as
-`remote_shell = "powershell"`; an omitted field means POSIX, preserving fleet
-compatibility with 0.5.0 clients. Every
+Onboarding probes POSIX first and PowerShell second, then records
+`remote_shell = "posix"` or `remote_shell = "powershell"`. An omitted field in
+an older fleet still means POSIX, but newly written entries are intentionally
+not readable by 0.5.0's strict parser. Upgrade every client/MCP sharing a fleet
+before adding workspaces with this release. Every
 later control and transfer connection uses that recorded quoting model without
 probing, retrying, or guessing. `--remote-shell` provides an explicit override
 for hosts whose environment makes automatic detection ambiguous. Fleet entries

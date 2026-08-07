@@ -123,7 +123,7 @@ and one root each on two machines are the same concept.
 ```toml
 [workspaces.robot]
 host = "robot@workstation"   # omit to run on the local machine
-# remote_shell = "powershell" # required only for Windows OpenSSH
+remote_shell = "posix"       # "powershell" for Windows OpenSSH
 root = "/home/robot/project"
 bin = "/home/robot/.local/lib/remote-workspace/remote-workspace-server"
 label = "ROS workspace"      # optional, shown by list_workspaces
@@ -131,20 +131,22 @@ label = "ROS workspace"      # optional, shown by list_workspaces
 ```
 
 Prefer `workspace add` over editing this by hand: it validates the target and
-rewrites the file atomically, preserving your comments and other entries. Only
-PowerShell entries record `remote_shell`; omitting it means POSIX and keeps
-newly-added Linux workspaces readable by 0.5.0 clients. Use
+rewrites the file atomically, preserving your comments and other entries. New
+SSH entries always record their detected `remote_shell`; entries created by
+older versions without the field are still read as POSIX. Use
 `--remote-shell` during `workspace add` only when detection needs an explicit
 answer. A running MCP picks up changes on its next call -- no restart, and workspaces
 whose entry did not change keep their open connections. A file that does not
 parse is never partially applied; calls report `fleet_reload_failed` until it
 is valid again.
 
-PowerShell SSH endpoints require the client and MCP to run on Windows. They use
+The new field is intentionally not backward-compatible with 0.5.0's strict
+fleet parser. Upgrade the client and MCP everywhere that reads a shared fleet
+before adding a workspace with this release; no server change is needed just
+to parse the fleet. PowerShell SSH endpoints require the client and MCP to run on Windows. They use
 one short SSH/server process per request, so requests to one workspace are
 serialized and pay SSH startup cost. Install the newer client and MCP on every
-machine sharing a fleet before adding a PowerShell entry; older clients reject
-that new key.
+machine sharing a fleet before adding a PowerShell entry.
 
 ### Execution profiles
 
