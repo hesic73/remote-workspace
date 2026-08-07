@@ -255,6 +255,7 @@ fn stage_write(abs: &Path, content: &[u8]) -> Result<StagedWrite, ProtocolError>
     })?;
     std::fs::write(tmp.path(), content)
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("temp write failed: {e}")))?;
+    #[cfg(unix)]
     if let Ok(orig_meta) = std::fs::metadata(abs) {
         use std::os::unix::fs::PermissionsExt;
         let mode = orig_meta.permissions().mode();
@@ -471,6 +472,7 @@ fn atomic_create_bytes(
     })?;
     // Temp files are 0600; a fresh workspace file should get conventional
     // permissions instead of inheriting that.
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644)).map_err(
@@ -763,7 +765,6 @@ fn file_kind(path: &Path) -> ListKind {
 }
 
 fn entry_for(client_path: &str, abs: &Path, meta: &std::fs::Metadata) -> FileEntry {
-    use std::os::unix::fs::PermissionsExt;
     let kind = if meta.file_type().is_symlink() {
         ListKind::Symlink
     } else if meta.is_dir() {
@@ -771,7 +772,6 @@ fn entry_for(client_path: &str, abs: &Path, meta: &std::fs::Metadata) -> FileEnt
     } else {
         ListKind::File
     };
-    let mode = meta.permissions().mode();
     FileEntry {
         path: client_path.to_string(),
         kind,
@@ -781,11 +781,28 @@ fn entry_for(client_path: &str, abs: &Path, meta: &std::fs::Metadata) -> FileEnt
         } else {
             None
         },
-        mode: Some(remote_workspace_protocol::FileMode {
-            readable: mode & 0o400 != 0,
-            writable: mode & 0o200 != 0,
-            executable: mode & 0o111 != 0,
-        }),
+        mode: Some(file_mode(meta)),
+    }
+}
+
+#[cfg(unix)]
+fn file_mode(meta: &std::fs::Metadata) -> remote_workspace_protocol::FileMode {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = meta.permissions().mode();
+    remote_workspace_protocol::FileMode {
+        readable: mode & 0o400 != 0,
+        writable: mode & 0o200 != 0,
+        executable: mode & 0o111 != 0,
+    }
+}
+
+#[cfg(windows)]
+fn file_mode(meta: &std::fs::Metadata) -> remote_workspace_protocol::FileMode {
+    remote_workspace_protocol::FileMode {
+        readable: true,
+        writable: !meta.permissions().readonly(),
+        executable: false,
     }
 }
 
@@ -988,6 +1005,7 @@ mod write_tests {
 
     // A write must not silently strip an executable bit.
     #[test]
+    #[cfg(unix)]
     fn installing_over_a_file_preserves_its_mode() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
@@ -1011,10 +1029,7 @@ mod read_tests {
     fn ws_with(path: &str, content: &str) -> (tempfile::TempDir, Workspace) {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join(path), content).unwrap();
-        let w = Workspace {
-            root: dir.path().to_path_buf(),
-            scratch_root: dir.path().join("scratch"),
-        };
+        let w = Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
         (dir, w)
     }
 
@@ -1080,10 +1095,7 @@ mod read_tests {
         let dir = tempdir().unwrap();
         let big = vec![b'x'; MAX_TEXT_BYTES + 1024];
         std::fs::write(dir.path().join("big.log"), &big).unwrap();
-        let w = Workspace {
-            root: dir.path().to_path_buf(),
-            scratch_root: dir.path().join("scratch"),
-        };
+        let w = Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
         let offset = MAX_TEXT_BYTES as u64;
         match read(&w, "big.log", Some(offset), Some(64)).unwrap() {
             ResultBody::Read(r) => {

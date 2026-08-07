@@ -28,8 +28,20 @@ pub struct Profile {
     pub setup: String,
 }
 
+#[cfg(unix)]
 fn default_shell() -> Vec<String> {
     vec!["bash".into(), "-c".into()]
+}
+
+#[cfg(windows)]
+fn default_shell() -> Vec<String> {
+    vec![
+        "powershell.exe".into(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+    ]
 }
 
 impl ServerConfig {
@@ -84,9 +96,26 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn shell_defaults_to_bash() {
         let c = ServerConfig::load_from_str("[profiles.p]\nsetup = \"x=1\"\n").unwrap();
         assert_eq!(c.profiles["p"].shell, vec!["bash", "-c"]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn shell_defaults_to_powershell() {
+        let c = ServerConfig::load_from_str("[profiles.p]\nsetup = \"$x = 1\"\n").unwrap();
+        assert_eq!(
+            c.profiles["p"].shell,
+            vec![
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command"
+            ]
+        );
     }
 
     #[test]

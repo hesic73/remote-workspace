@@ -48,9 +48,13 @@ correlated by `request_id`.
 
 ## Session semantics
 
-Persistent connection, stateless execution. The SSH connection, server
-process, and workspace root persist; every `exec` spawns a fresh child
-process, so `conda activate` in one command does not leak into the next.
+Persistent connection, stateless execution on POSIX endpoints. The SSH
+connection, server process, and workspace root persist; every `exec` spawns a
+fresh child process, so `conda activate` in one command does not leak into the
+next. PowerShell endpoints use a Windows-local proxy that serializes requests
+and starts one short SSH/server process per request. This avoids Windows
+OpenSSH's inability to carry multiple control writes reliably, at the cost of
+an SSH handshake and state reload per call.
 Environment setup (conda, ROS, ...) is re-applied per command via server-side
 profiles:
 
@@ -199,7 +203,10 @@ the target's directory; `upload_commit` verifies the staged size, installs
 atomically (rename for overwrite, hard-link-then-unlink for race-free
 no-replace), fsyncs, and appends the operation record; `upload_abort` deletes
 the staging file after a failure. The staging path travels only between the
-resident server and the client; it is never persisted or shown to the agent.
+server and the client and is never shown to the agent. It is held in memory on
+persistent POSIX sessions and in an atomically replaced
+`pending_uploads.json` registry for PowerShell, where prepare and commit run in
+different server processes.
 Downloads verify size and SHA-256 against the sender's framing, install
 locally via temp file + (no-clobber) rename, then append a `download_record`.
 
@@ -266,6 +273,7 @@ the canonical root path:
 ~/.remote-workspace/state/<rootname>-<hash>/
 |-- operations.jsonl   one record per operation (fs + exec)
 |-- requests.jsonl     request idempotency table
+|-- pending_uploads.json  cross-process upload registry (PowerShell)
 |-- scratch/           agent-visible runtime artifacts (`@scratch/...`)
 |-- lock               single-writer flock
 |-- server.jsonl       server lifecycle: start, lock refusal, exit reason
@@ -283,6 +291,9 @@ after reconnect) are exactly the reason the state must outlive them.
   argv, and exit codes. Appends are fsync'd. Mutations are
   write-ahead: `prepared` before the rename, `committed` after, so a crash in
   between is reconciled on restart instead of leaving a phantom operation.
+  On Windows, file contents are flushed but there is no stable directory-fsync
+  equivalent; rename/delete metadata durability therefore relies on the NTFS
+  journal and is weaker than the POSIX guarantee.
 * **Client log = interaction truth.** Optional JSONL log of every request
   sent and every response/event received (including truncation flags), i.e.
   what the agent actually saw. `remote-workspace-mcp --log-dir DIR` writes one
@@ -381,6 +392,26 @@ machines and directories an agent may reach, so it belongs on the trusted side
 of the boundary: the CLI adds and removes workspaces and installs binaries;
 the MCP exposes only already-configured workspaces; the agent chooses among
 them. There is no `add_workspace`, `install_server`, or reload tool.
+
+Onboarding probes POSIX first and PowerShell second, then records
+`remote_shell = "posix"` or `remote_shell = "powershell"`. An omitted field in
+an older fleet still means POSIX, but newly written entries are intentionally
+not readable by 0.5.0's strict parser. Upgrade every client/MCP sharing a fleet
+before adding workspaces with this release. Every
+later control and transfer connection uses that recorded quoting model without
+probing, retrying, or guessing. `--remote-shell` provides an explicit override
+for hosts whose environment makes automatic detection ambiguous. Fleet entries
+from releases before this field existed retain POSIX behavior.
+
+PowerShell endpoints require a Windows client/MCP. Their control proxy uses one
+SSH connection and server process per request, forces that process's idle
+timeout to one second, consumes one response line, and serializes requests for
+the workspace. Windows server binaries are not release artifacts and managed
+installation/upgrade is deliberately unsupported: the user builds and places
+`remote-workspace-server.exe`, then supplies `--remote-bin`. The onboarding
+error for a Windows target points to that path. A future Windows artifact must
+not enable the POSIX-only upload/install path; Windows executable replacement
+needs a separate upgrade design.
 
 `add` is onboarding only and refuses a name already in the fleet, so picking up
 a new release is a separate verb:

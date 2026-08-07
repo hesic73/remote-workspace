@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -196,6 +198,7 @@ fn add_installs_probes_and_records() {
 
     let fleet = std::fs::read_to_string(&env.fleet).unwrap();
     assert!(fleet.contains("[workspaces.robot]"));
+    assert!(fleet.contains("remote_shell = \"posix\""));
     assert!(fleet.contains(".local/lib/remote-workspace/remote-workspace-server"));
     // The managed binary was actually installed on the (loopback) remote.
     assert!(env

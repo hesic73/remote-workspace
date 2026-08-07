@@ -4,6 +4,8 @@ pub mod fs_ops;
 pub mod fsync;
 pub mod hash;
 pub mod install;
+mod locking;
+mod process_group;
 pub mod scratch;
 pub mod server;
 pub mod session_log;

@@ -109,12 +109,14 @@ remote-workspace-server     (on the remote, installed for you)</div>
 
 <h2>Install</h2>
 
-<p>You need two binaries on your own machine. The server is installed on the remote
-automatically when you add a workspace, so you never copy it yourself.</p>
+<p>You need two binaries on your own machine. For Linux x86_64 remotes, the server
+is installed automatically when you add a workspace. Windows remotes currently
+require a manually built and placed server plus <code>--remote-bin</code>.</p>
 
 <h3>Download</h3>
 
-<p>Static builds for Linux x86_64, so the glibc version does not matter.</p>
+<p>Static Linux x86_64 builds and Windows 11 x64 client/MCP builds are published.
+The Windows release does not include a managed server artifact.</p>
 
 <pre><code>BASE=https://github.com/hesic73/remote-workspace/releases/latest/download
 
@@ -150,6 +152,7 @@ already exist.</p>
 
 <pre><code>Adding workspace 'robot'
   SSH                    connected
+  Remote shell           posix
   Remote platform        linux-x86_64
   Workspace root         valid
   Server                 installed 0.5.0

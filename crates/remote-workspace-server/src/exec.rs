@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::os::unix::process::ExitStatusExt;
 use std::time::Duration;
 
 use remote_workspace_protocol::{
@@ -82,12 +81,7 @@ pub async fn exec(
             c
         }
         Some(p) => {
-            let quoted: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
-            let script = if p.setup.is_empty() {
-                format!("exec {}", quoted.join(" "))
-            } else {
-                format!("{}\nexec {}", p.setup, quoted.join(" "))
-            };
+            let script = profile_script(&p.setup, argv);
             let mut c = Command::new(&p.shell[0]);
             c.args(&p.shell[1..]).arg(script);
             c
@@ -99,23 +93,18 @@ pub async fn exec(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    unsafe {
-        // Isolate the command tree so timeout kills descendants that inherited
-        // a pipe as well as the direct child. A failed setsid must abort the
-        // spawn: without our own process group, group-kill on timeout or drain
-        // expiry would signal the wrong processes.
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    crate::process_group::ProcessGroup::configure(&mut cmd);
     let start = std::time::Instant::now();
     let mut child = cmd
         .spawn()
         .map_err(|e| ProtocolError::new(ErrorCode::ExecFailed, format!("spawn failed: {e}")))?;
-    let pid = child.id();
+    let process_group = crate::process_group::ProcessGroup::attach(&mut child).map_err(|e| {
+        let _ = child.start_kill();
+        ProtocolError::new(
+            ErrorCode::ExecFailed,
+            format!("create process group failed: {e}"),
+        )
+    })?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
@@ -130,13 +119,13 @@ pub async fn exec(
 
     let termination = loop {
         if tokio::time::Instant::now() >= deadline {
-            kill_process_group(pid);
+            process_group.kill();
             let _ = child.start_kill();
             break ExecTermination::TimedOut;
         }
         tokio::select! {
             () = tokio::time::sleep_until(deadline) => {
-                kill_process_group(pid);
+                process_group.kill();
                 let _ = child.start_kill();
                 break ExecTermination::TimedOut;
             }
@@ -145,12 +134,7 @@ pub async fn exec(
                 let status = status.map_err(|e| {
                     ProtocolError::new(ErrorCode::ExecFailed, format!("wait failed: {e}"))
                 })?;
-                break match status.code() {
-                    Some(code) => ExecTermination::Exited { code },
-                    None => ExecTermination::Signaled {
-                        signal: status.signal().unwrap_or(0),
-                    },
-                };
+                break exit_termination(status);
             }
         }
     };
@@ -170,7 +154,7 @@ pub async fn exec(
     loop {
         tokio::select! {
             () = tokio::time::sleep_until(drain_deadline) => {
-                kill_process_group(pid);
+                process_group.kill();
                 drain_timed_out = true;
                 break;
             }
@@ -264,19 +248,88 @@ fn bounded_lossy(bytes: &[u8], limit: usize) -> String {
     text
 }
 
-fn kill_process_group(pid: Option<u32>) {
-    if let Some(pid) = pid {
-        unsafe {
-            libc::killpg(pid as i32, libc::SIGKILL);
-        }
+#[cfg(unix)]
+fn exit_termination(status: std::process::ExitStatus) -> ExecTermination {
+    use std::os::unix::process::ExitStatusExt;
+
+    match status.code() {
+        Some(code) => ExecTermination::Exited { code },
+        None => ExecTermination::Signaled {
+            signal: status.signal().unwrap_or(0),
+        },
     }
 }
 
+#[cfg(windows)]
+fn exit_termination(status: std::process::ExitStatus) -> ExecTermination {
+    ExecTermination::Exited {
+        code: status.code().unwrap_or(1),
+    }
+}
+
+#[cfg(unix)]
+fn profile_script(setup: &str, argv: &[String]) -> String {
+    let quoted: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
+    if setup.is_empty() {
+        format!("exec {}", quoted.join(" "))
+    } else {
+        format!("{setup}\nexec {}", quoted.join(" "))
+    }
+}
+
+#[cfg(unix)]
 fn shell_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".into();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+fn profile_script(setup: &str, argv: &[String]) -> String {
+    let executable = argv.first().map(String::as_str).unwrap_or_default();
+    let arguments = argv
+        .iter()
+        .skip(1)
+        .map(|arg| windows_command_line_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let invoke = format!(
+        "try {{ $psi = [System.Diagnostics.ProcessStartInfo]::new(); $psi.FileName = {}; $psi.Arguments = {}; $psi.UseShellExecute = $false; $p = [System.Diagnostics.Process]::Start($psi); $p.WaitForExit(); exit $p.ExitCode }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}",
+        powershell_quote(executable),
+        powershell_quote(&arguments),
+    );
+    format!("{setup}\n{invoke}")
+}
+
+#[cfg(windows)]
+fn powershell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn windows_command_line_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| c.is_whitespace() || c == '"') {
+        return arg.to_string();
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else if c == '"' {
+            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+            quoted.push('"');
+            backslashes = 0;
+        } else {
+            quoted.push_str(&"\\".repeat(backslashes));
+            backslashes = 0;
+            quoted.push(c);
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(test)]

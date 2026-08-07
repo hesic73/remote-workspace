@@ -43,6 +43,7 @@ impl Workspace {
                 "path must be relative to workspace root",
             ));
         }
+        validate_platform_path(raw)?;
 
         // Reject any `..` components outright. This is simpler and stricter
         // than canonicalize-and-prefix-check, and matches the design intent
@@ -95,6 +96,51 @@ impl Workspace {
     }
 }
 
+#[cfg(unix)]
+fn validate_platform_path(_path: &Path) -> Result<(), ProtocolError> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_platform_path(path: &Path) -> Result<(), ProtocolError> {
+    // Apply the same strict namespace to reads and writes. Windows normally
+    // aliases trailing dots/spaces and device names, so accepting legacy names
+    // here would make path identity ambiguous.
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        if name.ends_with(['.', ' '])
+            || name
+                .chars()
+                .any(|c| c < ' ' || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+            || is_windows_device_name(&name)
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "path contains a Windows-reserved name or syntax",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_windows_device_name(name: &str) -> bool {
+    let basename = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    matches!(
+        basename.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || matches!(
+        basename.strip_prefix("COM"),
+        Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+    ) || matches!(
+        basename.strip_prefix("LPT"),
+        Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+    )
+}
+
 /// Canonicalize the deepest existing ancestor of `path`, re-attaching the
 /// non-existent tail components. Unlike `Path::canonicalize`, this handles
 /// paths whose final component does not exist yet, by walking up until an
@@ -145,38 +191,37 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn ws() -> Workspace {
+    fn ws() -> (tempfile::TempDir, Workspace) {
         let dir = tempdir().unwrap();
-        Workspace {
-            root: dir.path().to_path_buf(),
-            scratch_root: dir.path().join("scratch"),
-        }
+        let workspace =
+            Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
+        (dir, workspace)
     }
 
     #[test]
     fn rejects_parent_dir() {
-        let w = ws();
+        let (_dir, w) = ws();
         let err = w.resolve("../etc/passwd").unwrap_err();
         assert_eq!(err.code, ErrorCode::PathOutsideRoot);
     }
 
     #[test]
     fn rejects_absolute() {
-        let w = ws();
+        let (_dir, w) = ws();
         let err = w.resolve("/etc/passwd").unwrap_err();
         assert_eq!(err.code, ErrorCode::PathOutsideRoot);
     }
 
     #[test]
     fn rejects_empty() {
-        let w = ws();
+        let (_dir, w) = ws();
         let err = w.resolve("").unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidRequest);
     }
 
     #[test]
     fn allows_normal_relative() {
-        let w = ws();
+        let (_dir, w) = ws();
         let p = w.resolve("src/main.py").unwrap();
         assert!(p.starts_with(&w.root));
         assert!(p.ends_with("src/main.py"));
@@ -186,12 +231,9 @@ mod tests {
     fn resolves_scratch_namespace_separately() {
         let dir = tempdir().unwrap();
         let scratch = tempdir().unwrap();
-        let w = Workspace {
-            root: dir.path().to_path_buf(),
-            scratch_root: scratch.path().to_path_buf(),
-        };
+        let w = Workspace::new(dir.path().to_path_buf(), scratch.path().to_path_buf()).unwrap();
         let path = w.resolve("@scratch/logs/test.log").unwrap();
-        assert!(path.starts_with(scratch.path()));
+        assert!(path.starts_with(&w.scratch_root));
         assert_eq!(w.relative(&path), "@scratch/logs/test.log");
     }
 
@@ -199,46 +241,39 @@ mod tests {
     fn scratch_rejects_parent_escape() {
         let dir = tempdir().unwrap();
         let scratch = tempdir().unwrap();
-        let w = Workspace {
-            root: dir.path().to_path_buf(),
-            scratch_root: scratch.path().to_path_buf(),
-        };
+        let w = Workspace::new(dir.path().to_path_buf(), scratch.path().to_path_buf()).unwrap();
         let err = w.resolve("@scratch/../operations.jsonl").unwrap_err();
         assert_eq!(err.code, ErrorCode::PathOutsideRoot);
     }
 
     #[test]
     fn allows_dot_components() {
-        let w = ws();
+        let (_dir, w) = ws();
         let p = w.resolve("./src/./main.py").unwrap();
         assert!(p.ends_with("src/main.py"));
     }
 
     #[test]
+    #[cfg(unix)]
     fn rejects_symlink_escape() {
         let dir = tempdir().unwrap();
         let outside = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("src/escape")).unwrap();
-        let w = Workspace {
-            root: dir.path().to_path_buf(),
-            scratch_root: dir.path().join("scratch"),
-        };
+        let w = Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
         let err = w.resolve("src/escape").unwrap_err();
         assert_eq!(err.code, ErrorCode::PathOutsideRoot);
     }
 
     #[test]
+    #[cfg(unix)]
     fn rejects_symlinked_ancestor_with_nonexistent_leaf() {
         // Regression: a non-existent leaf under a symlinked parent must not
         // be accepted just because the leaf itself does not exist yet.
         let dir = tempdir().unwrap();
         let outside = tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
-        let w = Workspace {
-            root: dir.path().to_path_buf(),
-            scratch_root: dir.path().join("scratch"),
-        };
+        let w = Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
         let err = w.resolve("escape/new.txt").unwrap_err();
         assert_eq!(err.code, ErrorCode::PathOutsideRoot);
 
@@ -251,10 +286,7 @@ mod tests {
     fn allows_nonexistent_leaf_under_real_dir() {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        let w = Workspace {
-            root: dir.path().to_path_buf(),
-            scratch_root: dir.path().join("scratch"),
-        };
+        let w = Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
         let p = w.resolve("src/new/file.txt").unwrap();
         assert!(p.starts_with(&w.root));
         assert!(p.ends_with("src/new/file.txt"));
@@ -262,17 +294,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn rejects_symlink_escape_deep() {
         // A symlink several levels down, pointing outside.
         let dir = tempdir().unwrap();
         let outside = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("a/b/link")).unwrap();
-        let w = Workspace {
-            root: dir.path().to_path_buf(),
-            scratch_root: dir.path().join("scratch"),
-        };
+        let w = Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
         let err = w.resolve("a/b/link/x").unwrap_err();
         assert_eq!(err.code, ErrorCode::PathOutsideRoot);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_reserved_paths() {
+        let (_dir, w) = ws();
+        for path in [
+            "CON",
+            "con.txt",
+            "dir/NUL.log",
+            "COM1",
+            "lpt9.log",
+            "file.txt:stream",
+            "trailing.",
+            "trailing ",
+            "bad<name",
+        ] {
+            let err = w.resolve(path).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidRequest, "accepted {path:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn allows_similar_non_reserved_windows_names() {
+        let (_dir, w) = ws();
+        for path in ["console.txt", "COM10", "LPT0", "normal~1", "a.b"] {
+            assert!(w.resolve(path).is_ok(), "rejected {path:?}");
+        }
     }
 }

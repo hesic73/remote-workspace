@@ -82,14 +82,23 @@ struct Args {
         conflicts_with = "transfer_receive"
     )]
     transfer_send: Option<String>,
+
+    /// Internal: encode data-plane chunks as Base64 lines for text-only
+    /// transports such as Windows PowerShell over OpenSSH.
+    #[arg(long, hide = true)]
+    transfer_base64: bool,
 }
 
 fn resolve_state_base(state_base: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     match state_base {
         Some(b) => Ok(b),
         None => {
-            let home = std::env::var_os("HOME")
-                .ok_or_else(|| anyhow::anyhow!("HOME is not set; pass --state-base"))?;
+            #[cfg(unix)]
+            const HOME_ENV: &str = "HOME";
+            #[cfg(windows)]
+            const HOME_ENV: &str = "USERPROFILE";
+            let home = std::env::var_os(HOME_ENV)
+                .ok_or_else(|| anyhow::anyhow!("{HOME_ENV} is not set; pass --state-base"))?;
             Ok(PathBuf::from(home).join(".remote-workspace"))
         }
     }
@@ -129,7 +138,11 @@ async fn main() -> anyhow::Result<()> {
         let expect_size = args
             .expect_size
             .ok_or_else(|| anyhow::anyhow!("--transfer-receive requires --expect-size"))?;
-        return remote_workspace_server::transfer::run_transfer_receive(&staging, expect_size);
+        return finish_transfer(remote_workspace_server::transfer::run_transfer_receive(
+            &staging,
+            expect_size,
+            args.transfer_base64,
+        ));
     }
 
     let base = resolve_state_base(args.state_base)?;
@@ -138,7 +151,12 @@ async fn main() -> anyhow::Result<()> {
         let root = args
             .root
             .ok_or_else(|| anyhow::anyhow!("--transfer-send requires --root"))?;
-        return remote_workspace_server::transfer::run_transfer_send(&root, &base, &path);
+        return finish_transfer(remote_workspace_server::transfer::run_transfer_send(
+            &root,
+            &base,
+            &path,
+            args.transfer_base64,
+        ));
     }
 
     let root = args
@@ -157,6 +175,35 @@ async fn main() -> anyhow::Result<()> {
             .then(|| std::time::Duration::from_secs(args.idle_timeout_secs)),
     };
 
-    Server::new(opts)?.run_stdio().await?;
-    Ok(())
+    let result = Server::new(opts)?.run_stdio().await;
+    #[cfg(windows)]
+    // Tokio runtime teardown can retain Windows pipe/runtime worker state after
+    // stdio has completed; framing is flushed before this explicit process exit.
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        result?;
+        Ok(())
+    }
+}
+
+fn finish_transfer(result: anyhow::Result<()>) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    // Transfer functions flush their stdout before returning; avoid the same
+    // Windows runtime teardown hang as the control path.
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    }
+    #[cfg(not(windows))]
+    result
 }

@@ -20,6 +20,8 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
 remote-workspace-server = { path = "../remote-workspace-server" }
 
 [lib]

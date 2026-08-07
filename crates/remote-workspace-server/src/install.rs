@@ -1,4 +1,3 @@
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -6,6 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use remote_workspace_protocol::{should_replace, InstallOutcome, VersionInfo, PROTOCOL_VERSION};
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
 use crate::fsync::fsync_dir;
 
 const LOCK_GRACE: Duration = Duration::from_secs(30);
@@ -17,7 +17,7 @@ const LOCK_GRACE: Duration = Duration::from_secs(30);
 /// the desired binary means the version comparison and the swap happen in one
 /// locked process, so concurrent installers can never race a downgrade in.
 pub fn run_install_to(managed: &Path, expect_sha256: Option<&str>) -> Result<()> {
-    let self_path = std::fs::read_link("/proc/self/exe").context("resolve /proc/self/exe")?;
+    let self_path = std::env::current_exe().context("resolve current executable")?;
 
     if let Some(expect) = expect_sha256 {
         let bytes = std::fs::read(&self_path).context("read own binary for checksum")?;
@@ -45,11 +45,18 @@ pub fn run_install_to(managed: &Path, expect_sha256: Option<&str>) -> Result<()>
     let previous = probe_installed(managed);
     let installed = should_replace(previous.as_ref(), &desired);
     if installed {
-        // Rename of a running executable is safe on Linux: existing processes
-        // keep the old inode, new spawns get the new file.
-        std::fs::rename(&self_path, managed)
-            .with_context(|| format!("install {self_path:?} -> {managed:?}"))?;
-        let _ = fsync_dir(libdir);
+        #[cfg(windows)]
+        bail!(
+            "managed self-install is not supported on Windows; install the server manually and use --remote-bin"
+        );
+        #[cfg(unix)]
+        {
+            // Rename of a running executable is safe on Linux: existing processes
+            // keep the old inode, new spawns get the new file.
+            std::fs::rename(&self_path, managed)
+                .with_context(|| format!("install {self_path:?} -> {managed:?}"))?;
+            let _ = fsync_dir(libdir);
+        }
     } else {
         // Keep the newer/equal server; drop our now-unused upload.
         let _ = std::fs::remove_file(&self_path);
@@ -96,8 +103,9 @@ fn acquire_install_lock(libdir: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("open install lock {path:?}"))?;
     let deadline = Instant::now() + LOCK_GRACE;
     loop {
-        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
+        if crate::locking::try_lock_exclusive(&f, 0)
+            .with_context(|| format!("lock install file {path:?}"))?
+        {
             return Ok(f);
         }
         if Instant::now() >= deadline {

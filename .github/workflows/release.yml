@@ -1,6 +1,7 @@
 name: release
 
 on:
+  pull_request:
   push:
     tags: ["v*"]
   # Build-only dry run, so the artifacts can be verified before a tag exists.
@@ -11,7 +12,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,13 +42,46 @@ jobs:
               || { echo "$b is not statically linked"; exit 1; }
           done
 
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
-            dist/remote-workspace-linux-x86_64-musl
-            dist/remote-workspace-server-linux-x86_64-musl
-            dist/remote-workspace-mcp-linux-x86_64-musl
-            dist/release-manifest.json
-            dist/SHA256SUMS
+          name: release-linux-x86_64
+          path: dist/*
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test Windows workspace
+        run: cargo test --workspace
+
+      - name: Build Windows client and MCP artifacts
+        run: scripts/build-release.sh x86_64-pc-windows-msvc dist
+
+      - name: Check Windows artifacts run
+        run: |
+          dist/remote-workspace-windows-x86_64.exe --version
+          dist/remote-workspace-mcp-windows-x86_64.exe --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: dist/*
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

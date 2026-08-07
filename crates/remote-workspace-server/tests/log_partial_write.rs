@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 // The only test in this binary on purpose: it lowers RLIMIT_FSIZE and changes
 // the disposition of SIGXFSZ, both of which are process-wide.
 //

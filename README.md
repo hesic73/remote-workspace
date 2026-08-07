@@ -30,9 +30,10 @@ cargo build --release
 # target/release/remote-workspace-mcp     MCP server for coding agents
 ```
 
-You do not need to copy the server to the remote host yourself -- `workspace
-add` does that. Released servers are static musl binaries, so they run on any
-Linux of the same architecture regardless of glibc version.
+For Linux x86_64 targets, `workspace add` copies the released static musl
+server automatically. Windows releases currently contain the client and MCP,
+not a server artifact: build `remote-workspace-server.exe` on the Windows host,
+place it there yourself, and pass its absolute path with `--remote-bin`.
 
 ## Quick start
 
@@ -46,6 +47,7 @@ remote-workspace workspace add robot --host robot@workstation --root /home/robot
 ```text
 Adding workspace 'robot'
   SSH                    connected
+  Remote shell           posix
   Remote platform        linux-x86_64
   Workspace root         valid
   Server                 installed 0.5.0
@@ -121,6 +123,7 @@ and one root each on two machines are the same concept.
 ```toml
 [workspaces.robot]
 host = "robot@workstation"   # omit to run on the local machine
+remote_shell = "posix"       # "powershell" for Windows OpenSSH
 root = "/home/robot/project"
 bin = "/home/robot/.local/lib/remote-workspace/remote-workspace-server"
 label = "ROS workspace"      # optional, shown by list_workspaces
@@ -128,11 +131,25 @@ label = "ROS workspace"      # optional, shown by list_workspaces
 ```
 
 Prefer `workspace add` over editing this by hand: it validates the target and
-rewrites the file atomically, preserving your comments and other entries. A
-running MCP picks up changes on its next call -- no restart, and workspaces
+rewrites the file atomically, preserving your comments and other entries. New
+SSH entries always record their detected `remote_shell`; entries created by
+older versions without the field are still read as POSIX. Use
+`--remote-shell` during `workspace add` only when detection needs an explicit
+answer. A running MCP picks up changes on its next call -- no restart, and workspaces
 whose entry did not change keep their open connections. A file that does not
 parse is never partially applied; calls report `fleet_reload_failed` until it
 is valid again.
+
+The new field is intentionally not backward-compatible with 0.5.0's strict
+fleet parser. Upgrade the client and MCP everywhere that reads a shared fleet
+before adding a workspace with this release; no server change is needed just
+to parse the fleet. PowerShell SSH endpoints require the client and MCP to run
+on Windows. The Windows OpenSSH server must also have PowerShell configured as
+its `DefaultShell`: platform detection invokes PowerShell explicitly, but the
+actual SSH sessions are parsed by the configured default shell. These endpoints
+use one short SSH/server process per request, so requests to one workspace are
+serialized and pay SSH startup cost. Install the newer client and MCP on every
+machine sharing a fleet before adding a PowerShell entry.
 
 ### Execution profiles
 

@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use remote_workspace_mcp::RemoteWorkspaceServer;
 use rmcp::model::{ClientJsonRpcMessage, ClientRequest, ErrorCode, ErrorData, JsonRpcMessage};
@@ -88,11 +88,7 @@ async fn main() -> Result<()> {
 
     let fleet_path = match cli.fleet {
         Some(p) => p,
-        None => {
-            let home =
-                std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set; pass --fleet"))?;
-            PathBuf::from(home).join(".remote-workspace/workspaces.toml")
-        }
+        None => remote_workspace_client::fleet::default_fleet_path()?,
     };
     if cli.check {
         let text = std::fs::read_to_string(&fleet_path).with_context(|| {

@@ -1080,7 +1080,6 @@ fn acquire_dir_lock(
     log_dir: &std::path::Path,
     grace: std::time::Duration,
 ) -> Result<std::fs::File, ProtocolError> {
-    use std::os::fd::AsRawFd;
     let path = log_dir.join("lock");
     let f = std::fs::OpenOptions::new()
         .create(true)
@@ -1090,8 +1089,7 @@ fn acquire_dir_lock(
         .map_err(io_to_protocol)?;
     let deadline = std::time::Instant::now() + grace;
     loop {
-        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
+        if crate::locking::try_lock_exclusive(&f, 1 << 32).map_err(io_to_protocol)? {
             // Record our pid (best effort) so a conflicting starter can name
             // the holder -- e.g. a zombie server on a half-dead ssh session.
             let _ = f.set_len(0);
@@ -1342,11 +1340,7 @@ fn truncate_trailing_garbage(
     f.set_len(valid_end as u64).map_err(io_to_protocol)?;
     f.sync_all().map_err(io_to_protocol)?;
     if let Some(parent) = path.parent() {
-        let dir = std::fs::OpenOptions::new()
-            .read(true)
-            .open(parent)
-            .map_err(io_to_protocol)?;
-        dir.sync_all().map_err(io_to_protocol)?;
+        crate::fsync::fsync_dir(parent).map_err(io_to_protocol)?;
     }
     tracing::info!(
         file = %path.display(),
@@ -1374,11 +1368,7 @@ fn append_missing_newline(
     std::io::Write::write_all(&mut f, b"\n").map_err(io_to_protocol)?;
     f.sync_all().map_err(io_to_protocol)?;
     if let Some(parent) = path.parent() {
-        let dir = std::fs::OpenOptions::new()
-            .read(true)
-            .open(parent)
-            .map_err(io_to_protocol)?;
-        dir.sync_all().map_err(io_to_protocol)?;
+        crate::fsync::fsync_dir(parent).map_err(io_to_protocol)?;
     }
     tracing::info!(
         file = %path.display(),
