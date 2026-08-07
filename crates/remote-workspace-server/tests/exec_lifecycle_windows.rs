@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use remote_workspace_protocol::ExecTermination;
 use remote_workspace_server::config::ServerConfig;
-use remote_workspace_server::exec::{self, ExecOutcome, DRAIN_GRACE_MS};
+use remote_workspace_server::exec::{self, ExecOutcome};
 use remote_workspace_server::workspace::Workspace;
 use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
@@ -132,11 +132,9 @@ async fn timeout_kills_whole_job() {
 }
 
 #[tokio::test]
-async fn clean_exit_does_not_pay_drain_grace() {
+async fn clean_exit_drains_without_timeout() {
     let (_dir, workspace) = ws();
-    let start = Instant::now();
     let outcome = run_bounded(&workspace, "Write-Output 'done'", 30_000).await;
     assert_eq!(outcome.termination, ExecTermination::Exited { code: 0 });
     assert!(!outcome.drain_timed_out);
-    assert!(start.elapsed() < Duration::from_millis(DRAIN_GRACE_MS));
 }

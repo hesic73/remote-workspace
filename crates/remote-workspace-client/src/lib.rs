@@ -209,7 +209,7 @@ fn clip(s: &str, limit: usize) -> String {
 }
 
 pub struct Client {
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     reply_map: DispMap,
     /// Persistent close flag: once the transport EOFs, this stays true so any
     /// later request on this Client fails immediately instead of hanging.
@@ -232,7 +232,7 @@ impl Client {
             stdout,
             stderr,
         } = transport.spawn()?;
-        let stdin = Arc::new(Mutex::new(stdin));
+        let stdin = Arc::new(Mutex::new(Some(stdin)));
         let reply_map: DispMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let closed_notify = Arc::new(tokio::sync::Notify::new());
@@ -307,9 +307,9 @@ impl Client {
 
     pub async fn close_with_grace(mut self, grace: std::time::Duration) {
         if !self.is_closed() {
-            // EOF asks the server to drain and exit normally. The shutdown
-            // signal below remains the bounded fallback for a stuck peer.
-            let _ = self.stdin.lock().await.shutdown().await;
+            if let Some(stdin) = self.stdin.lock().await.take() {
+                let _ = close_control_stdin(stdin);
+            }
             let _ = tokio::time::timeout(grace, self.wait_closed()).await;
         }
         if let Some(shutdown) = self.shutdown.take() {
@@ -391,6 +391,10 @@ impl Client {
         }
         {
             let mut w = self.stdin.lock().await;
+            let Some(w) = w.as_mut() else {
+                self.reply_map.lock().await.remove(&request_id);
+                return Err(self.closed_error().await);
+            };
             let written = async {
                 w.write_all(line.as_bytes()).await?;
                 w.write_all(b"\n").await?;
@@ -792,6 +796,18 @@ impl Drop for Client {
     }
 }
 
+#[cfg(windows)]
+fn close_control_stdin(stdin: ChildStdin) -> std::io::Result<()> {
+    drop(stdin.into_owned_handle()?);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn close_control_stdin(stdin: ChildStdin) -> std::io::Result<()> {
+    drop(stdin);
+    Ok(())
+}
+
 pub fn powershell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -861,9 +877,45 @@ fn unique_id() -> String {
 #[cfg(test)]
 mod quote_tests {
     use super::{
-        powershell_quote, remote_argv_command, shell_quote, windows_command_line_arg, Endpoint,
-        RemoteShell,
+        powershell_quote, remote_argv_command, shell_quote, windows_command_line_arg,
+        ArgvTransport, Client, Endpoint, RemoteShell,
     };
+
+    #[cfg(windows)]
+    fn exits_on_stdin_eof_argv() -> Vec<String> {
+        vec![
+            "powershell.exe".into(),
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "$input | Out-Null".into(),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    fn exits_on_stdin_eof_argv() -> Vec<String> {
+        vec!["sh".into(), "-c".into(), "cat >/dev/null".into()]
+    }
+
+    #[tokio::test]
+    async fn graceful_close_delivers_real_stdin_eof() {
+        let client = Client::connect(
+            ArgvTransport {
+                argv: exits_on_stdin_eof_argv(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.close_with_grace(std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("graceful close must make the child observe EOF");
+    }
 
     #[test]
     fn quotes_empty_spaces_and_metacharacters() {

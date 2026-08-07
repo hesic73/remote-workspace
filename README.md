@@ -143,8 +143,11 @@ is valid again.
 The new field is intentionally not backward-compatible with 0.5.0's strict
 fleet parser. Upgrade the client and MCP everywhere that reads a shared fleet
 before adding a workspace with this release; no server change is needed just
-to parse the fleet. PowerShell SSH endpoints require the client and MCP to run on Windows. They use
-one short SSH/server process per request, so requests to one workspace are
+to parse the fleet. PowerShell SSH endpoints require the client and MCP to run
+on Windows. The Windows OpenSSH server must also have PowerShell configured as
+its `DefaultShell`: platform detection invokes PowerShell explicitly, but the
+actual SSH sessions are parsed by the configured default shell. These endpoints
+use one short SSH/server process per request, so requests to one workspace are
 serialized and pay SSH startup cost. Install the newer client and MCP on every
 machine sharing a fleet before adding a PowerShell entry.
 

@@ -663,13 +663,13 @@ pub fn deploy_managed(
             Err(client_too_old(&installed.expect("probed server"), &desired))
         }
         Preflight::NeedInstall => {
-            let artifact = resolve_artifact(client_version, os, arch)?;
             if shell != RemoteShell::Posix {
                 return Err(DeployError::new(
                     "unsupported_remote_platform",
                     "managed server installation requires a POSIX remote shell; place a server binary on the host and pass --remote-bin",
                 ));
             }
+            let artifact = resolve_artifact(client_version, os, arch)?;
             let outcome = upload_and_install(host, &artifact, managed_bin)?;
             Ok(ServerStep::Installed(outcome))
         }

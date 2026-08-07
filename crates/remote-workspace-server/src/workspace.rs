@@ -44,7 +44,6 @@ impl Workspace {
             ));
         }
         validate_platform_path(raw)?;
-        let base = base.clone();
 
         // Reject any `..` components outright. This is simpler and stricter
         // than canonicalize-and-prefix-check, and matches the design intent
@@ -71,7 +70,7 @@ impl Workspace {
             ProtocolError::new(ErrorCode::IoError, format!("failed to resolve path: {e}"))
         })?;
 
-        if !safe.starts_with(&base) {
+        if !safe.starts_with(base) {
             return Err(ProtocolError::new(
                 ErrorCode::PathOutsideRoot,
                 "resolved path escapes workspace root",

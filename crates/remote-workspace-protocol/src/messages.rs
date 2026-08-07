@@ -252,9 +252,15 @@ pub struct ExecResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExecTermination {
-    Exited { code: i32 },
+    Exited {
+        code: i32,
+    },
     TimedOut,
-    Signaled { signal: i32 },
+    /// Unix process terminated by a signal. Windows reports process exit codes
+    /// through `Exited` because `ExitStatus` has no signal representation.
+    Signaled {
+        signal: i32,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

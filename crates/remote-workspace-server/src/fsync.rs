@@ -3,15 +3,15 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::path::Path;
 
-/// fsync a single file and its parent directory. Use after writes/renames
-/// where the file itself still exists.
+/// Sync a file after a write or rename. Unix also syncs its parent directory;
+/// Windows cannot explicitly flush directory metadata.
 pub fn fsync_file_or_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     let f = File::open(path)?;
-    #[cfg(windows)]
     // FlushFileBuffers requires a writable handle. Mutation paths sync before
     // exposing any read-only attribute; returning AccessDenied is preferable
     // to claiming durability for an unflushed external read-only file.
+    #[cfg(windows)]
     let f = OpenOptions::new().read(true).write(true).open(path)?;
     f.sync_all()?;
     // Also sync the parent directory so the file entry is durable in the
