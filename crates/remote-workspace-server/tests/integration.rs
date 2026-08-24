@@ -191,6 +191,45 @@ fn req(id: &str, body: RequestBody) -> Request {
     }
 }
 
+#[cfg(unix)]
+fn platform_script(unix_script: &str, _windows_script: &str) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), unix_script.into()]
+}
+
+#[cfg(windows)]
+fn platform_script(_unix_script: &str, windows_script: &str) -> Vec<String> {
+    vec![
+        "powershell.exe".into(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        windows_script.into(),
+    ]
+}
+
+fn sleep_argv(milliseconds: u64) -> Vec<String> {
+    platform_script(
+        &format!("sleep {}", milliseconds as f64 / 1000.0),
+        &format!("Start-Sleep -Milliseconds {milliseconds}"),
+    )
+}
+
+#[cfg(unix)]
+fn verbatim_argv(value: &str) -> Vec<String> {
+    vec!["printf".into(), "%s".into(), value.into()]
+}
+
+#[cfg(windows)]
+fn verbatim_argv(value: &str) -> Vec<String> {
+    vec![
+        "python".into(),
+        "-c".into(),
+        "import sys; sys.stdout.buffer.write(sys.argv[1].encode())".into(),
+        value.into(),
+    ]
+}
+
 #[tokio::test]
 async fn create_then_read_roundtrip() {
     let mut h = harness().await;
@@ -513,7 +552,10 @@ async fn exec_returns_stdout_and_exit() {
     h.send(&req(
         "e",
         RequestBody::Exec {
-            argv: vec!["echo".into(), "hello-stdout".into()],
+            argv: platform_script(
+                "printf hello-stdout",
+                "[Console]::Out.Write('hello-stdout')",
+            ),
             cwd: None,
             profile: None,
             timeout_ms: Some(10000),
@@ -539,7 +581,10 @@ async fn exec_nonzero_exit_and_stderr() {
     h.send(&req(
         "e",
         RequestBody::Exec {
-            argv: vec!["sh".into(), "-c".into(), "echo err >&2; exit 7".into()],
+            argv: platform_script(
+                "echo err >&2; exit 7",
+                "[Console]::Error.WriteLine('err'); exit 7",
+            ),
             cwd: None,
             profile: None,
             timeout_ms: Some(10000),
@@ -599,17 +644,29 @@ async fn scratch_is_shared_by_exec_and_file_tools() {
     h.send(&req(
         "e",
         RequestBody::Exec {
-            argv: vec![
-                "sh".into(),
-                "-c".into(),
-                "printf scratch-data > \"$REMOTE_WORKSPACE_SCRATCH/job.log\"".into(),
-            ],
+            argv: platform_script(
+                "printf scratch-data > \"$REMOTE_WORKSPACE_SCRATCH/job.log\"",
+                "[System.IO.File]::WriteAllText([System.IO.Path]::Combine($env:REMOTE_WORKSPACE_SCRATCH, 'job.log'), 'scratch-data')",
+            ),
             cwd: None,
             profile: None,
             timeout_ms: Some(10000),
         },
     ));
-    let _ = h.recv_all_for("e").await;
+    let exec_msgs = h.recv_all_for("e").await;
+    assert!(
+        matches!(
+            &exec_msgs[0],
+            ServerMessage::Result {
+                result: ResultBody::Exec(ExecResult {
+                    termination: ExecTermination::Exited { code: 0 },
+                    ..
+                }),
+                ..
+            }
+        ),
+        "scratch writer failed: {exec_msgs:?}"
+    );
 
     h.send(&req(
         "r",
@@ -619,13 +676,17 @@ async fn scratch_is_shared_by_exec_and_file_tools() {
             limit: None,
         },
     ));
-    assert!(matches!(
-        h.recv().await,
-        ServerMessage::Result {
-            result: ResultBody::Read(ReadResult { content, .. }),
-            ..
-        } if content == "scratch-data"
-    ));
+    let read_msg = h.recv().await;
+    assert!(
+        matches!(
+            &read_msg,
+            ServerMessage::Result {
+                result: ResultBody::Read(ReadResult { content, .. }),
+                ..
+            } if content == "scratch-data"
+        ),
+        "unexpected scratch read: {read_msg:?}"
+    );
 }
 
 #[tokio::test]
@@ -1048,10 +1109,11 @@ async fn concurrent_duplicate_request_runs_once() {
 #[tokio::test]
 async fn exec_recorded_in_history_and_operation_get() {
     let mut h = harness().await;
+    let argv = platform_script("printf recorded", "[Console]::Out.Write('recorded')");
     h.send(&req(
         "e",
         RequestBody::Exec {
-            argv: vec!["echo".into(), "recorded".into()],
+            argv: argv.clone(),
             cwd: None,
             profile: None,
             timeout_ms: Some(10000),
@@ -1084,7 +1146,7 @@ async fn exec_recorded_in_history_and_operation_get() {
             match &operations[0] {
                 AnyOperationRecord::Exec(e) => {
                     assert_eq!(e.operation_id, op_id);
-                    assert_eq!(e.argv, vec!["echo".to_string(), "recorded".to_string()]);
+                    assert_eq!(e.argv, argv);
                     assert_eq!(e.termination, Some(ExecTermination::Exited { code: 0 }));
                     assert!(e.stdout.prefix.is_empty());
                     assert_eq!(e.stdout.omitted_bytes, e.stdout.total_bytes);
@@ -1664,7 +1726,10 @@ async fn exec_replay_after_disconnect_rejected() {
         h.send(&req(
             "exec-1",
             RequestBody::Exec {
-                argv: vec!["sh".into(), "-c".into(), "echo x >> marker".into()],
+                argv: platform_script(
+                    "echo x >> marker",
+                    "Add-Content -LiteralPath 'marker' -Value 'x'",
+                ),
                 cwd: None,
                 profile: None,
                 timeout_ms: Some(10000),
@@ -1701,7 +1766,10 @@ async fn exec_replay_after_disconnect_rejected() {
         h.send(&req(
             "exec-1",
             RequestBody::Exec {
-                argv: vec!["sh".into(), "-c".into(), "echo y >> marker".into()],
+                argv: platform_script(
+                    "echo y >> marker",
+                    "Add-Content -LiteralPath 'marker' -Value 'y'",
+                ),
                 cwd: None,
                 profile: None,
                 timeout_ms: Some(10000),
@@ -1940,11 +2008,10 @@ async fn continuous_output_command_is_killed_at_deadline() {
     h.send(&req(
         "e",
         RequestBody::Exec {
-            argv: vec![
-                "sh".into(),
-                "-c".into(),
-                "i=0; while [ $i -lt 1000000 ]; do echo x; i=$((i+1)); done".into(),
-            ],
+            argv: platform_script(
+                "i=0; while [ $i -lt 1000000 ]; do echo x; i=$((i+1)); done",
+                "while ($true) { [Console]::Out.WriteLine('x') }",
+            ),
             cwd: None,
             profile: None,
             timeout_ms: Some(200),
@@ -2721,7 +2788,7 @@ async fn exec_without_profile_spawns_argv_directly() {
     h.send(&req(
         "e",
         RequestBody::Exec {
-            argv: vec!["printf".into(), "%s".into(), hostile.into()],
+            argv: verbatim_argv(hostile),
             cwd: None,
             profile: None,
             timeout_ms: Some(10000),
@@ -2771,9 +2838,16 @@ async fn exec_without_profile_missing_command_rejected() {
 // generated script observable as output.
 #[tokio::test]
 async fn profile_with_empty_setup_still_uses_its_shell() {
+    #[cfg(unix)]
     let cfg = r#"
 [profiles.echoer]
 shell = ["echo"]
+setup = ""
+"#;
+    #[cfg(windows)]
+    let cfg = r#"
+[profiles.echoer]
+shell = ["python", "-c", "import sys; sys.stdout.write(sys.argv[1])"]
 setup = ""
 "#;
     let mut h = harness_with_config(Some(cfg)).await;
@@ -3056,7 +3130,7 @@ async fn idle_timeout_spares_a_request_and_restarts_from_its_completion() {
     let mut line = serde_json::to_string(&req(
         "slow",
         RequestBody::Exec {
-            argv: vec!["sleep".into(), "0.8".into()],
+            argv: sleep_argv(800),
             cwd: None,
             profile: None,
             timeout_ms: Some(10_000),
@@ -3211,7 +3285,10 @@ async fn a_request_still_running_at_stdin_eof_still_gets_its_reply() {
     let mut line = serde_json::to_string(&req(
         "slow",
         RequestBody::Exec {
-            argv: vec!["sh".into(), "-c".into(), "sleep 0.4; echo done".into()],
+            argv: platform_script(
+                "sleep 0.4; echo done",
+                "Start-Sleep -Milliseconds 400; [Console]::Out.WriteLine('done')",
+            ),
             cwd: None,
             profile: None,
             timeout_ms: Some(10_000),
@@ -3274,7 +3351,7 @@ async fn shutdown_does_not_wait_for_a_long_running_command() {
     let mut line = serde_json::to_string(&req(
         "forever",
         RequestBody::Exec {
-            argv: vec!["sleep".into(), "60".into()],
+            argv: sleep_argv(60_000),
             cwd: None,
             profile: None,
             timeout_ms: Some(120_000),
@@ -3343,7 +3420,10 @@ async fn a_broken_input_stream_still_drains_and_records_its_exit() {
     let mut line = serde_json::to_string(&req(
         "slow",
         RequestBody::Exec {
-            argv: vec!["sh".into(), "-c".into(), "sleep 0.4; echo done".into()],
+            argv: platform_script(
+                "sleep 0.4; echo done",
+                "Start-Sleep -Milliseconds 400; [Console]::Out.WriteLine('done')",
+            ),
             cwd: None,
             profile: None,
             timeout_ms: Some(10_000),
@@ -3403,7 +3483,7 @@ async fn an_abandoned_handler_does_not_keep_the_state_lock() {
     let mut line = serde_json::to_string(&req(
         "forever",
         RequestBody::Exec {
-            argv: vec!["sleep".into(), "60".into()],
+            argv: sleep_argv(60_000),
             cwd: None,
             profile: None,
             timeout_ms: Some(120_000),
@@ -3458,7 +3538,7 @@ async fn a_request_split_across_idle_expiries_is_not_truncated() {
     let mut busy = serde_json::to_string(&req(
         "busy",
         RequestBody::Exec {
-            argv: vec!["sleep".into(), "0.9".into()],
+            argv: sleep_argv(900),
             cwd: None,
             profile: None,
             timeout_ms: Some(10_000),
