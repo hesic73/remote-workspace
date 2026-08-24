@@ -816,7 +816,11 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let root = root.display().to_string();
         let output = run_powershell(&root_validation_script(RemoteShell::Powershell, &root));
-        assert_eq!(parse_root_status(&root, &output).unwrap(), root);
+        let resolved = parse_root_status(&root, &output).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(resolved).unwrap(),
+            std::fs::canonicalize(root).unwrap()
+        );
     }
 
     #[cfg(windows)]
