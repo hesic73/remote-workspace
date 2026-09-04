@@ -10,6 +10,7 @@ use crate::{ArgvTransport, Client, Endpoint, RemoteShell};
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FleetFile {
+    #[serde(default)]
     workspaces: BTreeMap<String, WorkspaceEntry>,
 }
 
@@ -36,14 +37,11 @@ pub struct Workspace {
     pub label: Option<String>,
 }
 
-/// Parse and validate a fleet config. Rejects an empty fleet and two
+/// Parse and validate a fleet config. Rejects two
 /// workspaces addressing the same (host, root): they would contend for the
 /// same server-side state lock and one of them would always fail.
 pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Workspace>> {
     let file: FleetFile = toml::from_str(text)?;
-    if file.workspaces.is_empty() {
-        anyhow::bail!("fleet config declares no workspaces");
-    }
     let mut seen: BTreeMap<(Option<String>, String), String> = BTreeMap::new();
     let mut host_shells: BTreeMap<String, RemoteShell> = BTreeMap::new();
     let mut out = BTreeMap::new();
@@ -97,6 +95,18 @@ pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Workspace>> {
         );
     }
     Ok(out)
+}
+
+/// A missing file is an unconfigured fleet; other read and parse errors fail.
+pub fn load_fleet(path: &Path) -> anyhow::Result<BTreeMap<String, Workspace>> {
+    use anyhow::Context;
+
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e).with_context(|| format!("read fleet config {path:?}")),
+    };
+    parse_fleet(&text).with_context(|| format!("invalid fleet config {path:?}"))
 }
 
 /// One-shot health probe of a workspace: spawn its server and do a real

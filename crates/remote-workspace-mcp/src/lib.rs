@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 // Fleet configuration lives in the client crate (shared with the `workspace
 // add` CLI); re-exported here so existing callers keep working.
-pub use remote_workspace_client::fleet::{check_workspace, parse_fleet, Workspace};
+pub use remote_workspace_client::fleet::{check_workspace, load_fleet, parse_fleet, Workspace};
 
 const SERVER_NAME: &str = "remote-workspace-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -285,19 +285,25 @@ pub struct RemoteWorkspaceServer {
     /// Reads clone the `Arc` and never block on I/O.
     snapshot: std::sync::RwLock<Arc<Snapshot>>,
     /// Serializes reload attempts and remembers the last-seen file stamp
-    /// (`None` = the file was absent or unreadable when last checked).
+    /// (`None` = the file was absent when last checked).
     last_seen: std::sync::Mutex<Option<FleetStamp>>,
 }
 
 const CONNECT_ATTEMPTS: u32 = 4;
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
-fn stamp_of(path: &std::path::Path) -> Option<FleetStamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some(FleetStamp {
-        modified: meta.modified().ok()?,
+fn stamp_of(path: &std::path::Path) -> anyhow::Result<Option<FleetStamp>> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("stat fleet config {path:?}")),
+    };
+    Ok(Some(FleetStamp {
+        modified: meta
+            .modified()
+            .with_context(|| format!("stat fleet config {path:?}"))?,
         len: meta.len(),
-    })
+    }))
 }
 
 /// Build a new snapshot from a parsed fleet, reusing the previous handle (and
@@ -329,11 +335,8 @@ impl RemoteWorkspaceServer {
     /// *before* the read it describes. Stamping after would miss a write landing
     /// in between and serve a stale snapshot that looks current.
     pub fn load(fleet_path: std::path::PathBuf) -> anyhow::Result<Self> {
-        let stamp = stamp_of(&fleet_path);
-        let text = std::fs::read_to_string(&fleet_path)
-            .with_context(|| format!("read fleet config {fleet_path:?}"))?;
-        let fleet =
-            parse_fleet(&text).with_context(|| format!("invalid fleet config {fleet_path:?}"))?;
+        let stamp = stamp_of(&fleet_path)?;
+        let fleet = load_fleet(&fleet_path)?;
         Ok(Self {
             fleet_path,
             log_dir: None,
@@ -352,20 +355,19 @@ impl RemoteWorkspaceServer {
     }
 
     /// Reload the fleet if the file changed since last checked; a no-op when the
-    /// stamp is unchanged. A file that is absent, unreadable, or invalid is
-    /// never partially applied: the last known-good snapshot keeps serving and
-    /// the triggering operation gets `fleet_reload_failed`. The bad state is not
+    /// stamp is unchanged. Missing or empty configuration clears the fleet.
+    /// An unreadable or invalid file is never applied: the triggering operation
+    /// gets `fleet_reload_failed`. The bad state is not
     /// recorded as seen, so the failure keeps being reported (rather than
     /// silently serving a stale fleet) until the file is valid again.
     fn refresh_fleet_if_changed(&self) -> Result<(), String> {
         let mut last = self.last_seen.lock().unwrap();
-        let now = stamp_of(&self.fleet_path);
+        let now = stamp_of(&self.fleet_path).map_err(|e| format!("fleet_reload_failed: {e:#}"))?;
         if now == *last {
             return Ok(());
         }
-        let text = std::fs::read_to_string(&self.fleet_path)
-            .map_err(|e| format!("fleet_reload_failed: read fleet config: {e}"))?;
-        let fleet = parse_fleet(&text).map_err(|e| format!("fleet_reload_failed: {e}"))?;
+        let fleet =
+            load_fleet(&self.fleet_path).map_err(|e| format!("fleet_reload_failed: {e:#}"))?;
         let old = self.snapshot();
         *self.snapshot.write().unwrap() = Arc::new(build_snapshot(&old, fleet));
         *last = now;

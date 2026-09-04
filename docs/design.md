@@ -389,7 +389,7 @@ remote-workspace workspace add robot --host robot@workstation --root /home/robot
 
 This is a **local CLI operation and never an MCP tool**. It expands the set of
 machines and directories an agent may reach, so it belongs on the trusted side
-of the boundary: the CLI adds and removes workspaces and installs binaries;
+of the boundary: the CLI adds workspaces and installs binaries;
 the MCP exposes only already-configured workspaces; the agent chooses among
 them. There is no `add_workspace`, `install_server`, or reload tool.
 
@@ -429,7 +429,7 @@ stable probe that mutates nothing, needs no config, and never starts the JSONL
 server:
 
 ```json
-{"software_version": "0.5.0", "protocol_version": 3}
+{"software_version": "0.6.0", "protocol_version": 3}
 ```
 
 `software_version` identifies the release and its CI artifact;
@@ -539,6 +539,12 @@ no server-side coordination at all -- there is no cross-workspace operation
   it `integer`. Nothing else is coerced.
 * In SSH mode the remote command line is shell-quoted per argument, because
   `ssh` re-parses its trailing arguments through the remote shell.
+* Missing or empty fleet configuration is a valid unconfigured state. MCP
+  initialization and tool discovery still succeed; `list_workspaces` returns
+  `[]`, and `--check` reports zero workspaces with an onboarding hint. No local
+  workspace is invented. Adding the first entry is handled by normal reload;
+  deleting the file or its last entry clears the fleet. Malformed TOML, unknown
+  fields, and I/O errors other than a missing file remain errors.
 * The fleet file is reloadable configuration, not startup-only state. Before
   listing workspaces or resolving one for a tool call, the MCP compares a
   cheap file stamp and, if it changed, parses and validates the whole file and

@@ -1,18 +1,23 @@
-#![cfg(unix)]
-
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 fn mcp_bin() -> String {
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("../../target/debug/remote-workspace-mcp");
-    p.to_string_lossy().into_owned()
+    env!("CARGO_BIN_EXE_remote-workspace-mcp").into()
 }
 
 fn server_bin() -> String {
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("../../target/debug/remote-workspace-server");
-    p.to_string_lossy().into_owned()
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!(
+            "remote-workspace-server{}",
+            std::env::consts::EXE_SUFFIX
+        ))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// A local fleet entry named `name` for `root`, with server state kept inside
@@ -169,10 +174,74 @@ fn mcp_initialize_and_server_info() {
 }
 
 #[test]
+fn mcp_empty_fleet_starts_and_reloads_without_restart() {
+    for initial in [None, Some(""), Some("[workspaces]\n")] {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = dir.path().join("fleet.toml");
+        if let Some(text) = initial {
+            std::fs::write(&fleet, text).unwrap();
+        }
+        let mut s = McpSession::spawn_fleet(&fleet);
+        s.initialize();
+        let (error, text) = s.tool("list_workspaces", serde_json::json!({}));
+        assert!(!error, "{text}");
+        assert_eq!(text, "[]");
+        let tools = s.call("tools/list", serde_json::json!({}));
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 9);
+        let (error, text) = s.tool(
+            "list_directory",
+            serde_json::json!({"workspace": "first", "path": "."}),
+        );
+        assert!(error && text.contains("unknown_workspace"), "{text}");
+        let check = Command::new(mcp_bin())
+            .arg("--fleet")
+            .arg(&fleet)
+            .arg("--check")
+            .output()
+            .unwrap();
+        assert!(check.status.success(), "{check:?}");
+        assert!(String::from_utf8_lossy(&check.stdout).contains("No workspaces configured"));
+
+        std::fs::write(&fleet, fleet_entry("first", dir.path().to_str().unwrap())).unwrap();
+        let (error, text) = s.tool("list_workspaces", serde_json::json!({}));
+        assert!(!error && text.contains("first"), "{text}");
+        let (error, text) = s.tool(
+            "list_directory",
+            serde_json::json!({"workspace": "first", "path": "."}),
+        );
+        assert!(!error, "{text}");
+
+        std::fs::write(&fleet, "[workspaces]\n").unwrap();
+        let (error, text) = s.tool("list_workspaces", serde_json::json!({}));
+        assert!(!error);
+        assert_eq!(text, "[]");
+        std::fs::remove_file(&fleet).unwrap();
+        let (error, text) = s.tool("list_workspaces", serde_json::json!({}));
+        assert!(!error);
+        assert_eq!(text, "[]");
+
+        std::fs::write(&fleet, "[workspaces").unwrap();
+        for _ in 0..2 {
+            let (error, text) = s.tool("list_workspaces", serde_json::json!({}));
+            assert!(error && text.contains("fleet_reload_failed"), "{text}");
+        }
+        std::fs::remove_file(&fleet).unwrap();
+        std::fs::create_dir(&fleet).unwrap();
+        let (error, text) = s.tool("list_workspaces", serde_json::json!({}));
+        assert!(error && text.contains("fleet_reload_failed"), "{text}");
+        std::fs::remove_dir(&fleet).unwrap();
+        let (error, text) = s.tool("list_workspaces", serde_json::json!({}));
+        assert!(!error);
+        assert_eq!(text, "[]");
+    }
+}
+
+#[test]
 fn mcp_rejects_invalid_fleet_configs() {
     let dir = tempfile::tempdir().unwrap();
     let cases = [
-        ("empty", "".to_string()),
+        ("malformed", "[workspaces".to_string()),
+        ("unknown-top-level", "workspace = {}".to_string()),
         (
             "duplicate",
             format!(
@@ -470,9 +539,14 @@ fn mcp_run_command_returns_exit_code() {
     let mut s = McpSession::spawn(dir.path().to_str().unwrap());
     s.initialize();
 
+    let argv = if cfg!(windows) {
+        vec!["cmd", "/C", "echo", "hello-from-mcp"]
+    } else {
+        vec!["echo", "hello-from-mcp"]
+    };
     let (e, text) = s.tool(
         "run_command",
-        serde_json::json!({"workspace": "test", "argv": ["echo", "hello-from-mcp"]}),
+        serde_json::json!({"workspace": "test", "argv": argv}),
     );
     assert!(!e);
     assert!(text.contains("hello-from-mcp"), "stdout missing: {text}");
@@ -711,6 +785,7 @@ fn mcp_full_tool_surface() {
 // If the connection to the server dies mid-session, the next tool call must
 // transparently reconnect instead of failing forever with "server closed
 // connection" (regression: flaky sshd resetting the connection).
+#[cfg(unix)]
 #[test]
 fn mcp_reconnects_after_server_death() {
     let dir = tempfile::tempdir().unwrap();
@@ -807,8 +882,8 @@ fn mcp_invalid_fleet_reload_is_reported_until_fixed() {
     let (e, _) = s.tool("list_workspaces", serde_json::json!({}));
     assert!(!e);
 
-    // Replace with an invalid fleet (declares no workspaces).
-    std::fs::write(&fleet, "# broken\n").unwrap();
+    // Replace with malformed TOML.
+    std::fs::write(&fleet, "[workspaces").unwrap();
 
     // Every operation keeps reporting it, not just the first one.
     for attempt in 1..=2 {

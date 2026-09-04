@@ -105,7 +105,7 @@ remote-workspace-mcp        (on your machine)
     │
     │  JSON Lines over ssh stdin/stdout
     ▼
-remote-workspace-server     (on the remote, installed for you)</div>
+remote-workspace-server     (on the remote; automatic install on Linux x86_64)</div>
 
 <h2>Install</h2>
 
@@ -115,9 +115,10 @@ require a manually built and placed server plus <code>--remote-bin</code>.</p>
 
 <h3>Download</h3>
 
-<p>Static Linux x86_64 builds and Windows 11 x64 client/MCP builds are published.
+<p>Version 0.6.0 adds Windows x64 client/MCP downloads alongside the static Linux x86_64 builds.
 The Windows release does not include a managed server artifact.</p>
 
+<h4>Linux x86_64</h4>
 <pre><code>BASE=https://github.com/hesic73/remote-workspace/releases/latest/download
 
 mkdir -p ~/.local/bin
@@ -128,17 +129,39 @@ done
 
 remote-workspace --version</code></pre>
 
-<p class="muted">Checksums for every asset are published as <code>SHA256SUMS</code> on
-the same release.</p>
+<h4>Windows x64 (PowerShell)</h4>
+<pre><code>$releaseBase = "https://github.com/hesic73/remote-workspace/releases/latest/download"
+$installDir = "$env:LOCALAPPDATA\remote-workspace\bin"
+New-Item -ItemType Directory -Force $installDir | Out-Null
+foreach ($name in @("remote-workspace", "remote-workspace-mcp")) {
+    Invoke-WebRequest "$releaseBase/$name-windows-x86_64.exe" -OutFile "$installDir\$name.exe"
+}
+$env:Path = "$installDir;$env:Path"
+remote-workspace --version</code></pre>
+<p>The PATH change applies to this shell. Add the directory to your user PATH for
+future shells, or register MCP with the absolute executable path.</p>
+<p class="muted">Release checksums: <code>SHA256SUMS</code> for Linux and
+<code>SHA256SUMS-windows-x86_64</code> for Windows.</p>
 
 <h3>Build from source</h3>
 
 <pre><code>git clone https://github.com/hesic73/remote-workspace
 cd remote-workspace
-cargo build --release
+cargo build --release --locked
 
 install -m755 target/release/remote-workspace \
               target/release/remote-workspace-mcp ~/.local/bin/</code></pre>
+
+<h3>Platform support</h3>
+<table>
+<thead><tr><th>Client / MCP</th><th>Remote host</th><th>Server installation</th></tr></thead>
+<tbody>
+<tr><td>Linux x86_64 or Windows x64</td><td>Linux x86_64, POSIX shell</td><td>Automatic</td></tr>
+<tr><td>Windows x64</td><td>Windows, PowerShell OpenSSH default shell</td><td>Manual build and <code>--remote-bin</code></td></tr>
+</tbody>
+</table>
+<p>Linux clients cannot use PowerShell endpoints. Other POSIX targets need a
+compatible server built and installed manually.</p>
 
 <h2>Add a workspace</h2>
 
@@ -155,7 +178,7 @@ already exist.</p>
   Remote shell           posix
   Remote platform        linux-x86_64
   Workspace root         valid
-  Server                 installed 0.5.0
+  Server                 installed 0.6.0
   Protocol               3
   Workspace probe        passed
   Fleet configuration    updated
@@ -163,6 +186,17 @@ Workspace 'robot' is ready.</code></pre>
 
 <p>If any step fails, nothing is recorded and the error names the layer that broke.
 Add as many workspaces as you like, on as many machines as you like.</p>
+
+<h3>Windows remote</h3>
+<p>On the remote Windows host, build a checkout of the same release with
+<code>cargo build --release --locked -p remote-workspace-server</code>. Place
+<code>target\release\remote-workspace-server.exe</code> at a persistent path and
+configure PowerShell as the OpenSSH <code>DefaultShell</code>. From a Windows client:</p>
+<pre><code>remote-workspace workspace add windows --host user@windows-host --root C:/projects/app --remote-bin C:/tools/remote-workspace-server.exe --remote-shell powershell</code></pre>
+<p>PowerShell requests use one short SSH/server process per request and are
+serialized per workspace. Windows server installation and upgrades are manual.
+Upgrade every client/MCP sharing a fleet before adding these entries: the
+<code>remote_shell</code> field is rejected by version 0.5.0.</p>
 
 <div class="note">
 <strong>Adding is for new workspaces.</strong> A name already in the fleet is refused;
@@ -173,9 +207,15 @@ moving registered hosts onto a newer release is <a href="#upgrading">upgrading</
 
 <p>One entry serves your whole fleet, so adding a workspace later needs no change here.
 Restart the host application afterwards, since MCP servers are loaded at startup.</p>
+<p>You can connect the MCP before adding a workspace. A missing or empty fleet is
+valid: <code>list_workspaces</code> returns <code>[]</code>, and
+<code>--check</code> succeeds with instructions for adding the first workspace.
+Nothing is registered automatically. Adding the first workspace takes effect on
+the next call; deleting the fleet file or its last entry clears the list. Invalid
+configuration and unreadable files still produce errors.</p>
 
 <h3>Claude Code</h3>
-<pre><code>claude mcp add remote-workspace -- remote-workspace-mcp</code></pre>
+<pre><code>claude mcp add --scope user remote-workspace -- remote-workspace-mcp</code></pre>
 
 <h3>Claude Desktop</h3>
 <p>In <code>claude_desktop_config.json</code>. Use an absolute path, because a GUI app
@@ -189,9 +229,11 @@ does not inherit your shell's <code>PATH</code>.</p>
 }</code></pre>
 
 <h3>Codex</h3>
-<p>In <code>~/.codex/config.toml</code>:</p>
-<pre><code>[mcp_servers.remote-workspace]
-command = "/home/you/.local/bin/remote-workspace-mcp"</code></pre>
+<pre><code>codex mcp add remote-workspace -- remote-workspace-mcp</code></pre>
+
+<h3>Grok Build</h3>
+<pre><code>grok mcp add --scope user remote-workspace -- remote-workspace-mcp</code></pre>
+<p>On Windows, use <code>remote-workspace-mcp.exe</code> or its absolute path.</p>
 
 <h2>Check it works</h2>
 
@@ -208,6 +250,15 @@ left untouched. Every tool
 except <code>list_workspaces</code> takes a required <code>workspace</code> argument, so a
 call cannot land on the wrong machine by default. Inspecting what happened afterwards
 is a job for the <code>remote-workspace</code> CLI, not a tool the agent carries.</p>
+
+<h3>What CI verifies</h3>
+<p>Linux and Windows CI run workspace tests, including MCP stdio startup and fleet
+reload, plus formatting and Clippy. Separate jobs build and run the Linux static
+artifacts and Windows client/MCP executables. Publishing is gated on all jobs.</p>
+<p>The real Windows-client SSH transfer smoke test requires a prepared SSH host
+and is opt-in; hosted CI does not validate a live Windows OpenSSH deployment.
+The <a href="https://github.com/hesic73/remote-workspace#development">development instructions</a>
+show how to run it. The process-kill/reconnect MCP test is Unix-only.</p>
 
 <h2>Making conda work</h2>
 

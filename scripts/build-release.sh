@@ -35,7 +35,7 @@ case "$TARGET" in
 esac
 
 echo "Building remote-workspace for $TARGET" >&2
-cargo_args=(--release --target "$TARGET")
+cargo_args=(--release --locked --target "$TARGET")
 for package in "${BINS[@]}"; do
   case "$package" in
     remote-workspace) cargo_args+=(-p remote-workspace-client) ;;

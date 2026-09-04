@@ -91,16 +91,15 @@ async fn main() -> Result<()> {
         None => remote_workspace_client::fleet::default_fleet_path()?,
     };
     if cli.check {
-        let text = std::fs::read_to_string(&fleet_path).with_context(|| {
-            format!("read fleet config {fleet_path:?}; create it or pass --fleet")
-        })?;
-        let fleet = remote_workspace_mcp::parse_fleet(&text)
-            .with_context(|| format!("invalid fleet config {fleet_path:?}"))?;
+        let fleet = remote_workspace_mcp::load_fleet(&fleet_path)?;
         println!(
             "fleet config {} ok: {} workspace(s)",
             fleet_path.display(),
             fleet.len()
         );
+        if fleet.is_empty() {
+            println!("No workspaces configured. Add one with: remote-workspace workspace add <name> --host <host> --root <path>");
+        }
         let mut unhealthy = 0;
         for (name, ws) in &fleet {
             let location = match &ws.endpoint {
@@ -128,7 +127,7 @@ async fn main() -> Result<()> {
     // being resumed briefly overlaps its predecessor on the same state lock).
     // The first tool call to each workspace connects on demand.
     let mut server = RemoteWorkspaceServer::load(fleet_path)
-        .context("fleet config unusable; create it or pass --fleet")?;
+        .context("fleet config unusable; fix it or pass --fleet")?;
     if let Some(dir) = cli.log_dir {
         server = server.with_log_dir(dir);
     }

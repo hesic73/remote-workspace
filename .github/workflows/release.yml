@@ -3,6 +3,7 @@ name: release
 on:
   pull_request:
   push:
+    branches: [main]
     tags: ["v*"]
   # Build-only dry run, so the artifacts can be verified before a tag exists.
   # Publishing is gated on the ref actually being a tag.
@@ -12,10 +13,36 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Build test binaries
+        run: cargo build --workspace --locked
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
 
       - name: Install musl toolchain
         # The client links rustls, whose crypto backend ships C code, so a
@@ -55,8 +82,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Test Windows workspace
-        run: cargo test --workspace
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
 
       - name: Build Windows client and MCP artifacts
         run: scripts/build-release.sh x86_64-pc-windows-msvc dist
@@ -73,7 +102,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-linux, build-windows]
+    needs: [test, build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -85,3 +114,4 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          generate_release_notes: true

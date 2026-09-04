@@ -24,7 +24,7 @@ Download the server artifact from a
 [release](https://github.com/hesic73/remote-workspace/releases) or build locally:
 
 ```bash
-cargo build --release
+cargo build --release --locked
 # target/release/remote-workspace         client + CLI
 # target/release/remote-workspace-server  server (runs on the remote host)
 # target/release/remote-workspace-mcp     MCP server for coding agents
@@ -34,6 +34,44 @@ For Linux x86_64 targets, `workspace add` copies the released static musl
 server automatically. Windows releases currently contain the client and MCP,
 not a server artifact: build `remote-workspace-server.exe` on the Windows host,
 place it there yourself, and pass its absolute path with `--remote-bin`.
+
+## Platform support
+
+| Local client / MCP | Remote host | Server installation |
+| --- | --- | --- |
+| Linux x86_64 | Linux x86_64, POSIX shell | Automatic static musl server download |
+| Windows x64 | Linux x86_64, POSIX shell | Automatic static musl server download |
+| Windows x64 | Windows, PowerShell OpenSSH default shell | Build and place the server manually; pass `--remote-bin` |
+
+Linux clients cannot connect to PowerShell endpoints. Other POSIX targets need a
+compatible server built and installed manually. Published Windows assets contain
+only the client and MCP, not the server.
+
+On Windows, download the client and MCP in PowerShell:
+
+```powershell
+$releaseBase = "https://github.com/hesic73/remote-workspace/releases/latest/download"
+$installDir = "$env:LOCALAPPDATA\remote-workspace\bin"
+New-Item -ItemType Directory -Force $installDir | Out-Null
+foreach ($name in @("remote-workspace", "remote-workspace-mcp")) {
+    Invoke-WebRequest "$releaseBase/$name-windows-x86_64.exe" -OutFile "$installDir\$name.exe"
+}
+$env:Path = "$installDir;$env:Path"
+remote-workspace --version
+```
+
+The PATH change applies to the current shell; add that directory to your user PATH
+for future shells, or use the absolute binary path in MCP registrations. Linux
+checksums are in `SHA256SUMS`; Windows checksums are in `SHA256SUMS-windows-x86_64`.
+
+For a Windows remote, build `cargo build --release --locked -p remote-workspace-server`
+in a checkout of the same release on that host. Place the resulting
+`target\release\remote-workspace-server.exe` at a persistent path. From a Windows
+client, with PowerShell configured as the remote OpenSSH `DefaultShell`:
+
+```powershell
+remote-workspace workspace add windows --host user@windows-host --root C:/projects/app --remote-bin C:/tools/remote-workspace-server.exe --remote-shell powershell
+```
 
 ## Quick start
 
@@ -50,7 +88,7 @@ Adding workspace 'robot'
   Remote shell           posix
   Remote platform        linux-x86_64
   Workspace root         valid
-  Server                 installed 0.5.0
+  Server                 installed 0.6.0
   Protocol               3
   Workspace probe        passed
   Fleet configuration    updated
@@ -76,8 +114,18 @@ for trying things out on one machine.
 ## Use from a coding agent (MCP)
 
 ```bash
-claude mcp add remote-workspace -- remote-workspace-mcp     # one entry serves every workspace
+claude mcp add --scope user remote-workspace -- remote-workspace-mcp
+codex mcp add remote-workspace -- remote-workspace-mcp
+grok mcp add --scope user remote-workspace -- remote-workspace-mcp
 ```
+
+You can register the MCP before adding any workspace. A missing fleet file, an
+empty file, or `[workspaces]` with no entries is a valid unconfigured state:
+`list_workspaces` returns `[]`, and `--check` succeeds with an onboarding hint.
+No workspace is added automatically. Add the first one later; the running MCP
+picks it up on its next call. Invalid TOML, unknown fields, and unreadable files
+remain errors. Removing the fleet file or its last entry clears the available
+workspaces without stopping the MCP.
 
 `remote-workspace-mcp` multiplexes the whole fleet over stdio. Tools:
 `list_workspaces`, `list_directory`, `read_file`, `create_file`, `edit_file`,
@@ -277,7 +325,22 @@ crates/
 ```
 
 ```bash
-cargo test --workspace --all-targets   # includes end-to-end tests against the
+cargo build --workspace --locked       # binaries used by integration tests
+cargo test --workspace --all-targets --locked # includes end-to-end tests against the
                                        # real server and MCP binaries
 cargo clippy --workspace --all-targets -- -D warnings
+```
+
+CI runs the workspace tests, formatting, and Clippy on Linux and Windows. It also
+builds static Linux artifacts and Windows client/MCP executables; tagged releases
+publish only after all jobs pass. MCP stdio tests run on both platforms, except
+the Unix process-kill/reconnect test.
+
+The real Windows-client SSH transfer smoke test is opt-in, not exercised by the
+hosted CI runners. To run it from Windows, set `REMOTE_WORKSPACE_TEST_HOST`,
+`REMOTE_WORKSPACE_TEST_ROOT`, `REMOTE_WORKSPACE_TEST_BIN`, and
+`REMOTE_WORKSPACE_TEST_SHELL` (`posix` or `powershell`) to a prepared target, then:
+
+```powershell
+cargo test -p remote-workspace-client --test windows_remote_smoke -- --ignored
 ```

@@ -1,6 +1,8 @@
 # Agent guidance
 
-This server manages one or more named workspaces, each a directory on a configured machine. Every tool except `list_workspaces` requires a `workspace` argument naming which one to act on. Workspaces are fully isolated from each other: paths and operation IDs are scoped to a single workspace and mean nothing in another.
+This server manages zero or more named workspaces, each a directory on a configured machine. Every tool except `list_workspaces` requires a `workspace` argument naming which one to act on. Workspaces are fully isolated from each other: paths and operation IDs are scoped to a single workspace and mean nothing in another.
+
+An empty `list_workspaces` result means no workspaces are configured. Ask the user for a target and add it locally with `remote-workspace workspace add <name> --host <host> --root <path>`. Do not invent a workspace or register the current directory automatically. The running MCP picks up the first workspace on its next call.
 
 The normal workflow:
 
