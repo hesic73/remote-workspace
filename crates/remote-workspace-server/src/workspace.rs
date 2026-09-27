@@ -24,6 +24,42 @@ impl Workspace {
     /// workspace root -- or the scratch root, for `@scratch/...` paths -- even
     /// when intermediate components are symlinks pointing out.
     pub fn resolve(&self, rel: &str) -> Result<PathBuf, ProtocolError> {
+        let (base, joined) = self.join(rel)?;
+        // Canonicalize the deepest existing ancestor of the joined path, then
+        // re-attach the non-existent tail. This is what makes the boundary
+        // safe: a leaf that does not yet exist (e.g. `escape/new.txt` where
+        // `escape` is a symlink out of root) is resolved against the
+        // *already-validated* ancestor instead of being accepted unchecked.
+        let safe = canonicalize_ancestor(&joined).map_err(|e| {
+            ProtocolError::new(ErrorCode::IoError, format!("failed to resolve path: {e}"))
+        })?;
+
+        if !safe.starts_with(base) {
+            return Err(ProtocolError::new(
+                ErrorCode::PathOutsideRoot,
+                "resolved path escapes workspace root",
+            ));
+        }
+        Ok(safe)
+    }
+
+    /// Whether the entry `rel` names is itself a symlink, which `resolve`
+    /// follows to its target.
+    pub fn is_symlink(&self, rel: &str) -> Result<bool, ProtocolError> {
+        let (_, joined) = self.join(rel)?;
+        match std::fs::symlink_metadata(joined) {
+            Ok(meta) => Ok(meta.file_type().is_symlink()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(ProtocolError::new(
+                ErrorCode::IoError,
+                format!("failed to resolve path: {e}"),
+            )),
+        }
+    }
+
+    /// Validate `rel` and join it to the root it addresses, returning that
+    /// root and the joined, not yet canonicalized, path.
+    fn join(&self, rel: &str) -> Result<(&Path, PathBuf), ProtocolError> {
         if rel.is_empty() {
             return Err(ProtocolError::new(
                 ErrorCode::InvalidRequest,
@@ -59,24 +95,7 @@ impl Workspace {
                 }
             }
         }
-
-        // Canonicalize the deepest existing ancestor of the joined path, then
-        // re-attach the non-existent tail. This is what makes the boundary
-        // safe: a leaf that does not yet exist (e.g. `escape/new.txt` where
-        // `escape` is a symlink out of root) is resolved against the
-        // *already-validated* ancestor instead of being accepted unchecked.
-        let joined = base.join(raw);
-        let safe = canonicalize_ancestor(&joined).map_err(|e| {
-            ProtocolError::new(ErrorCode::IoError, format!("failed to resolve path: {e}"))
-        })?;
-
-        if !safe.starts_with(base) {
-            return Err(ProtocolError::new(
-                ErrorCode::PathOutsideRoot,
-                "resolved path escapes workspace root",
-            ));
-        }
-        Ok(safe)
+        Ok((base, base.join(raw)))
     }
 
     /// Relative form (posix, forward slashes) of an absolute in-root path, for

@@ -19,6 +19,9 @@ pub const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 /// Upper bound on replacements in one `edit`. Each is separately bounded by
 /// MAX_TEXT_BYTES; this bounds the request as a whole.
 pub const MAX_EDITS: usize = 100;
+/// Mode of a file this server creates; temp files start out 0600.
+#[cfg(unix)]
+pub(crate) const NEW_FILE_MODE: u32 = 0o644;
 
 pub fn list(
     ws: &Workspace,
@@ -105,6 +108,9 @@ pub fn read(
             ErrorCode::IsADirectory,
             format!("is a directory: {path}"),
         ));
+    }
+    if !meta.is_file() {
+        return Err(not_a_regular_file(path));
     }
     let file_len = meta.len();
     let limit = limit.unwrap_or(READ_DEFAULT_LIMIT);
@@ -470,19 +476,16 @@ fn atomic_create_bytes(
             format!("temp write failed: {e}"),
         ))
     })?;
-    // Temp files are 0600; a fresh workspace file should get conventional
-    // permissions instead of inheriting that.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644)).map_err(
-            |e| {
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(NEW_FILE_MODE))
+            .map_err(|e| {
                 not_yet(ProtocolError::new(
                     ErrorCode::IoError,
                     format!("chmod temp failed: {e}"),
                 ))
-            },
-        )?;
+            })?;
     }
     std::fs::hard_link(tmp.path(), abs).map_err(|e| {
         not_yet(if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -604,6 +607,7 @@ pub fn edit(
     // above the cap is rejected either way, and reading it first is precisely
     // the cost the cap exists to avoid.
     match std::fs::metadata(&abs) {
+        Ok(meta) if !meta.is_file() => return Err(not_a_regular_file(path)),
         Ok(meta) if meta.len() > MAX_TEXT_BYTES as u64 => {
             return Err(ProtocolError::new(
                 ErrorCode::InvalidRequest,
@@ -728,19 +732,32 @@ pub fn delete(
     path: &str,
 ) -> Result<ResultBody, ProtocolError> {
     let abs = ws.resolve(path)?;
-    if abs.is_dir() {
+    // `resolve` follows a symlink to its target, and removing that would
+    // delete the file the link points to while the link itself stays.
+    if ws.is_symlink(path)? {
         return Err(ProtocolError::new(
-            ErrorCode::IsADirectory,
-            format!("not a file: {path}"),
+            ErrorCode::NotAFile,
+            format!("{path} is a symlink; remove the link itself with run_command"),
         ));
+    }
+    match std::fs::metadata(&abs) {
+        Ok(meta) if meta.is_dir() => {
+            return Err(ProtocolError::new(
+                ErrorCode::IsADirectory,
+                format!("not a file: {path}"),
+            ))
+        }
+        Ok(meta) if !meta.is_file() => return Err(not_a_regular_file(path)),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("not found: {path}"),
+            ))
+        }
+        Err(e) => return Err(e.into()),
     }
     let before_hash = hash_file(&abs)?;
-    if before_hash.is_none() {
-        return Err(ProtocolError::new(
-            ErrorCode::NotFound,
-            format!("not found: {path}"),
-        ));
-    }
     // A delete's "expected after" is the absent-file sentinel.
     let op_id = write_ahead_delete(store, request_id, path, &abs, &before_hash)?;
     Ok(ResultBody::Mutation(MutationResult {
@@ -748,6 +765,11 @@ pub fn delete(
         old_hash: before_hash,
         new_hash: FILE_ABSENT_HASH.into(),
     }))
+}
+
+/// For FIFOs, sockets and devices: opening one to read can block forever.
+fn not_a_regular_file(path: &str) -> ProtocolError {
+    ProtocolError::new(ErrorCode::NotAFile, format!("not a regular file: {path}"))
 }
 
 fn file_kind(path: &Path) -> ListKind {
@@ -776,7 +798,9 @@ fn entry_for(client_path: &str, abs: &Path, meta: &std::fs::Metadata) -> FileEnt
         path: client_path.to_string(),
         kind,
         size: meta.len(),
-        hash: if meta.is_file() {
+        // Only `edit` consumes a hash, and it refuses files above the cap:
+        // hashing a multi-GB file here would read all of it for nothing.
+        hash: if meta.is_file() && meta.len() <= MAX_TEXT_BYTES as u64 {
             hash_file(abs).ok().flatten()
         } else {
             None

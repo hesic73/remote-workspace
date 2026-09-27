@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use base64::Engine as _;
 use remote_workspace_protocol::TransferResult;
@@ -7,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use crate::{platform, remote_argv_command, Client, ClientError, RemoteShell};
+use crate::{platform, remote_argv_command, Client, ClientError, RemoteShell, StderrTail};
 
 const TRANSFER_BUF_SIZE: usize = 64 * 1024;
 const POWERSHELL_TRANSFER_BUF_SIZE: usize = 3 * 1024;
@@ -169,9 +170,10 @@ impl Endpoint {
                         ssh_argv(host, *remote_shell, &remote)
                     }
                     RemoteShell::Powershell => {
-                        // Each proxy iteration closes stdin after one request;
-                        // this timeout is only a bound if Windows OpenSSH fails
-                        // to deliver that EOF to the short-lived server.
+                        // Each proxy iteration closes stdin once its request
+                        // has been answered; this timeout is only a bound if
+                        // Windows OpenSSH fails to deliver that EOF to the
+                        // short-lived server.
                         remote.extend([
                             "--idle-timeout-secs".into(),
                             POWERSHELL_REQUEST_IDLE_TIMEOUT_SECS.to_string(),
@@ -218,8 +220,9 @@ impl Endpoint {
         let tail = |bin: &str, root: &str, state_base: &Option<String>, base64: bool| {
             let mut argv = vec![
                 bin.to_string(),
-                "--transfer-send".into(),
-                remote_path.to_string(),
+                // Joined with `=`: as a separate argument, a workspace path
+                // starting with `-` would be parsed as a flag.
+                format!("--transfer-send={remote_path}"),
                 "--root".into(),
                 root.to_string(),
             ];
@@ -317,6 +320,10 @@ fn powershell_ssh_proxy_argv(host: &str, remote: &[String]) -> Vec<String> {
         .join(" ");
     let ssh_bin = crate::powershell_quote(&ssh[0]);
     let arguments = crate::powershell_quote(&arguments);
+    // The server's stdin stays open until the reply has arrived: the server
+    // treats EOF as shutdown and stops whatever is still running. Lines before
+    // the reply that are not JSON objects come from the remote PowerShell
+    // profile, which the SSH server runs for every session.
     let script = format!(
         "$ErrorActionPreference = 'Stop'; \
          $utf8 = [System.Text.UTF8Encoding]::new($false); \
@@ -330,11 +337,12 @@ fn powershell_ssh_proxy_argv(host: &str, remote: &[String]) -> Vec<String> {
          $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; \
          $session = [System.Diagnostics.Process]::Start($psi); \
          $requestBytes = $utf8.GetBytes($line + [char]10); \
-         $session.StandardInput.BaseStream.Write($requestBytes, 0, $requestBytes.Length); $session.StandardInput.Close(); \
+         $session.StandardInput.BaseStream.Write($requestBytes, 0, $requestBytes.Length); $session.StandardInput.BaseStream.Flush(); \
          $sessionOut = [System.IO.StreamReader]::new($session.StandardOutput.BaseStream, $utf8, $false); \
          $sessionErr = [System.IO.StreamReader]::new($session.StandardError.BaseStream, $utf8, $false); \
          $errorTask = $sessionErr.ReadToEndAsync(); \
-         $response = $sessionOut.ReadLine(); \
+         do {{ $response = $sessionOut.ReadLine() }} while ($null -ne $response -and -not $response.StartsWith('{{')); \
+         $session.StandardInput.Close(); \
          $exited = $session.WaitForExit(2500); \
          if (-not $exited) {{ $session.Kill(); $session.WaitForExit() }}; \
          $errorText = $errorTask.GetAwaiter().GetResult(); \
@@ -373,12 +381,14 @@ fn transfer_err(msg: impl Into<String>) -> ClientError {
     ClientError::Transfer(msg.into())
 }
 
-fn spawn_transfer_child(argv: &[String]) -> std::io::Result<tokio::process::Child> {
+fn spawn_transfer_child(
+    argv: &[String],
+) -> std::io::Result<(tokio::process::Child, Arc<StderrTail>)> {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     // Die with the parent, like the control-plane transport: a killed consumer
     // must not leave an orphaned ssh streaming bytes.
@@ -388,7 +398,28 @@ fn spawn_transfer_child(argv: &[String]) -> std::io::Result<tokio::process::Chil
         let _ = child.start_kill();
         return Err(error);
     }
-    Ok(child)
+    let stderr = crate::drain_stderr(child.stderr.take().expect("piped stderr"));
+    Ok((child, stderr))
+}
+
+/// Add what the transfer process printed on stderr to its error. A remote
+/// server that refuses a transfer explains why there, while the error on its
+/// own only has the symptom ("sender produced no header").
+async fn with_stderr<T>(
+    result: Result<T, ClientError>,
+    stderr: &StderrTail,
+) -> Result<T, ClientError> {
+    match result {
+        Err(ClientError::Transfer(message)) => {
+            let text = stderr.text().await;
+            Err(transfer_err(if text.is_empty() {
+                message
+            } else {
+                format!("{message}; remote stderr: {text}")
+            }))
+        }
+        other => other,
+    }
 }
 
 #[cfg(windows)]
@@ -483,8 +514,21 @@ async fn stream_to_receiver(
     staging_path: &str,
 ) -> Result<String, ClientError> {
     let argv = endpoint.transfer_receive_argv(staging_path, size);
-    let mut child = spawn_transfer_child(&argv)
+    let (mut child, stderr) = spawn_transfer_child(&argv)
         .map_err(|e| transfer_err(format!("spawn transfer receiver: {e}")))?;
+    with_stderr(
+        send_to_receiver(&mut child, endpoint, local_path, size).await,
+        &stderr,
+    )
+    .await
+}
+
+async fn send_to_receiver(
+    child: &mut tokio::process::Child,
+    endpoint: &Endpoint,
+    local_path: &Path,
+    size: u64,
+) -> Result<String, ClientError> {
     let mut child_stdin = child.stdin.take().expect("piped stdin");
     let child_stdout = child.stdout.take().expect("piped stdout");
 
@@ -576,8 +620,7 @@ async fn stream_to_receiver(
             remote.size, remote.sha256
         )));
     }
-    if let Some(status) = finish_transfer_child(&mut child, endpoint.uses_base64_transfer()).await?
-    {
+    if let Some(status) = finish_transfer_child(child, endpoint.uses_base64_transfer()).await? {
         if !status.success() {
             return Err(transfer_err(format!(
                 "transfer receiver failed with {status}"
@@ -609,10 +652,16 @@ pub async fn download_file(
     overwrite: bool,
 ) -> Result<TransferResult, ClientError> {
     let start = std::time::Instant::now();
-    let parent = local_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| transfer_err(format!("local target has no parent: {local_path:?}")))?;
+    let parent = match local_path.parent() {
+        // A bare file name lives in the current directory.
+        Some(p) if p.as_os_str().is_empty() => Path::new("."),
+        Some(p) => p,
+        None => {
+            return Err(transfer_err(format!(
+                "local target has no parent: {local_path:?}"
+            )))
+        }
+    };
     if !parent.is_dir() {
         return Err(transfer_err(format!(
             "local parent directory does not exist: {parent:?}"
@@ -642,20 +691,57 @@ pub async fn download_file(
         .map_err(|e| transfer_err(format!("create local temp file: {e}")))?;
 
     let argv = endpoint.transfer_send_argv(remote_path);
-    let mut child = spawn_transfer_child(&argv)
+    let (mut child, stderr) = spawn_transfer_child(&argv)
         .map_err(|e| transfer_err(format!("spawn transfer sender: {e}")))?;
+    let (size, sha256) = with_stderr(
+        receive_from_sender(&mut child, tmp.as_file(), endpoint).await,
+        &stderr,
+    )
+    .await?;
+
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| transfer_err(format!("sync local temp file: {e}")))?;
+    #[cfg(unix)]
+    set_installed_mode(tmp.as_file(), local_path)?;
+    if overwrite {
+        tmp.persist(local_path)
+            .map_err(|e| transfer_err(format!("install local target: {e}")))?;
+    } else {
+        tmp.persist_noclobber(local_path)
+            .map_err(|e| transfer_err(format!("install local target: {e}")))?;
+    }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    client
+        .download_record(remote_path, size, &sha256, duration_ms)
+        .await
+        .map_err(|e| {
+            transfer_err(format!(
+                "download completed and {local_path:?} was installed, \
+                 but recording the operation on the server failed: {e}"
+            ))
+        })
+}
+
+/// Run the sender until the whole file is in `out` and verified. Returns
+/// (size, sha256).
+async fn receive_from_sender(
+    child: &mut tokio::process::Child,
+    out: &std::fs::File,
+    endpoint: &Endpoint,
+) -> Result<(u64, String), ClientError> {
     drop(child.stdin.take());
     let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
 
-    let received =
-        receive_stream(&mut reader, tmp.as_file(), endpoint.uses_base64_transfer()).await;
+    let received = receive_stream(&mut reader, out, endpoint.uses_base64_transfer()).await;
     if received.is_err() {
         // A sender that stalled will never exit on its own, so waiting for it
         // would hang exactly where the stall was supposed to be caught. Killing
         // it first is what turns a detected stall into a returned error.
         let _ = child.kill().await;
     }
-    let status = finish_transfer_child(&mut child, endpoint.uses_base64_transfer()).await?;
+    let status = finish_transfer_child(child, endpoint.uses_base64_transfer()).await?;
     let (size, sha256) = match received {
         Ok(v) => v,
         Err(e) => {
@@ -676,28 +762,21 @@ pub async fn download_file(
             )));
         }
     }
+    Ok((size, sha256))
+}
 
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| transfer_err(format!("sync local temp file: {e}")))?;
-    if overwrite {
-        tmp.persist(local_path)
-            .map_err(|e| transfer_err(format!("install local target: {e}")))?;
-    } else {
-        tmp.persist_noclobber(local_path)
-            .map_err(|e| transfer_err(format!("install local target: {e}")))?;
-    }
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    client
-        .download_record(remote_path, size, &sha256, duration_ms)
-        .await
-        .map_err(|e| {
-            transfer_err(format!(
-                "download completed and {local_path:?} was installed, \
-                 but recording the operation on the server failed: {e}"
-            ))
-        })
+/// Temp files are created 0600. The installed file keeps the mode of the file
+/// it replaces, or gets the conventional 0644 of a new one.
+#[cfg(unix)]
+fn set_installed_mode(tmp: &std::fs::File, local_path: &Path) -> Result<(), ClientError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = match std::fs::metadata(local_path) {
+        Ok(meta) => meta.permissions().mode(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0o644,
+        Err(e) => return Err(transfer_err(format!("stat local target: {e}"))),
+    };
+    tmp.set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|e| transfer_err(format!("set local file mode: {e}")))
 }
 
 /// Read the sender framing (header line, exactly `size` raw bytes, trailer

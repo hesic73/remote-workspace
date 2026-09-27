@@ -1551,6 +1551,11 @@ async fn recovery_drops_when_rename_not_done() {
 #[cfg(unix)]
 async fn read_only_request_log_surfaces_error() {
     use std::os::unix::fs::PermissionsExt;
+    // Permissions do not stop root, so the log would stay writable.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: running as root");
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let log_dir = root.path().join(".remote-workspace");
     std::fs::create_dir_all(&log_dir).unwrap();
@@ -3597,4 +3602,30 @@ async fn a_request_split_across_idle_expiries_is_not_truncated() {
     assert!(saw_read, "the split request never produced its result");
     drop(writer);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
+}
+
+// A request this server cannot parse still gets a reply its sender can match.
+// An op from a newer client used to be answered under "(parse-error)", leaving
+// the caller waiting on its own id until it timed out.
+#[tokio::test]
+async fn unreadable_requests_are_answered_under_their_own_id() {
+    let mut h = harness().await;
+    h.req_tx
+        .send("{\"request_id\":\"future-1\",\"op\":\"teleport\"}\n".into())
+        .unwrap();
+    match h.recv().await {
+        ServerMessage::Error { request_id, error } => {
+            assert_eq!(request_id, "future-1");
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+        }
+        other => panic!("expected an error, got {other:?}"),
+    }
+    // Windows PowerShell can prefix what it writes with a byte order mark.
+    h.req_tx
+        .send("\u{feff}{\"request_id\":\"bom-1\",\"op\":\"stat\",\"path\":\".\"}\n".into())
+        .unwrap();
+    assert!(matches!(
+        h.recv().await,
+        ServerMessage::Result { request_id, .. } if request_id == "bom-1"
+    ));
 }

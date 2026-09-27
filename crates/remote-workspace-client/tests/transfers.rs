@@ -275,7 +275,8 @@ async fn download_missing_source_dir_source_and_missing_parent_fail() {
     let ep = endpoint(remote.path());
     let client = connect(&ep).await;
 
-    // Missing remote source: the sender exits nonzero before any framing.
+    // Missing remote source: the sender exits nonzero before any framing, and
+    // says why on its stderr, which the error must carry.
     let err = download_file(
         &client,
         &ep,
@@ -285,7 +286,10 @@ async fn download_missing_source_dir_source_and_missing_parent_fail() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, ClientError::Transfer(_)));
+    assert!(
+        matches!(&err, ClientError::Transfer(m) if m.contains("cannot stat missing.bin")),
+        "unexpected error: {err:?}"
+    );
 
     // Remote source is a directory.
     std::fs::create_dir(remote.path().join("adir")).unwrap();
@@ -709,4 +713,64 @@ async fn a_receiver_that_stops_reading_is_reported_as_stalled() {
     // The reserved staging file must still be cleaned up via upload_abort.
     assert!(!remote.path().join("u.bin").exists());
     assert!(part_files(remote.path()).is_empty());
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+// Both directions stage into a 0600 temp file. The installed file used to keep
+// that mode, stripping an executable bit on overwrite and making new files
+// unreadable to anyone else.
+#[tokio::test]
+async fn transferred_files_get_conventional_or_preserved_modes() {
+    let remote = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let ep = endpoint(remote.path());
+    let client = connect(&ep).await;
+    let src = local.path().join("run.sh");
+    std::fs::write(&src, "#!/bin/sh\n").unwrap();
+
+    upload_file(&client, &ep, &src, "run.sh", false)
+        .await
+        .unwrap();
+    assert_eq!(mode_of(&remote.path().join("run.sh")), 0o644);
+    set_mode(&remote.path().join("run.sh"), 0o755);
+    upload_file(&client, &ep, &src, "run.sh", true)
+        .await
+        .unwrap();
+    assert_eq!(mode_of(&remote.path().join("run.sh")), 0o755);
+
+    let dest = local.path().join("copy.sh");
+    download_file(&client, &ep, "run.sh", &dest, false)
+        .await
+        .unwrap();
+    assert_eq!(mode_of(&dest), 0o644);
+    set_mode(&dest, 0o700);
+    download_file(&client, &ep, "run.sh", &dest, true)
+        .await
+        .unwrap();
+    assert_eq!(mode_of(&dest), 0o700);
+}
+
+// The sender used to receive the path as a separate argument, where a name
+// starting with `-` was parsed as a flag and every download of it failed.
+#[tokio::test]
+async fn a_path_starting_with_a_dash_downloads() {
+    let remote = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let ep = endpoint(remote.path());
+    let client = connect(&ep).await;
+    std::fs::write(remote.path().join("-v.txt"), "dash").unwrap();
+    let dest = local.path().join("v.txt");
+    download_file(&client, &ep, "-v.txt", &dest, false)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "dash");
 }

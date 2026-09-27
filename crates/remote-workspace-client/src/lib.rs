@@ -72,9 +72,14 @@ pub enum ClientError {
     Serde(#[from] serde_json::Error),
     #[error("transfer failed: {0}")]
     Transfer(String),
+    /// A reply to this request that the client cannot parse, such as a new
+    /// error code from a newer server on the same protocol.
+    #[error("unreadable reply from server: {0}")]
+    UnreadableReply(String),
 }
 
-type DispMap = Arc<Mutex<std::collections::HashMap<RequestId, oneshot::Sender<ServerMessage>>>>;
+type Reply = Result<ServerMessage, ClientError>;
+type DispMap = Arc<Mutex<std::collections::HashMap<RequestId, oneshot::Sender<Reply>>>>;
 
 /// Default deadline for a reply, guarding against a server that stays connected
 /// but never responds. `exec` overrides it with one derived from the
@@ -140,7 +145,7 @@ impl Transport for ArgvTransport {
 
 /// Bounded tail of the transport's stderr, so a closed connection can say what
 /// the far end printed on its way out instead of only that it closed.
-struct StderrTail {
+pub(crate) struct StderrTail {
     lines: Mutex<std::collections::VecDeque<String>>,
     finished: std::sync::atomic::AtomicBool,
     finished_notify: tokio::sync::Notify,
@@ -183,7 +188,7 @@ impl StderrTail {
     /// The tail, after giving the reader a moment to finish. Keeps the last
     /// lines rather than the first: shells on the far end print their own
     /// noise at startup, and what matters is the last thing said.
-    async fn text(&self) -> String {
+    pub(crate) async fn text(&self) -> String {
         if !self.finished.load(std::sync::atomic::Ordering::SeqCst) {
             // Registering before the re-check closes the window where the
             // reader finishes between them; the timeout bounds the rest.
@@ -195,6 +200,31 @@ impl StderrTail {
         let g = self.lines.lock().await;
         g.iter().cloned().collect::<Vec<_>>().join("; ")
     }
+}
+
+/// Collect a child's stderr into a tail. Drained continuously, not on demand:
+/// an unread pipe fills at 64 KiB and blocks the far end mid-write.
+pub(crate) fn drain_stderr(stderr: ChildStderr) -> Arc<StderrTail> {
+    let tail = Arc::new(StderrTail::new());
+    let filling = tail.clone();
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    // Also traced, so nothing the far end says is lost to the
+                    // tail's bound when someone is watching with RUST_LOG.
+                    debug!(line = %line.trim_end(), "transport stderr");
+                    filling.push(&line).await;
+                }
+            }
+        }
+        filling.finish();
+    });
+    tail
 }
 
 fn clip(s: &str, limit: usize) -> String {
@@ -237,34 +267,14 @@ impl Client {
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let closed_notify = Arc::new(tokio::sync::Notify::new());
         let log = log.map(Arc::new);
-        let tail = Arc::new(StderrTail::new());
-
-        match stderr {
-            // Drained continuously, not on demand: an unread pipe fills at
-            // 64 KiB and blocks the far end mid-write.
-            Some(stderr) => {
-                let tail = tail.clone();
-                tokio::spawn(async move {
-                    let mut reader = BufReader::new(stderr);
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        match reader.read_line(&mut line).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {
-                                // Also traced, so nothing the far end says is
-                                // lost to the tail's bound when someone is
-                                // watching with RUST_LOG.
-                                debug!(line = %line.trim_end(), "transport stderr");
-                                tail.push(&line).await;
-                            }
-                        }
-                    }
-                    tail.finish();
-                });
+        let tail = match stderr {
+            Some(stderr) => drain_stderr(stderr),
+            None => {
+                let tail = Arc::new(StderrTail::new());
+                tail.finish();
+                tail
             }
-            None => tail.finish(),
-        }
+        };
 
         let reader_reply = reply_map.clone();
         let drain_reply = reply_map.clone();
@@ -383,7 +393,7 @@ impl Client {
             request_id: request_id.clone(),
             body,
         };
-        let (tx, rx) = oneshot::channel::<ServerMessage>();
+        let (tx, rx) = oneshot::channel::<Reply>();
         self.reply_map.lock().await.insert(request_id.clone(), tx);
         let line = serde_json::to_string(&req)?;
         if let Some(l) = &self.log {
@@ -424,7 +434,7 @@ impl Client {
                 return Err(ClientError::Timeout);
             }
             m = rx => match m {
-                Ok(m) => m,
+                Ok(reply) => reply?,
                 Err(_) => return Err(self.closed_error().await),
             },
         };
@@ -756,6 +766,19 @@ async fn reader_loop(stdout: ChildStdout, reply_map: DispMap, log: Option<Arc<Cl
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, line = trimmed, "could not parse server message");
+                // A reply this client cannot read still names its request, and
+                // failing that request now beats leaving it to its timeout.
+                let rid = serde_json::from_str::<serde_json::Value>(trimmed)
+                    .ok()
+                    .and_then(|v| v.get("request_id")?.as_str().map(str::to_owned));
+                if let Some(rid) = rid {
+                    if let Some(tx) = reply_map.lock().await.remove(&rid) {
+                        let _ = tx.send(Err(ClientError::UnreadableReply(format!(
+                            "{e}: {}",
+                            clip(trimmed, 300)
+                        ))));
+                    }
+                }
                 continue;
             }
         };
@@ -770,7 +793,7 @@ async fn reader_loop(stdout: ChildStdout, reply_map: DispMap, log: Option<Arc<Cl
         debug!(request_id = %rid, "recv");
         let reply_tx = { reply_map.lock().await.remove(&rid) };
         if let Some(tx) = reply_tx {
-            let _ = tx.send(msg);
+            let _ = tx.send(Ok(msg));
         } else {
             warn!(request_id = %rid, "no handler for message");
         }
@@ -809,7 +832,17 @@ fn close_control_stdin(stdin: ChildStdin) -> std::io::Result<()> {
 }
 
 pub fn powershell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    let mut quoted = String::from("'");
+    for c in s.chars() {
+        // PowerShell ends a single-quoted string at any of these, not only `'`,
+        // and takes each one doubled as a literal.
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            quoted.push(c);
+        }
+        quoted.push(c);
+    }
+    quoted.push('\'');
+    quoted
 }
 
 pub(crate) fn windows_command_line_arg(arg: &str) -> String {
@@ -917,6 +950,30 @@ mod quote_tests {
         .expect("graceful close must make the child observe EOF");
     }
 
+    // A newer server on the same protocol can answer with an error code this
+    // client has never heard of. The reply still names its request, so the call
+    // fails at once instead of waiting out its two-minute timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_reply_fails_its_request_immediately() {
+        let reply = r#"read line; id=$(printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'); printf '{"request_id":"%s","code":"FROM_THE_FUTURE","message":"x"}\n' "$id"; cat >/dev/null"#;
+        let client = Client::connect(
+            ArgvTransport {
+                argv: vec!["sh".into(), "-c".into(), reply.into()],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), client.stat("."))
+            .await
+            .expect("the reply must not be left to the request timeout");
+        assert!(
+            matches!(&result, Err(super::ClientError::UnreadableReply(m)) if m.contains("FROM_THE_FUTURE")),
+            "unexpected result: {result:?}"
+        );
+    }
+
     #[test]
     fn quotes_empty_spaces_and_metacharacters() {
         assert_eq!(shell_quote(""), "''");
@@ -925,6 +982,7 @@ mod quote_tests {
         assert_eq!(shell_quote("$(rm -rf /);`x`|&"), "'$(rm -rf /);`x`|&'");
         assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
         assert_eq!(powershell_quote("it's"), "'it''s'");
+        assert_eq!(powershell_quote("Sam’s ‘x’ ‚y‛"), "'Sam’’s ‘‘x’’ ‚‚y‛‛'");
         let command = remote_argv_command(
             RemoteShell::Powershell,
             &["C:\\Program Files\\server.exe".into(), "it's".into()],
@@ -1007,7 +1065,7 @@ mod quote_tests {
         let send = ep.transfer_send_argv("@scratch/big file.bin");
         assert_eq!(
             send[send.len() - 1],
-            "'remote-workspace-server' '--transfer-send' '@scratch/big file.bin' \
+            "'remote-workspace-server' '--transfer-send=@scratch/big file.bin' \
              '--root' '/data/my project' '--state-base' '/data/sicheng/agent state'"
         );
     }
@@ -1034,8 +1092,7 @@ mod quote_tests {
             ep.transfer_send_argv("f.bin"),
             vec![
                 "/bin/remote-workspace-server",
-                "--transfer-send",
-                "f.bin",
+                "--transfer-send=f.bin",
                 "--root",
                 "/ws"
             ]

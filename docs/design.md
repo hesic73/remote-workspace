@@ -222,7 +222,9 @@ A hard-killed or interrupted upload can leave its staging file behind.
 Cleanup is conservative and best-effort: only files matching the exact
 `.remote-workspace-upload.*.part` convention, older than 24 hours by mtime (an
 active upload keeps its mtime fresh), and not registered as in-flight are
-deleted. The sweep runs where staging files accumulate -- the target
+deleted. A registration outlives its server only while its staging file is
+younger than those 24 hours, so an upload whose client died between prepare
+and commit stops counting as in flight at the next server start. The sweep runs where staging files accumulate -- the target
 directory on each `upload_prepare` -- and over the whole workspace and
 scratch trees on `gc`, which reports the count as `removed_stale_staging`.
 Startup deliberately does not walk the tree: a server starts on every
@@ -374,7 +376,9 @@ recovery happens minutes after a drop, far inside any reasonable window.
 
 All file paths resolve inside `--root`; `..`, absolute paths, and symlinks
 escaping the root are rejected (including a non-existent leaf under a
-symlinked parent). This guards against accidents, not adversaries -- `exec`
+symlinked parent). Paths resolve through symlinks inside the root, so
+`delete` refuses a symlink rather than remove the file it points to. This
+guards against accidents, not adversaries -- `exec`
 can still reach anything the remote user can. Real isolation belongs to
 containers or user permissions.
 
@@ -451,7 +455,8 @@ downloads the artifact pinned to *its own* release (never an unpinned
 `latest`), verifies its SHA-256, and caches it under
 `~/.cache/remote-workspace/server/`. The remote host needs no internet access.
 Passing an explicit `--remote-bin` marks the server user-managed: checked for
-compatibility, never installed or overwritten.
+compatibility (the same protocol, whatever its release), never installed or
+overwritten.
 
 Installation is atomic and downgrade-proof. The artifact is uploaded to a
 unique temporary path, and the *uploaded binary installs itself*: it verifies
