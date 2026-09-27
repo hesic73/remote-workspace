@@ -450,8 +450,10 @@ async fn workspace_upgrade(name: Option<&str>, fleet: Option<PathBuf>) -> Result
     };
 
     // Installation belongs to an SSH identity, not a workspace: several
-    // workspaces on one host share a single binary, so each host is done once.
-    let mut done: BTreeSet<String> = BTreeSet::new();
+    // workspaces on one host share a single binary, so each (host, binary) pair
+    // is done once. Keyed by host alone, a workspace with a user-managed binary
+    // would mark its host done and the managed server there would be skipped.
+    let mut done: BTreeSet<(String, String)> = BTreeSet::new();
     let mut failures = 0;
     for (ws_name, ws) in selected {
         let (host, shell, bin) = match &ws.endpoint {
@@ -466,8 +468,8 @@ async fn workspace_upgrade(name: Option<&str>, fleet: Option<PathBuf>) -> Result
                 continue;
             }
         };
-        if !done.insert(host.clone()) {
-            println!("{ws_name}: shares {host}, already handled");
+        if !done.insert((host.clone(), bin.clone())) {
+            println!("{ws_name}: shares {bin} on {host}, already handled");
             continue;
         }
         match upgrade_host(host, shell, bin).await {

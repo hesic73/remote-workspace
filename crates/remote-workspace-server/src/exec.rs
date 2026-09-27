@@ -304,7 +304,17 @@ fn profile_script(setup: &str, argv: &[String]) -> String {
 
 #[cfg(windows)]
 fn powershell_quote(arg: &str) -> String {
-    format!("'{}'", arg.replace('\'', "''"))
+    let mut quoted = String::from("'");
+    for c in arg.chars() {
+        // PowerShell ends a single-quoted string at any of these, not only `'`,
+        // and takes each one doubled as a literal.
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            quoted.push(c);
+        }
+        quoted.push(c);
+    }
+    quoted.push('\'');
+    quoted
 }
 
 #[cfg(windows)]

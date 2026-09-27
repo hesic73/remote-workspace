@@ -3,7 +3,6 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
-#[cfg(windows)]
 fn idle_timeout_exits_even_while_stdin_pipe_remains_open() {
     let workspace = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();

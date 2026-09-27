@@ -245,15 +245,24 @@ impl Server {
                 None => break "stdin_eof",
             };
             idle_since = tokio::time::Instant::now();
-            let trimmed = line.trim();
+            // Windows PowerShell 5.1 can put a UTF-8 byte order mark in front of
+            // what it writes to a child's stdin, and `trim` keeps it.
+            let trimmed = line.trim().trim_start_matches('\u{feff}');
             if trimmed.is_empty() {
                 continue;
             }
             let req = match serde_json::from_str::<Request>(trimmed) {
                 Ok(r) => r,
                 Err(e) => {
+                    // A request this server cannot read -- an op from a newer
+                    // client, say -- usually still names itself, and echoing
+                    // that id is what lets the sender stop waiting for a reply.
+                    let request_id = serde_json::from_str::<serde_json::Value>(trimmed)
+                        .ok()
+                        .and_then(|v| v.get("request_id")?.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "(parse-error)".into());
                     let msg = ServerMessage::Error {
-                        request_id: "(parse-error)".into(),
+                        request_id,
                         error: remote_workspace_protocol::ProtocolError::new(
                             ErrorCode::InvalidRequest,
                             format!("invalid request line: {e}"),

@@ -52,7 +52,14 @@ impl UploadRegistry {
                 ))
             }
         };
-        entries.retain(|_, pending| pending.staging.is_file());
+        // An entry is only worth keeping while its upload could still be
+        // committed. One left by a client that died mid-upload would otherwise
+        // count as in flight forever and shield its staging file from the
+        // stale-staging sweeps.
+        entries.retain(|_, pending| {
+            std::fs::metadata(&pending.staging)
+                .is_ok_and(|meta| meta.is_file() && !is_stale(&meta, STALE_STAGING_MAX_AGE))
+        });
         let registry = Self {
             entries: parking_lot::Mutex::new(entries),
             path,
@@ -244,6 +251,8 @@ pub fn upload_commit(
             ),
         ));
     }
+    #[cfg(unix)]
+    set_installed_mode(&entry)?;
     if entry.overwrite {
         std::fs::rename(&entry.staging, &entry.target)
             .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("rename failed: {e}")))?;
@@ -289,6 +298,20 @@ pub fn upload_commit(
         sha256: sha256.to_string(),
         duration_ms,
     }))
+}
+
+/// Staging files are created 0600. The installed file keeps the mode of the
+/// file it replaces, or gets the one `create` gives a new file.
+#[cfg(unix)]
+fn set_installed_mode(entry: &PendingUpload) -> Result<(), ProtocolError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = match std::fs::metadata(&entry.target) {
+        Ok(meta) => meta.permissions().mode(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => crate::fs_ops::NEW_FILE_MODE,
+        Err(e) => return Err(e.into()),
+    };
+    std::fs::set_permissions(&entry.staging, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("chmod staging file: {e}")))
 }
 
 pub fn upload_abort(
@@ -390,17 +413,21 @@ pub fn sweep_stale_staging_dir(
         if !meta.is_file() {
             continue;
         }
-        let stale = meta
-            .modified()
-            .ok()
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age >= max_age);
-        if stale && std::fs::remove_file(&path).is_ok() {
+        if is_stale(&meta, max_age) && std::fs::remove_file(&path).is_ok() {
             tracing::info!(path = %path.display(), "removed stale upload staging file");
             removed += 1;
         }
     }
     removed
+}
+
+/// Not written for at least `max_age`; an upload in progress keeps its staging
+/// file's mtime fresh with every chunk.
+fn is_stale(meta: &std::fs::Metadata, max_age: std::time::Duration) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .is_some_and(|age| age >= max_age)
 }
 
 /// Recursive sweep over a whole tree (workspace root or scratch root), used by
@@ -607,6 +634,52 @@ mod sweep_tests {
             .unwrap()
             .get("transfer-1")
             .is_none());
+    }
+
+    // A client that dies between prepare and commit never comes back for its
+    // entry. Kept registered, its staging file would count as in flight and
+    // survive every sweep.
+    #[test]
+    fn an_abandoned_upload_is_dropped_from_the_registry_on_reload() {
+        let state = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let abandoned = files.path().join(".remote-workspace-upload.a.1.part");
+        let fresh = files.path().join(".remote-workspace-upload.b.2.part");
+        let registry = UploadRegistry::new(state.path()).unwrap();
+        for (id, staging) in [("old", &abandoned), ("new", &fresh)] {
+            std::fs::write(staging, b"partial").unwrap();
+            registry
+                .insert(
+                    id.into(),
+                    PendingUpload {
+                        staging: staging.clone(),
+                        target: files.path().join(id),
+                        logical_path: id.into(),
+                        overwrite: false,
+                    },
+                )
+                .unwrap();
+        }
+        drop(registry);
+        let two_days_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&abandoned)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+
+        let reloaded = UploadRegistry::new(state.path()).unwrap();
+        assert!(reloaded.get("old").is_none());
+        assert!(reloaded.get("new").is_some());
+        let removed = sweep_stale_staging_dir(
+            files.path(),
+            &in_flight_staging(&reloaded),
+            STALE_STAGING_MAX_AGE,
+        );
+        assert_eq!(removed, 1);
+        assert!(!abandoned.exists());
+        assert!(fresh.exists());
     }
 
     #[test]

@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
         let expect_size = args
             .expect_size
             .ok_or_else(|| anyhow::anyhow!("--transfer-receive requires --expect-size"))?;
-        return finish_transfer(remote_workspace_server::transfer::run_transfer_receive(
+        exit_with(remote_workspace_server::transfer::run_transfer_receive(
             &staging,
             expect_size,
             args.transfer_base64,
@@ -151,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
         let root = args
             .root
             .ok_or_else(|| anyhow::anyhow!("--transfer-send requires --root"))?;
-        return finish_transfer(remote_workspace_server::transfer::run_transfer_send(
+        exit_with(remote_workspace_server::transfer::run_transfer_send(
             &root,
             &base,
             &path,
@@ -175,35 +175,20 @@ async fn main() -> anyhow::Result<()> {
             .then(|| std::time::Duration::from_secs(args.idle_timeout_secs)),
     };
 
-    let result = Server::new(opts)?.run_stdio().await;
-    #[cfg(windows)]
-    // Tokio runtime teardown can retain Windows pipe/runtime worker state after
-    // stdio has completed; framing is flushed before this explicit process exit.
-    match result {
-        Ok(()) => std::process::exit(0),
-        Err(error) => {
-            eprintln!("Error: {error}");
-            std::process::exit(1);
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        result?;
-        Ok(())
-    }
+    exit_with(Server::new(opts)?.run_stdio().await.map_err(Into::into))
 }
 
-fn finish_transfer(result: anyhow::Result<()>) -> anyhow::Result<()> {
-    #[cfg(windows)]
-    // Transfer functions flush their stdout before returning; avoid the same
-    // Windows runtime teardown hang as the control path.
+/// Exit instead of returning from `main`: tokio reads stdin on a blocking thread
+/// nothing can cancel, and dropping the runtime waits for it. After an idle
+/// timeout that read belongs to a client that may never write or close again
+/// (one that lost power), so returning would leave this process and its SSH
+/// session alive, with the client still seeing an open connection.
+fn exit_with(result: anyhow::Result<()>) -> ! {
     match result {
         Ok(()) => std::process::exit(0),
         Err(error) => {
-            eprintln!("Error: {error}");
+            eprintln!("Error: {error:#}");
             std::process::exit(1);
         }
     }
-    #[cfg(not(windows))]
-    result
 }

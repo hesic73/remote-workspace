@@ -492,8 +492,11 @@ fn probe_installed(host: &str, shell: RemoteShell, bin: &str) -> Result<Option<V
 fn version_probe_script(shell: RemoteShell, bin: &str) -> String {
     match shell {
         RemoteShell::Posix => format!(
+            // `command -v` also finds a bare name on PATH, where the server
+            // runs from when a fleet entry names no `bin`; dash reports any
+            // existing path through it, so the result is checked as well.
             "b={q}\n\
-             if [ ! -x \"$b\" ]; then printf '{m}absent\\n'; \
+             if ! p=$(command -v \"$b\" 2>/dev/null) || [ ! -f \"$p\" ] || [ ! -x \"$p\" ]; then printf '{m}absent\\n'; \
              elif v=$(\"$b\" --version-json 2>/dev/null); then printf '{m}ok %s\\n' \"$v\"; \
              else printf '{m}legacy\\n'; fi\n",
             q = shell_quote(bin),
@@ -690,18 +693,18 @@ pub fn check_custom_bin(host: &str, shell: RemoteShell, bin: &str) -> Result<Ver
             format!("custom server {bin:?} is missing or does not support --version-json; it is user-managed and will not be installed"),
         )
     })?;
-    match preflight(Some(&installed), &desired) {
-        Preflight::Connect => Ok(installed),
-        Preflight::ClientTooOld => Err(client_too_old(&installed, &desired)),
-        Preflight::NeedInstall => Err(DeployError::new(
+    // Only the protocol decides compatibility. A user-managed server that is
+    // merely an older release on the same protocol works, and refusing it
+    // would force a rebuild on every client bug-fix release.
+    match installed.protocol_version.cmp(&desired.protocol_version) {
+        std::cmp::Ordering::Equal => Ok(installed),
+        std::cmp::Ordering::Greater => Err(client_too_old(&installed, &desired)),
+        std::cmp::Ordering::Less => Err(DeployError::new(
             "server_probe_failed",
             format!(
-                "custom server {bin:?} is {} (protocol {}), older than this client {} (protocol {}); \
+                "custom server {bin:?} is {} (protocol {}), older than this client's protocol {}; \
                  update your user-managed binary (it will not be overwritten)",
-                installed.software_version,
-                installed.protocol_version,
-                desired.software_version,
-                desired.protocol_version
+                installed.software_version, installed.protocol_version, desired.protocol_version
             ),
         )),
     }

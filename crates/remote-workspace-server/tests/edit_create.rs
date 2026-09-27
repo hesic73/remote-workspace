@@ -800,3 +800,70 @@ async fn racing_claims_write_one_request_line() {
         remote_workspace_protocol::RequestStatus::Error
     );
 }
+
+#[cfg(unix)]
+async fn delete(f: &Fixture, path: &str) -> Result<ResultBody, ProtocolError> {
+    let guard = f.store.write_guard().await;
+    fs_ops::delete(&f.ws, &f.store, &guard, "req-delete", path)
+}
+
+fn stat_hash(f: &Fixture, path: &str) -> Option<String> {
+    match fs_ops::stat(&f.ws, path).unwrap() {
+        ResultBody::Stat { stat } => stat.hash,
+        other => panic!("expected stat result, got {other:?}"),
+    }
+}
+
+// Paths resolve through symlinks, so deleting a link used to remove the file it
+// points to and leave the link dangling.
+#[tokio::test]
+#[cfg(unix)]
+async fn deleting_a_symlink_is_refused_and_leaves_its_target() {
+    let f = fixture();
+    create(&f, "real.txt", "keep me\n").await.unwrap();
+    std::os::unix::fs::symlink("real.txt", f.ws.root.join("link.txt")).unwrap();
+
+    assert_eq!(code(delete(&f, "link.txt").await), ErrorCode::NotAFile);
+    assert_eq!(
+        std::fs::read_to_string(f.ws.root.join("real.txt")).unwrap(),
+        "keep me\n"
+    );
+    assert!(std::fs::symlink_metadata(f.ws.root.join("link.txt"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    // The target itself is still deletable by its own name.
+    delete(&f, "real.txt").await.unwrap();
+}
+
+// Opening a FIFO blocks until a writer appears, and `edit` did that while
+// holding the mutation guard, stalling every later mutation.
+#[tokio::test]
+#[cfg(unix)]
+async fn non_regular_files_are_refused_before_they_are_opened() {
+    let f = fixture();
+    let fifo = std::ffi::CString::new(f.ws.root.join("pipe").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+
+    assert_eq!(
+        code(fs_ops::read(&f.ws, "pipe", None, None)),
+        ErrorCode::NotAFile
+    );
+    assert_eq!(
+        code(edit(&f, "pipe", &hash_of(""), "a", "b", false).await),
+        ErrorCode::NotAFile
+    );
+    assert_eq!(code(delete(&f, "pipe").await), ErrorCode::NotAFile);
+    create(&f, "after.txt", "the guard is free\n")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stat_hashes_only_files_edit_could_accept() {
+    let f = fixture();
+    std::fs::write(f.ws.root.join("small.txt"), "hi").unwrap();
+    std::fs::write(f.ws.root.join("big.log"), vec![b'x'; MAX_TEXT_BYTES + 1]).unwrap();
+    assert_eq!(stat_hash(&f, "small.txt"), Some(hash_of("hi")));
+    assert_eq!(stat_hash(&f, "big.log"), None);
+}
