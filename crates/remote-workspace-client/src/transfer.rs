@@ -349,8 +349,8 @@ fn powershell_ssh_proxy_argv(host: &str, remote: &[String]) -> Vec<String> {
         "-NoLogo".into(),
         "-NoProfile".into(),
         "-NonInteractive".into(),
-        "-EncodedCommand".into(),
-        crate::deploy::powershell_encoded_command(&script),
+        "-Command".into(),
+        script,
     ]
 }
 

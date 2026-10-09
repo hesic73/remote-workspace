@@ -88,7 +88,7 @@ Adding workspace 'robot'
   Remote shell           posix
   Remote platform        linux-x86_64
   Workspace root         valid
-  Server                 installed 0.6.0
+  Server                 installed 0.6.1
   Protocol               3
   Workspace probe        passed
   Fleet configuration    updated

@@ -212,7 +212,11 @@ pub fn upload_prepare(
     }
     Ok(ResultBody::UploadPrepare(UploadPrepareResult {
         transfer_id,
-        staging_path: staging.to_string_lossy().into_owned(),
+        // Passed back on a receiver's command line, where Git's MSYS ssh
+        // collapses the `\\` that starts a `\\?\` path.
+        staging_path: crate::workspace::host_path(&staging)
+            .to_string_lossy()
+            .into_owned(),
     }))
 }
 

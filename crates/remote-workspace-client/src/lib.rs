@@ -1145,7 +1145,7 @@ mod quote_tests {
         let argv = endpoint.control_argv();
         assert_eq!(argv[0], "powershell.exe");
         assert!(argv.contains(&"-NoProfile".to_string()));
-        assert!(argv.contains(&"-EncodedCommand".to_string()));
+        assert!(argv.contains(&"-Command".to_string()));
         let receive = endpoint
             .transfer_receive_argv(r"C:\stage\it's.part", 42)
             .last()

@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
 use remote_workspace_protocol::{
     preflight, InstallOutcome, Preflight, VersionInfo, PROTOCOL_VERSION,
 };
@@ -279,16 +278,10 @@ fn ssh_script(host: &str, shell: RemoteShell, script: &str) -> Result<String> {
     let mut argv = ssh_prefix(host);
     match shell {
         RemoteShell::Posix => argv.extend(["sh".into(), "-s".into()]),
-        RemoteShell::Powershell => {
-            argv.extend([
-                "powershell.exe".into(),
-                "-NoLogo".into(),
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-EncodedCommand".into(),
-                powershell_encoded_command(script),
-            ]);
-        }
+        // The script is the remote command itself, run by the PowerShell that
+        // is the SSH server's default shell. Its profile may print to stdout,
+        // which is why results are located by MARKER.
+        RemoteShell::Powershell => argv.push(script.into()),
     }
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
@@ -325,20 +318,35 @@ fn ssh_script(host: &str, shell: RemoteShell, script: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-pub(crate) fn powershell_encoded_command(script: &str) -> String {
-    let bytes = script
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect::<Vec<_>>();
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
 /// Probe the remote OS, architecture, and home directory in one round trip.
 pub fn probe_platform(host: &str, shell: RemoteShell) -> Result<Platform> {
     let script = platform_script(shell);
     let out = ssh_script(host, shell, &script)
         .map_err(|e| DeployError::new("remote_probe_failed", e.message))?;
-    parse_platform(&out)
+    let platform = parse_platform(&out)?;
+    if shell == RemoteShell::Posix {
+        reject_windows_posix_layer(&platform)?;
+    }
+    Ok(platform)
+}
+
+/// Git for Windows puts an `sh` on PATH, so the POSIX probe can succeed on a
+/// Windows host whose SSH default shell is PowerShell, which would then
+/// receive POSIX-quoted commands.
+fn reject_windows_posix_layer(platform: &Platform) -> Result<()> {
+    if ["msys", "mingw", "cygwin"]
+        .iter()
+        .any(|layer| platform.os.starts_with(layer))
+    {
+        return Err(DeployError::new(
+            "remote_probe_failed",
+            format!(
+                "the POSIX probe ran in a Windows compatibility layer ({}); Windows hosts need PowerShell as the OpenSSH default shell",
+                platform.os
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn platform_script(shell: RemoteShell) -> String {
@@ -769,6 +777,28 @@ mod tests {
     }
 
     #[test]
+    fn posix_probe_inside_windows_compatibility_layers_is_rejected() {
+        for uname in [
+            "MSYS_NT-10.0-26300",
+            "MINGW64_NT-10.0-26300",
+            "CYGWIN_NT-10.0",
+        ] {
+            let platform = Platform {
+                os: normalize_os(uname),
+                arch: "x86_64".into(),
+                home: "/home/robot".into(),
+            };
+            assert!(reject_windows_posix_layer(&platform).is_err(), "{uname}");
+        }
+        let linux = Platform {
+            os: normalize_os("Linux"),
+            arch: "x86_64".into(),
+            home: "/home/robot".into(),
+        };
+        assert!(reject_windows_posix_layer(&linux).is_ok());
+    }
+
+    #[test]
     fn managed_bin_path() {
         let p = Platform {
             os: "linux".into(),
@@ -799,8 +829,8 @@ mod tests {
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
-                "-EncodedCommand",
-                &powershell_encoded_command(script),
+                "-Command",
+                script,
             ])
             .output()
             .unwrap();
