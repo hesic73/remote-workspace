@@ -100,7 +100,9 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
-    fn uses_base64_transfer(&self) -> bool {
+    /// PowerShell SSH endpoints transfer in base64 and serve one control
+    /// request at a time through a client-side proxy.
+    pub fn is_powershell_ssh(&self) -> bool {
         matches!(
             self,
             Endpoint::Ssh {
@@ -290,15 +292,6 @@ fn ssh_argv(host: &str, shell: RemoteShell, remote: &[String]) -> Vec<String> {
     argv
 }
 
-#[cfg(windows)]
-fn powershell_encoded_command(script: &str) -> String {
-    let bytes: Vec<u8> = script
-        .encode_utf16()
-        .flat_map(|unit| unit.to_le_bytes())
-        .collect();
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
 #[cfg(not(windows))]
 fn powershell_ssh_proxy_argv(_host: &str, _remote: &[String]) -> Vec<String> {
     vec![
@@ -357,7 +350,7 @@ fn powershell_ssh_proxy_argv(host: &str, remote: &[String]) -> Vec<String> {
         "-NoProfile".into(),
         "-NonInteractive".into(),
         "-EncodedCommand".into(),
-        powershell_encoded_command(&script),
+        crate::deploy::powershell_encoded_command(&script),
     ]
 }
 
@@ -535,7 +528,7 @@ async fn send_to_receiver(
     let mut file = tokio::fs::File::open(local_path)
         .await
         .map_err(|e| transfer_err(format!("open local source {local_path:?}: {e}")))?;
-    let buf_size = if endpoint.uses_base64_transfer() {
+    let buf_size = if endpoint.is_powershell_ssh() {
         POWERSHELL_TRANSFER_BUF_SIZE
     } else {
         TRANSFER_BUF_SIZE
@@ -555,7 +548,7 @@ async fn send_to_receiver(
             }
             hasher.update(&buf[..n]);
             let encoded;
-            let bytes = if endpoint.uses_base64_transfer() {
+            let bytes = if endpoint.is_powershell_ssh() {
                 encoded = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
                 encoded.as_bytes()
             } else {
@@ -569,7 +562,7 @@ async fn send_to_receiver(
                 started,
             )
             .await?;
-            if endpoint.uses_base64_transfer() {
+            if endpoint.is_powershell_ssh() {
                 transfer_step(
                     child_stdin.write_all(b"\n"),
                     "delimiting the Base64 upload chunk",
@@ -620,7 +613,7 @@ async fn send_to_receiver(
             remote.size, remote.sha256
         )));
     }
-    if let Some(status) = finish_transfer_child(child, endpoint.uses_base64_transfer()).await? {
+    if let Some(status) = finish_transfer_child(child, endpoint.is_powershell_ssh()).await? {
         if !status.success() {
             return Err(transfer_err(format!(
                 "transfer receiver failed with {status}"
@@ -734,14 +727,14 @@ async fn receive_from_sender(
     drop(child.stdin.take());
     let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
 
-    let received = receive_stream(&mut reader, out, endpoint.uses_base64_transfer()).await;
+    let received = receive_stream(&mut reader, out, endpoint.is_powershell_ssh()).await;
     if received.is_err() {
         // A sender that stalled will never exit on its own, so waiting for it
         // would hang exactly where the stall was supposed to be caught. Killing
         // it first is what turns a detected stall into a returned error.
         let _ = child.kill().await;
     }
-    let status = finish_transfer_child(child, endpoint.uses_base64_transfer()).await?;
+    let status = finish_transfer_child(child, endpoint.is_powershell_ssh()).await?;
     let (size, sha256) = match received {
         Ok(v) => v,
         Err(e) => {

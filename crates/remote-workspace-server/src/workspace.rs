@@ -115,6 +115,26 @@ impl Workspace {
     }
 }
 
+/// `path` as programs on the host expect to be given it. On Windows,
+/// `canonicalize` returns `\\?\` paths, which cmd, PowerShell 5.1, and git
+/// reject.
+#[cfg(unix)]
+pub fn host_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(windows)]
+pub fn host_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
 #[cfg(unix)]
 fn validate_platform_path(_path: &Path) -> Result<(), ProtocolError> {
     Ok(())
@@ -343,6 +363,17 @@ mod tests {
             let err = w.resolve(path).unwrap_err();
             assert_eq!(err.code, ErrorCode::InvalidRequest, "accepted {path:?}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_path_drops_verbatim_prefix() {
+        assert_eq!(host_path(Path::new(r"\\?\C:\work")), Path::new(r"C:\work"));
+        assert_eq!(
+            host_path(Path::new(r"\\?\UNC\server\share\x")),
+            Path::new(r"\\server\share\x")
+        );
+        assert_eq!(host_path(Path::new(r"C:\work")), Path::new(r"C:\work"));
     }
 
     #[cfg(windows)]

@@ -426,6 +426,7 @@ impl RemoteWorkspaceServer {
             }
             let transport = remote_workspace_client::ArgvTransport {
                 argv: handle.endpoint.control_argv(),
+                serial: handle.endpoint.is_powershell_ssh(),
             };
             match Client::connect(transport, log.clone()).await {
                 Ok(c) => match c.stat(".").await {

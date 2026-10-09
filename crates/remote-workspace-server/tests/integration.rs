@@ -216,17 +216,36 @@ fn sleep_argv(milliseconds: u64) -> Vec<String> {
 }
 
 #[cfg(unix)]
-fn verbatim_argv(value: &str) -> Vec<String> {
+fn verbatim_argv(_dir: &std::path::Path, value: &str) -> Vec<String> {
     vec!["printf".into(), "%s".into(), value.into()]
 }
 
 #[cfg(windows)]
-fn verbatim_argv(value: &str) -> Vec<String> {
+fn verbatim_argv(dir: &std::path::Path, value: &str) -> Vec<String> {
+    let mut argv = echo_last_arg_argv(dir);
+    argv.push(value.into());
+    argv
+}
+
+/// PowerShell that prints its last command-line argument verbatim. Only a
+/// script file can take an argument: `-Command` treats the rest as code.
+#[cfg(windows)]
+fn echo_last_arg_argv(dir: &std::path::Path) -> Vec<String> {
+    let script = dir.join("echo-last-arg.ps1");
+    std::fs::write(
+        &script,
+        "[Console]::Out.Write([Environment]::GetCommandLineArgs()[-1])",
+    )
+    .unwrap();
     vec![
-        "python".into(),
-        "-c".into(),
-        "import sys; sys.stdout.buffer.write(sys.argv[1].encode())".into(),
-        value.into(),
+        "powershell.exe".into(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-ExecutionPolicy".into(),
+        "Bypass".into(),
+        "-File".into(),
+        script.display().to_string(),
     ]
 }
 
@@ -646,7 +665,8 @@ async fn scratch_is_shared_by_exec_and_file_tools() {
         RequestBody::Exec {
             argv: platform_script(
                 "printf scratch-data > \"$REMOTE_WORKSPACE_SCRATCH/job.log\"",
-                "[System.IO.File]::WriteAllText([System.IO.Path]::Combine($env:REMOTE_WORKSPACE_SCRATCH, 'job.log'), 'scratch-data')",
+                // PowerShell 5.1 cmdlets, like cmd and git, reject `\\?\` paths.
+                "Set-Content -LiteralPath \"$env:REMOTE_WORKSPACE_SCRATCH\\job.log\" -Value scratch-data -NoNewline",
             ),
             cwd: None,
             profile: None,
@@ -2793,7 +2813,7 @@ async fn exec_without_profile_spawns_argv_directly() {
     h.send(&req(
         "e",
         RequestBody::Exec {
-            argv: verbatim_argv(hostile),
+            argv: verbatim_argv(&h.root_path, hostile),
             cwd: None,
             profile: None,
             timeout_ms: Some(10000),
@@ -2850,11 +2870,14 @@ shell = ["echo"]
 setup = ""
 "#;
     #[cfg(windows)]
-    let cfg = r#"
-[profiles.echoer]
-shell = ["python", "-c", "import sys; sys.stdout.write(sys.argv[1])"]
-setup = ""
-"#;
+    let script_dir = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    let cfg_text = format!(
+        "[profiles.echoer]\nshell = {}\nsetup = \"\"\n",
+        toml::Value::from(echo_last_arg_argv(script_dir.path()))
+    );
+    #[cfg(windows)]
+    let cfg = cfg_text.as_str();
     let mut h = harness_with_config(Some(cfg)).await;
     h.send(&req(
         "e",
@@ -2939,6 +2962,48 @@ setup = "$env:MARKER = 'via-override'"
             } => assert_eq!(r.stdout.prefix.trim(), expected),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+}
+
+// The command a Windows profile runs is found the way PowerShell finds it --
+// `.cmd` shims included, on the PATH the setup left -- and starts where the
+// setup's Set-Location left it, as `cd` in a Unix setup would.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_profile_finds_cmd_shims_and_follows_set_location() {
+    let tools = tempfile::tempdir().unwrap();
+    std::fs::write(tools.path().join("shim.cmd"), "@echo shim ran in %CD%\r\n").unwrap();
+    let setup = format!(
+        "$env:PATH = '{};' + $env:PATH; Set-Location sub",
+        tools.path().display()
+    );
+    let cfg = format!(
+        "[profiles.p]\nsetup = {}\n",
+        toml::Value::from(setup.as_str())
+    );
+    let mut h = harness_with_config(Some(&cfg)).await;
+    std::fs::create_dir(h.root_path.join("sub")).unwrap();
+    h.send(&req(
+        "e",
+        RequestBody::Exec {
+            argv: vec!["shim".into()],
+            cwd: None,
+            profile: Some("p".into()),
+            timeout_ms: Some(10000),
+        },
+    ));
+    let msgs = h.recv_all_for("e").await;
+    match &msgs[0] {
+        ServerMessage::Result {
+            result: ResultBody::Exec(r),
+            ..
+        } => {
+            assert_eq!(r.termination, ExecTermination::Exited { code: 0 }, "{r:?}");
+            let line = r.stdout.prefix.trim();
+            assert!(line.starts_with("shim ran in "), "{line:?}");
+            assert!(line.ends_with(r"\sub"), "{line:?}");
+        }
+        other => panic!("unexpected: {other:?}"),
     }
 }
 

@@ -31,6 +31,7 @@ async fn connect(ep: &Endpoint) -> Client {
     Client::connect(
         ArgvTransport {
             argv: ep.control_argv(),
+            serial: false,
         },
         None,
     )

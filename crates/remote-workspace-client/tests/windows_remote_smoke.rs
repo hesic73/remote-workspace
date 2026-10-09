@@ -30,6 +30,7 @@ async fn windows_client_round_trips_binary_over_ssh() {
     let client = Client::connect(
         ArgvTransport {
             argv: endpoint.control_argv_with_idle_timeout(20),
+            serial: endpoint.is_powershell_ssh(),
         },
         None,
     )

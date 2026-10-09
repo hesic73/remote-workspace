@@ -227,6 +227,12 @@ strict: unknown fields, an empty `shell`, or a `default_profile` naming no
 declared profile fail server startup rather than silently running commands in
 the wrong environment.
 
+On a Windows server the default `shell` is Windows PowerShell, and `setup` is
+PowerShell code. The command then starts as its own process: environment
+variables and `Set-Location` from the setup carry over, while functions and
+aliases it defines do not. Bare command names are found as PowerShell finds
+them, so `.cmd` shims such as `npm` work with or without a profile.
+
 ### Server state
 
 Server state (history, idempotency table, scratch) lives **outside

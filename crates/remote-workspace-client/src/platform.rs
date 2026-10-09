@@ -7,7 +7,7 @@ pub(crate) const HOME_ENV: &str = "HOME";
 #[cfg(windows)]
 pub(crate) const HOME_ENV: &str = "USERPROFILE";
 
-pub(crate) fn home_dir(option: &str) -> anyhow::Result<PathBuf> {
+pub fn home_dir(option: &str) -> anyhow::Result<PathBuf> {
     let home = std::env::var_os(HOME_ENV)
         .ok_or_else(|| anyhow::anyhow!("{HOME_ENV} is not set; pass {option}"))?;
     Ok(PathBuf::from(home))

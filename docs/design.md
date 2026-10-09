@@ -54,7 +54,10 @@ fresh child process, so `conda activate` in one command does not leak into the
 next. PowerShell endpoints use a Windows-local proxy that serializes requests
 and starts one short SSH/server process per request. This avoids Windows
 OpenSSH's inability to carry multiple control writes reliably, at the cost of
-an SSH handshake and state reload per call.
+an SSH handshake and state reload per call. The client sends such an endpoint
+one request at a time and holds the next until the previous reply arrives, so a
+request whose deadline passes while it waits is never sent rather than run after
+its caller was told it timed out.
 Environment setup (conda, ROS, ...) is re-applied per command via server-side
 profiles:
 
@@ -453,7 +456,8 @@ The client never builds the server; CI publishes static musl artifacts plus a
 machine-readable `release-manifest.json` and `SHA256SUMS`, and the client
 downloads the artifact pinned to *its own* release (never an unpinned
 `latest`), verifies its SHA-256, and caches it under
-`~/.cache/remote-workspace/server/`. The remote host needs no internet access.
+`~/.cache/remote-workspace/server/` (`%LOCALAPPDATA%\remote-workspace\cache\server` on Windows).
+The remote host needs no internet access.
 Passing an explicit `--remote-bin` marks the server user-managed: checked for
 compatibility (the same protocol, whatever its release), never installed or
 overwritten.

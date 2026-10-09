@@ -117,6 +117,7 @@ pub fn load_fleet(path: &Path) -> anyhow::Result<BTreeMap<String, Workspace>> {
 pub async fn check_workspace(endpoint: &Endpoint) -> Result<(), String> {
     let transport = ArgvTransport {
         argv: endpoint.one_shot_control_argv(),
+        serial: endpoint.is_powershell_ssh(),
     };
     match Client::connect(transport, None).await {
         Err(e) => Err(format!("connect_failed: {e}")),

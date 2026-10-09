@@ -198,14 +198,7 @@ fn main() -> Result<()> {
 }
 
 fn default_log_dir() -> Result<PathBuf> {
-    #[cfg(unix)]
-    const HOME_VAR: &str = "HOME";
-    #[cfg(windows)]
-    const HOME_VAR: &str = "USERPROFILE";
-
-    let home = std::env::var_os(HOME_VAR)
-        .ok_or_else(|| anyhow!("{HOME_VAR} is not set; pass --log-dir"))?;
-    Ok(PathBuf::from(home).join(".remote-workspace/log"))
+    Ok(remote_workspace_client::home_dir("--log-dir")?.join(".remote-workspace/log"))
 }
 
 async fn async_main_real() -> Result<()> {
@@ -271,6 +264,7 @@ async fn async_main_real() -> Result<()> {
 
     let transport = ArgvTransport {
         argv: endpoint.one_shot_control_argv(),
+        serial: endpoint.is_powershell_ssh(),
     };
     let client = Client::connect(transport, log)
         .await

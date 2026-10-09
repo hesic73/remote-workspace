@@ -8,7 +8,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::config::ServerConfig;
-use crate::workspace::Workspace;
+use crate::workspace::{host_path, Workspace};
 
 pub const OUTPUT_PREFIX_LIMIT: usize = 4 * 1024;
 pub const OUTPUT_SUFFIX_LIMIT: usize = 12 * 1024;
@@ -65,7 +65,7 @@ pub async fn exec(
     if !working_dir.is_dir() {
         return Err(ProtocolError::new(
             ErrorCode::NotFound,
-            format!("cwd not found: {}", working_dir.display()),
+            format!("cwd not found: {}", host_path(&working_dir).display()),
         ));
     }
 
@@ -76,7 +76,7 @@ pub async fn exec(
     // so signals reach the real command.
     let mut cmd = match resolved_profile {
         None => {
-            let mut c = Command::new(&argv[0]);
+            let mut c = Command::new(program(&argv[0]));
             c.args(&argv[1..]);
             c
         }
@@ -88,7 +88,7 @@ pub async fn exec(
         }
     };
     cmd.current_dir(&working_dir)
-        .env("REMOTE_WORKSPACE_SCRATCH", &ws.scratch_root)
+        .env("REMOTE_WORKSPACE_SCRATCH", host_path(&ws.scratch_root))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -237,7 +237,7 @@ impl OutputCapture {
 }
 
 fn bounded_lossy(bytes: &[u8], limit: usize) -> String {
-    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    let mut text = decode(bytes);
     if text.len() > limit {
         let mut end = limit;
         while end > 0 && !text.is_char_boundary(end) {
@@ -246,6 +246,79 @@ fn bounded_lossy(bytes: &[u8], limit: usize) -> String {
         text.truncate(end);
     }
     text
+}
+
+#[cfg(unix)]
+fn decode(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Windows programs that do not write UTF-8 write the OEM code page when their
+/// output is piped. A preview is a byte window, so a UTF-8 character cut at
+/// either edge is not evidence against UTF-8.
+#[cfg(windows)]
+fn decode(bytes: &[u8]) -> String {
+    let cut_start = bytes
+        .iter()
+        .take(3)
+        .take_while(|b| (0x80..0xC0).contains(*b))
+        .count();
+    match std::str::from_utf8(&bytes[cut_start..]) {
+        Err(e) if e.error_len().is_some() => decode_oem(bytes),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+#[cfg(windows)]
+fn decode_oem(bytes: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_OEMCP};
+
+    let len = i32::try_from(bytes.len()).expect("preview fits in i32");
+    let units =
+        unsafe { MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    let mut wide = vec![0u16; units as usize];
+    unsafe { MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), units) };
+    String::from_utf16_lossy(&wide)
+}
+
+#[cfg(unix)]
+fn program(name: &str) -> &std::ffi::OsStr {
+    name.as_ref()
+}
+
+/// std's lookup of a bare name finds only `.exe` files, but npm, yarn, and
+/// similar tools are installed as `.cmd` shims. Like cmd, take the first PATH
+/// directory that has the name; std runs a batch file it is handed by path.
+#[cfg(windows)]
+fn program(name: &str) -> std::ffi::OsString {
+    std::env::var_os("PATH")
+        .and_then(|dirs| batch_file_on_path(name, &dirs))
+        .map_or_else(|| name.into(), Into::into)
+}
+
+#[cfg(windows)]
+fn batch_file_on_path(name: &str, dirs: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(name);
+    if path.extension().is_some() || path.components().count() != 1 {
+        return None;
+    }
+    for dir in std::env::split_paths(dirs) {
+        let file = dir.join(name);
+        if ["exe", "com"]
+            .iter()
+            .any(|ext| file.with_extension(ext).is_file())
+        {
+            return None;
+        }
+        if let Some(batch) = ["cmd", "bat"]
+            .iter()
+            .map(|ext| file.with_extension(ext))
+            .find(|candidate| candidate.is_file())
+        {
+            return Some(batch);
+        }
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -294,8 +367,11 @@ fn profile_script(setup: &str, argv: &[String]) -> String {
         .map(|arg| windows_command_line_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
+    // A bare name is looked up with Get-Command, which honors PATHEXT (so
+    // `.cmd` shims are found) and any PATH the setup changed. The working
+    // directory follows a Set-Location in the setup, as `cd` does on Unix.
     let invoke = format!(
-        "try {{ $psi = [System.Diagnostics.ProcessStartInfo]::new(); $psi.FileName = {}; $psi.Arguments = {}; $psi.UseShellExecute = $false; $p = [System.Diagnostics.Process]::Start($psi); $p.WaitForExit(); exit $p.ExitCode }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}",
+        "try {{ $exe = {}; if ($exe -notmatch '[\\\\/]') {{ $exe = (Get-Command -Name $exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }}; $psi = [System.Diagnostics.ProcessStartInfo]::new(); $psi.FileName = $exe; $psi.Arguments = {}; $psi.WorkingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath; $psi.UseShellExecute = $false; $p = [System.Diagnostics.Process]::Start($psi); $p.WaitForExit(); exit $p.ExitCode }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}",
         powershell_quote(executable),
         powershell_quote(&arguments),
     );
@@ -383,5 +459,43 @@ mod tests {
         assert!(output.suffix.is_char_boundary(output.suffix.len()));
         assert!(output.prefix.len() <= OUTPUT_PREFIX_LIMIT);
         assert!(output.suffix.len() <= OUTPUT_SUFFIX_LIMIT);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_that_is_not_utf8_is_decoded_as_oem() {
+        let text = decode(b"caf\x82 ok");
+        assert!(text.starts_with("caf") && text.ends_with(" ok"), "{text:?}");
+        assert!(!text.contains('\u{FFFD}'), "{text:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn utf8_cut_at_the_window_edges_stays_utf8() {
+        let bytes = "éxé".as_bytes();
+        assert_eq!(decode(&bytes[1..bytes.len() - 1]), "\u{FFFD}x\u{FFFD}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bare_names_find_batch_files_unless_an_exe_comes_first() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("shim.cmd"), "").unwrap();
+        std::fs::write(second.path().join("tool.exe"), "").unwrap();
+        std::fs::write(second.path().join("shim.exe"), "").unwrap();
+        std::fs::write(first.path().join("tool.bat"), "").unwrap();
+        std::fs::write(first.path().join("only.bat"), "").unwrap();
+        let dirs = std::env::join_paths([second.path(), first.path()]).unwrap();
+
+        assert_eq!(batch_file_on_path("tool", &dirs), None);
+        assert_eq!(batch_file_on_path("shim", &dirs), None);
+        assert_eq!(
+            batch_file_on_path("only", &dirs),
+            Some(first.path().join("only.bat"))
+        );
+        assert_eq!(batch_file_on_path("only.bat", &dirs), None);
+        assert_eq!(batch_file_on_path(r"sub\only", &dirs), None);
+        assert_eq!(batch_file_on_path("missing", &dirs), None);
     }
 }

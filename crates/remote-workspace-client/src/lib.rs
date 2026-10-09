@@ -52,6 +52,7 @@ pub mod stats;
 mod transfer;
 
 pub use log_writer::ClientLog;
+pub use platform::home_dir;
 pub use transfer::{download_file, upload_file, Endpoint};
 
 #[derive(Debug, Error)]
@@ -79,11 +80,20 @@ pub enum ClientError {
 }
 
 type Reply = Result<ServerMessage, ClientError>;
-type DispMap = Arc<Mutex<std::collections::HashMap<RequestId, oneshot::Sender<Reply>>>>;
+type DispMap = Arc<Mutex<std::collections::HashMap<RequestId, Pending>>>;
+
+struct Pending {
+    tx: oneshot::Sender<Reply>,
+    /// On a serial connection, the right to have a request in flight. Released
+    /// when the reply arrives or the connection closes, not when the caller
+    /// stops waiting: until then the far end is still busy with this request.
+    _slot: Option<tokio::sync::OwnedSemaphorePermit>,
+}
 
 /// Default deadline for a reply, guarding against a server that stays connected
 /// but never responds. `exec` overrides it with one derived from the
-/// server-side `timeout_ms`.
+/// server-side `timeout_ms`. On a serial connection the deadline also covers
+/// waiting for the request's turn.
 const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
@@ -101,6 +111,13 @@ pub struct Spawned {
 /// Spawns the remote process (ssh or local).
 pub trait Transport: Send {
     fn spawn(&mut self) -> std::io::Result<Spawned>;
+
+    /// Whether the far end handles one request at a time, in arrival order.
+    /// The client then sends one at a time, so a request that times out while
+    /// queued is never sent rather than run long after its caller gave up.
+    fn serial(&self) -> bool {
+        false
+    }
 }
 
 /// Default transport: spawns the given argv as a subprocess. For SSH use
@@ -108,9 +125,14 @@ pub trait Transport: Send {
 /// use the local server binary directly.
 pub struct ArgvTransport {
     pub argv: Vec<String>,
+    pub serial: bool,
 }
 
 impl Transport for ArgvTransport {
+    fn serial(&self) -> bool {
+        self.serial
+    }
+
     fn spawn(&mut self) -> std::io::Result<Spawned> {
         let mut cmd = Command::new(&self.argv[0]);
         cmd.args(&self.argv[1..])
@@ -241,6 +263,8 @@ fn clip(s: &str, limit: usize) -> String {
 pub struct Client {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     reply_map: DispMap,
+    /// One permit, present only for serial transports.
+    serial: Option<Arc<tokio::sync::Semaphore>>,
     /// Persistent close flag: once the transport EOFs, this stays true so any
     /// later request on this Client fails immediately instead of hanging.
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -256,6 +280,9 @@ impl Client {
         mut transport: T,
         log: Option<ClientLog>,
     ) -> Result<Self, ClientError> {
+        let serial = transport
+            .serial()
+            .then(|| Arc::new(tokio::sync::Semaphore::new(1)));
         let Spawned {
             mut child,
             stdin,
@@ -301,6 +328,7 @@ impl Client {
         Ok(Self {
             stdin,
             reply_map,
+            serial,
             closed,
             closed_notify,
             stderr: tail,
@@ -388,13 +416,26 @@ impl Client {
         if self.is_closed() {
             return Err(self.closed_error().await);
         }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let slot = match &self.serial {
+            None => None,
+            Some(serial) => {
+                match tokio::time::timeout_at(deadline, serial.clone().acquire_owned()).await {
+                    Ok(permit) => Some(permit.expect("serial semaphore is never closed")),
+                    Err(_) => return Err(ClientError::Timeout),
+                }
+            }
+        };
         let request_id = self.next_request_id();
         let req = Request {
             request_id: request_id.clone(),
             body,
         };
         let (tx, rx) = oneshot::channel::<Reply>();
-        self.reply_map.lock().await.insert(request_id.clone(), tx);
+        self.reply_map
+            .lock()
+            .await
+            .insert(request_id.clone(), Pending { tx, _slot: slot });
         let line = serde_json::to_string(&req)?;
         if let Some(l) = &self.log {
             l.log_request(&request_id, &line).await;
@@ -429,8 +470,12 @@ impl Client {
         let msg = tokio::select! {
             biased;
             () = self.wait_closed() => return Err(self.closed_error().await),
-            () = tokio::time::sleep(timeout) => {
-                self.reply_map.lock().await.remove(&request_id);
+            () = tokio::time::sleep_until(deadline) => {
+                // A serial connection keeps the entry, and with it the slot,
+                // until the late reply or a close arrives.
+                if self.serial.is_none() {
+                    self.reply_map.lock().await.remove(&request_id);
+                }
                 return Err(ClientError::Timeout);
             }
             m = rx => match m {
@@ -772,8 +817,8 @@ async fn reader_loop(stdout: ChildStdout, reply_map: DispMap, log: Option<Arc<Cl
                     .ok()
                     .and_then(|v| v.get("request_id")?.as_str().map(str::to_owned));
                 if let Some(rid) = rid {
-                    if let Some(tx) = reply_map.lock().await.remove(&rid) {
-                        let _ = tx.send(Err(ClientError::UnreadableReply(format!(
+                    if let Some(pending) = reply_map.lock().await.remove(&rid) {
+                        let _ = pending.tx.send(Err(ClientError::UnreadableReply(format!(
                             "{e}: {}",
                             clip(trimmed, 300)
                         ))));
@@ -791,9 +836,9 @@ async fn reader_loop(stdout: ChildStdout, reply_map: DispMap, log: Option<Arc<Cl
             l.log_raw(&rid, trimmed).await;
         }
         debug!(request_id = %rid, "recv");
-        let reply_tx = { reply_map.lock().await.remove(&rid) };
-        if let Some(tx) = reply_tx {
-            let _ = tx.send(Ok(msg));
+        let pending = { reply_map.lock().await.remove(&rid) };
+        if let Some(pending) = pending {
+            let _ = pending.tx.send(Ok(msg));
         } else {
             warn!(request_id = %rid, "no handler for message");
         }
@@ -911,7 +956,7 @@ fn unique_id() -> String {
 mod quote_tests {
     use super::{
         powershell_quote, remote_argv_command, shell_quote, windows_command_line_arg,
-        ArgvTransport, Client, Endpoint, RemoteShell,
+        ArgvTransport, Client, ClientError, Endpoint, RemoteShell, RequestBody,
     };
 
     #[cfg(windows)]
@@ -931,11 +976,75 @@ mod quote_tests {
         vec!["sh".into(), "-c".into(), "cat >/dev/null".into()]
     }
 
+    #[cfg(windows)]
+    fn record_lines_argv(log: &std::path::Path) -> Vec<String> {
+        vec![
+            "powershell.exe".into(),
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!(
+                "while ($null -ne ($line = [Console]::In.ReadLine())) {{ Add-Content -LiteralPath {} -Value $line }}",
+                powershell_quote(&log.display().to_string())
+            ),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    fn record_lines_argv(log: &std::path::Path) -> Vec<String> {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("cat >> {}", shell_quote(&log.display().to_string())),
+        ]
+    }
+
+    // On a serial connection, a request that times out waiting behind one the
+    // far end has not answered is never sent: sending it later would run it
+    // after its caller was told it failed.
+    #[tokio::test]
+    async fn a_serial_request_that_times_out_in_the_queue_is_never_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("received.jsonl");
+        let client = Client::connect(
+            ArgvTransport {
+                argv: record_lines_argv(&log),
+                serial: true,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let short = std::time::Duration::from_millis(300);
+        for _ in 0..2 {
+            let result = client
+                .send_request_with_timeout(RequestBody::Stat { path: ".".into() }, short)
+                .await;
+            assert!(matches!(result, Err(ClientError::Timeout)), "{result:?}");
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::fs::read_to_string(&log).unwrap_or_default().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first request never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+        client
+            .close_with_grace(std::time::Duration::from_secs(5))
+            .await;
+    }
+
     #[tokio::test]
     async fn graceful_close_delivers_real_stdin_eof() {
         let client = Client::connect(
             ArgvTransport {
                 argv: exits_on_stdin_eof_argv(),
+                serial: false,
             },
             None,
         )
@@ -960,6 +1069,7 @@ mod quote_tests {
         let client = Client::connect(
             ArgvTransport {
                 argv: vec!["sh".into(), "-c".into(), reply.into()],
+                serial: false,
             },
             None,
         )

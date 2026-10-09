@@ -242,23 +242,34 @@ fn resolve_artifact(client_version: &str, os: &str, arch: &str) -> Result<Cached
     })
 }
 
+#[cfg(unix)]
 fn cache_dir() -> Result<PathBuf> {
     if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
         return Ok(PathBuf::from(x).join("remote-workspace").join("server"));
     }
-    let home = std::env::var_os(crate::platform::HOME_ENV).ok_or_else(|| {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
         DeployError::new(
             "artifact_cache_failed",
-            format!(
-                "{} is not set; set XDG_CACHE_HOME or {} to locate the artifact cache",
-                crate::platform::HOME_ENV,
-                crate::platform::HOME_ENV
-            ),
+            "HOME is not set; set XDG_CACHE_HOME or HOME to locate the artifact cache",
         )
     })?;
     Ok(PathBuf::from(home)
         .join(".cache")
         .join("remote-workspace")
+        .join("server"))
+}
+
+#[cfg(windows)]
+fn cache_dir() -> Result<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+        DeployError::new(
+            "artifact_cache_failed",
+            "LOCALAPPDATA is not set; it locates the artifact cache",
+        )
+    })?;
+    Ok(PathBuf::from(local)
+        .join("remote-workspace")
+        .join("cache")
         .join("server"))
 }
 
@@ -314,7 +325,7 @@ fn ssh_script(host: &str, shell: RemoteShell, script: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn powershell_encoded_command(script: &str) -> String {
+pub(crate) fn powershell_encoded_command(script: &str) -> String {
     let bytes = script
         .encode_utf16()
         .flat_map(u16::to_le_bytes)

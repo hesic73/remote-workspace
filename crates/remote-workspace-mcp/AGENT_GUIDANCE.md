@@ -15,7 +15,7 @@ The normal workflow:
 7. Use `upload_file`/`download_file` for large or binary files; their content never enters the model context. Never move binary data through `create_file`, base64, shell quoting, or paginated `read_file`.
 8. Never automatically retry `run_command` after an uncertain transport failure, because the command may already have produced side effects.
 
-Normal relative paths address the workspace. Paths beginning with `@scratch/` address the workspace's server-managed scratch area; commands receive its physical path in `$REMOTE_WORKSPACE_SCRATCH`.
+Normal relative paths address the workspace. Paths beginning with `@scratch/` address the workspace's server-managed scratch area; commands receive its physical path in the `REMOTE_WORKSPACE_SCRATCH` environment variable (`$REMOTE_WORKSPACE_SCRATCH` in POSIX shells, `$env:REMOTE_WORKSPACE_SCRATCH` in PowerShell, `%REMOTE_WORKSPACE_SCRATCH%` in cmd).
 
 Scratch is transient and shared by every session using that workspace. It is the right place for your own working material -- analysis scripts you wrote, intermediate output, command logs -- which would otherwise clutter the user's project. It is not storage: files idle for a week are deleted without warning. Anything meant to last belongs in the workspace, or on the local machine via `download_file`. Do not park results there -- trained weights, recordings, datasets -- and do not treat a file you left in scratch last week as still being there.
 
