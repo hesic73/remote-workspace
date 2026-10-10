@@ -466,6 +466,62 @@ async fn a_marker_left_by_a_crash_is_recovered_as_a_commit() {
     );
 }
 
+// A marker kept because the sync after its rename failed is followed, in the
+// same session, by an edit that starts from the content it installed and moves
+// the file on. Recovery must still see that the first edit landed, though the
+// file no longer holds what it wrote.
+#[tokio::test]
+async fn a_marker_superseded_by_a_later_commit_is_recovered_as_a_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let state = root.join("state");
+    std::fs::write(root.join("f.txt"), "v3\n").unwrap();
+
+    let first = {
+        let store = OperationStore::new(state.clone()).unwrap();
+        let first = store
+            .prepare_fs_record(
+                "req-1",
+                OperationKind::Edit,
+                "f.txt",
+                Some(hash_of("v1\n")),
+                hash_of("v2\n"),
+            )
+            .unwrap();
+        let second = store
+            .prepare_fs_record(
+                "req-2",
+                OperationKind::Edit,
+                "f.txt",
+                Some(hash_of("v2\n")),
+                hash_of("v3\n"),
+            )
+            .unwrap();
+        store
+            .commit_fs_record(
+                &second,
+                "req-2",
+                OperationKind::Edit,
+                "f.txt",
+                Some(hash_of("v2\n")),
+                hash_of("v3\n"),
+            )
+            .unwrap();
+        first
+    };
+
+    let ws = Workspace::new(root, dir.path().join("scratch")).unwrap();
+    let store = OperationStore::new(state).unwrap();
+    store.recover(&ws).unwrap();
+    assert!(
+        store
+            .history(None)
+            .iter()
+            .any(|r| r.operation_id() == first),
+        "an edit that landed was dropped from history"
+    );
+}
+
 // `gc` rewrites the operation log from the in-memory table, so anything missing
 // there is erased. A prepared marker is not history but pending state -- the
 // only thing that lets the next start work out what became of a mutation whose

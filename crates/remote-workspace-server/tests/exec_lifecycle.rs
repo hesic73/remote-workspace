@@ -170,3 +170,43 @@ async fn clean_exit_does_not_pay_the_drain_grace() {
         "clean exit must not wait out the drain grace period"
     );
 }
+
+// An exec abandoned mid-run -- its task aborted at server shutdown -- must
+// take its descendants with it, not only the direct child.
+#[tokio::test]
+async fn dropping_a_running_exec_kills_its_process_tree() {
+    let (d, w) = ws();
+    let pid_file = d.path().join("pid");
+    let script = format!(
+        "sleep 30 >/dev/null 2>&1 & echo $! > {}; sleep 30",
+        pid_file.display()
+    );
+    let argv = vec!["bash".to_string(), "-c".to_string(), script];
+    let config = ServerConfig::default();
+    let running = exec::exec(
+        &w,
+        &config,
+        None,
+        None,
+        &argv,
+        Some(60_000),
+        "op-test".into(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid = tokio::select! {
+        _ = running => panic!("exec finished before it was dropped"),
+        pid = async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                {
+                    return pid;
+                }
+                assert!(Instant::now() < deadline, "descendant never started");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        } => pid,
+    };
+    assert_process_gone(pid);
+}

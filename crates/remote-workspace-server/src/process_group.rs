@@ -1,8 +1,12 @@
 use tokio::process::{Child, Command};
 
+/// Kills the command's whole process tree when dropped, unless `release`d
+/// first. An `exec` whose task is aborted (server shutdown) is dropped
+/// mid-run, and `kill_on_drop` alone reaches only the direct child.
 #[cfg(unix)]
 pub(crate) struct ProcessGroup {
     pid: Option<u32>,
+    armed: bool,
 }
 
 #[cfg(unix)]
@@ -19,7 +23,10 @@ impl ProcessGroup {
     }
 
     pub(crate) fn attach(child: &mut Child) -> std::io::Result<Self> {
-        Ok(Self { pid: child.id() })
+        Ok(Self {
+            pid: child.id(),
+            armed: true,
+        })
     }
 
     pub(crate) fn kill(&self) {
@@ -34,6 +41,7 @@ impl ProcessGroup {
 #[cfg(windows)]
 pub(crate) struct ProcessGroup {
     job: usize,
+    armed: bool,
 }
 
 #[cfg(windows)]
@@ -65,7 +73,10 @@ impl ProcessGroup {
             unsafe { CloseHandle(job) };
             return Err(error);
         }
-        Ok(Self { job: job as usize })
+        Ok(Self {
+            job: job as usize,
+            armed: true,
+        })
     }
 
     pub(crate) fn kill(&self) {
@@ -78,13 +89,26 @@ impl ProcessGroup {
     }
 }
 
-#[cfg(windows)]
+impl ProcessGroup {
+    /// For a command that ran to completion: what it left running by then
+    /// redirected its output away (the nohup pattern) and is meant to outlive it.
+    pub(crate) fn release(mut self) {
+        self.armed = false;
+    }
+}
+
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        if self.armed {
+            self.kill();
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 
-        unsafe {
-            CloseHandle(self.job as HANDLE);
+            unsafe {
+                CloseHandle(self.job as HANDLE);
+            }
         }
     }
 }

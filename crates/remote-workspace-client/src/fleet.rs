@@ -263,6 +263,18 @@ fn parse_document(text: &str) -> Result<toml_edit::DocumentMut, DeployError> {
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), DeployError> {
     use std::io::Write;
+    // A fleet file kept as a symlink (a dotfiles checkout) is written where it
+    // points: renaming over the link would replace it with a detached copy.
+    let path = &match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(e) => {
+            return Err(DeployError::new(
+                "fleet_write_failed",
+                format!("resolve {path:?}: {e}"),
+            ))
+        }
+    };
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(".workspaces.toml.tmp-{}", std::process::id()));
     let write = || -> std::io::Result<()> {
@@ -270,10 +282,10 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), DeployError> {
         f.write_all(contents.as_bytes())?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
-        // fsync the directory so the rename itself is durable.
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
+        // fsync the directory so the rename itself is durable. Windows cannot
+        // open a directory as a file to flush it.
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     };
     write().map_err(|e| {
@@ -461,6 +473,21 @@ mod tests {
                     [workspaces.b]\nhost = \"same\"\nroot = \"C:\\\\b\"\nremote_shell = \"powershell\"\n";
         let error = parse_fleet(text).err().unwrap();
         assert!(error.to_string().contains("conflicting remote_shell"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_fleet_file_is_written_through_the_link() {
+        let dotfiles = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = dotfiles.path().join("workspaces.toml");
+        std::fs::write(&target, "").unwrap();
+        let link = home.path().join("workspaces.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_atomic(&link, "[workspaces]\n").unwrap();
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "[workspaces]\n");
     }
 
     #[cfg(windows)]

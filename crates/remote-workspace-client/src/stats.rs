@@ -30,8 +30,8 @@ fn display_name(op: &str) -> Option<&str> {
         "exec" => "run_command",
         "upload_prepare" => "upload_file",
         "download_record" => "download_file",
-        // The second step of an upload already counted at its prepare, not a
-        // separate call the agent chose to make.
+        // Steps of an upload already counted at its prepare, not separate
+        // calls the agent chose to make.
         "upload_commit" | "upload_abort" => return None,
         other => other,
     })
@@ -88,6 +88,11 @@ impl Stats {
                     let Some(op) = body["op"].as_str() else {
                         continue;
                     };
+                    // Not a call of its own, but its failure is the upload's.
+                    if op == "upload_commit" {
+                        pending.insert(request_id, "upload_file".into());
+                        continue;
+                    }
                     let Some(name) = display_name(op) else {
                         continue;
                     };
@@ -208,6 +213,11 @@ mod tests {
             log_line("response", "r4", "upload_prepare", false),
             log_line("request", "r5", "upload_commit", false),
             log_line("response", "r5", "upload_commit", false),
+            // ...but a commit that fails is a failed upload.
+            log_line("request", "r6", "upload_prepare", false),
+            log_line("response", "r6", "upload_prepare", false),
+            log_line("request", "r7", "upload_commit", false),
+            log_line("response", "r7", "upload_commit", true),
         ];
         std::fs::write(dir.path().join("ws.jsonl"), lines.join("\n")).unwrap();
 
@@ -216,9 +226,10 @@ mod tests {
         assert_eq!(stats.per_tool["run_command"].errors, 0);
         assert_eq!(stats.per_tool["read_file"].calls, 1);
         assert_eq!(stats.per_tool["read_file"].errors, 1);
-        assert_eq!(stats.per_tool["upload_file"].calls, 1);
+        assert_eq!(stats.per_tool["upload_file"].calls, 2);
+        assert_eq!(stats.per_tool["upload_file"].errors, 1);
         assert!(!stats.per_tool.contains_key("upload_commit"));
-        assert_eq!(stats.per_workspace["ws"].calls, 4);
+        assert_eq!(stats.per_workspace["ws"].calls, 5);
 
         let text = stats.render();
         assert!(text.contains("run_command"), "{text}");

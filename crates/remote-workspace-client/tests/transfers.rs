@@ -1,9 +1,10 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use remote_workspace_client::{
-    download_file, upload_file, ArgvTransport, Client, ClientError, Endpoint,
+    download_file, upload_file, ArgvTransport, Client, ClientError, Control, Endpoint,
 };
 use remote_workspace_protocol::{AnyOperationRecord, ErrorCode, TransferDirection};
 
@@ -26,17 +27,19 @@ fn endpoint(root: &Path) -> Endpoint {
     }
 }
 
-async fn connect(ep: &Endpoint) -> Client {
+async fn connect(ep: &Endpoint) -> Arc<Client> {
     assert!(server_bin().exists(), "build remote-workspace-server first");
-    Client::connect(
-        ArgvTransport {
-            argv: ep.control_argv(),
-            serial: false,
-        },
-        None,
+    Arc::new(
+        Client::connect(
+            ArgvTransport {
+                argv: ep.control_argv(),
+                serial: false,
+            },
+            None,
+        )
+        .await
+        .expect("connect"),
     )
-    .await
-    .expect("connect")
 }
 
 fn part_files(dir: &Path) -> Vec<PathBuf> {
@@ -112,6 +115,86 @@ async fn upload_download_small_text_roundtrip() {
     assert_eq!(std::fs::read(&dest).unwrap(), content);
     assert!(part_files(local.path()).is_empty());
     assert!(part_files(remote.path()).is_empty());
+}
+
+/// A new server for every control step, as when the one that took the
+/// prepare has exited on its idle timeout while the bytes were moving.
+struct FreshEachTime(Endpoint);
+
+impl Control for FreshEachTime {
+    async fn client(&self) -> Result<Arc<Client>, ClientError> {
+        Ok(connect(&self.0).await)
+    }
+}
+
+#[tokio::test]
+async fn control_steps_after_the_stream_run_on_a_new_connection() {
+    let remote = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let ep = endpoint(remote.path());
+    let control = FreshEachTime(ep.clone());
+
+    let src = local.path().join("src.txt");
+    std::fs::write(&src, b"outlived\n").unwrap();
+    upload_file(&control, &ep, &src, "data.txt", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(remote.path().join("data.txt")).unwrap(),
+        b"outlived\n"
+    );
+
+    let dest = local.path().join("back.txt");
+    download_file(&control, &ep, "data.txt", &dest, false)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"outlived\n");
+}
+
+// A shell startup file that prints on every session (an `echo` in .bashrc)
+// puts its text ahead of what the transfer process writes.
+#[tokio::test]
+async fn transfers_skip_what_the_remote_shell_prints_first() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let remote = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let wrapper = local.path().join("chatty-server");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\necho 'Welcome to the build box'\nexec '{}' \"$@\"\n",
+            server_bin().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ep = match endpoint(remote.path()) {
+        Endpoint::Local {
+            root,
+            state_base,
+            config,
+            ..
+        } => Endpoint::Local {
+            server_bin: wrapper.to_string_lossy().into_owned(),
+            root,
+            state_base,
+            config,
+        },
+        other => panic!("unexpected endpoint {other:?}"),
+    };
+    let client = connect(&ep).await;
+
+    let src = local.path().join("src.txt");
+    std::fs::write(&src, b"through the noise\n").unwrap();
+    upload_file(&client, &ep, &src, "data.txt", false)
+        .await
+        .unwrap();
+    let dest = local.path().join("back.txt");
+    download_file(&client, &ep, "data.txt", &dest, false)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"through the noise\n");
 }
 
 #[tokio::test]

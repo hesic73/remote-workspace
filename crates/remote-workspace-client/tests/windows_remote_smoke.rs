@@ -27,15 +27,17 @@ async fn windows_client_round_trips_binary_over_ssh() {
         state_base: None,
         config: None,
     };
-    let client = Client::connect(
-        ArgvTransport {
-            argv: endpoint.control_argv_with_idle_timeout(20),
-            serial: endpoint.is_powershell_ssh(),
-        },
-        None,
-    )
-    .await
-    .unwrap();
+    let client = std::sync::Arc::new(
+        Client::connect(
+            ArgvTransport {
+                argv: endpoint.control_argv_with_idle_timeout(20),
+                serial: endpoint.is_powershell_ssh(),
+            },
+            None,
+        )
+        .await
+        .unwrap(),
+    );
 
     let local_dir = tempfile::tempdir().unwrap();
     let source = local_dir.path().join("source.bin");
@@ -56,7 +58,8 @@ async fn windows_client_round_trips_binary_over_ssh() {
     assert_eq!(upload.size, download.size);
 
     client.delete(&remote_path).await.unwrap();
-    client
+    std::sync::Arc::into_inner(client)
+        .expect("transfers are done with the client")
         .close_with_grace(std::time::Duration::from_secs(2))
         .await;
 }

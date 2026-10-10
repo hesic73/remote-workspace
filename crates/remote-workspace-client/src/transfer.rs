@@ -267,13 +267,17 @@ impl Endpoint {
 
 /// `ssh` plus this client's connection policy, up to and including the host:
 /// the single place those options are chosen. BatchMode fails fast instead of
-/// hanging on an auth prompt; ServerAlive keeps NAT'd / idle-pruning
-/// connections open across long sessions.
+/// hanging on an auth prompt; ConnectTimeout does the same for a host that
+/// drops packets, which would otherwise hold a call for minutes per attempt;
+/// ServerAlive keeps NAT'd / idle-pruning connections open across long
+/// sessions.
 pub(crate) fn ssh_prefix(host: &str) -> Vec<String> {
     vec![
         "ssh".into(),
         "-o".into(),
         "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=30".into(),
         "-o".into(),
         "ServerAliveInterval=30".into(),
         "-o".into(),
@@ -457,11 +461,27 @@ fn close_transfer_stdin(stdin: tokio::process::ChildStdin) -> std::io::Result<()
     Ok(())
 }
 
+/// Supplies the control connection for a transfer's control steps. A
+/// transfer can outlast the connection it started on: its bytes move through
+/// a separate process, and the resident server exits after its idle timeout
+/// while they do. So the step after the stream asks for a connection again.
+pub trait Control: Sync {
+    fn client(&self) -> impl std::future::Future<Output = Result<Arc<Client>, ClientError>> + Send;
+}
+
+/// One fixed connection, for a caller whose server has no idle timeout to
+/// outlast.
+impl Control for Arc<Client> {
+    async fn client(&self) -> Result<Arc<Client>, ClientError> {
+        Ok(self.clone())
+    }
+}
+
 /// Upload a local file to `remote_path` (workspace-relative or `@scratch/...`)
 /// by streaming raw bytes through a dedicated receiver process, then
 /// atomically installing on the remote.
 pub async fn upload_file(
-    client: &Client,
+    control: &impl Control,
     endpoint: &Endpoint,
     local_path: &Path,
     remote_path: &str,
@@ -478,23 +498,31 @@ pub async fn upload_file(
     }
     let size = meta.len();
 
-    let prep = client.upload_prepare(remote_path, overwrite).await?;
+    let prep = control
+        .client()
+        .await?
+        .upload_prepare(remote_path, overwrite)
+        .await?;
 
     // From here on every failure must abort the prepared upload so the remote
     // staging file is cleaned up.
     let streamed = stream_to_receiver(endpoint, local_path, size, &prep.staging_path).await;
     let sha256 = match streamed {
         Ok(sha256) => sha256,
-        Err(e) => return Err(abort_after(client, &prep.transfer_id, e).await),
+        Err(e) => return Err(abort_after(control, &prep.transfer_id, e).await),
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
+    let client = match control.client().await {
+        Ok(client) => client,
+        Err(e) => return Err(abort_after(control, &prep.transfer_id, e).await),
+    };
     match client
         .upload_commit(&prep.transfer_id, size, &sha256, duration_ms)
         .await
     {
         Ok(result) => Ok(result),
-        Err(e) => Err(abort_after(client, &prep.transfer_id, e).await),
+        Err(e) => Err(abort_after(control, &prep.transfer_id, e).await),
     }
 }
 
@@ -604,8 +632,14 @@ async fn send_to_receiver(
         started,
     )
     .await?;
-    let remote: ReceiveMetadata = serde_json::from_str(out.trim())
-        .map_err(|e| transfer_err(format!("invalid receiver metadata {out:?}: {e}")))?;
+    // Lines before it that are not JSON objects come from the remote shell's
+    // startup files, as on the control plane.
+    let metadata = out
+        .lines()
+        .rfind(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| transfer_err(format!("receiver reported no metadata: {out:?}")))?;
+    let remote: ReceiveMetadata = serde_json::from_str(metadata.trim())
+        .map_err(|e| transfer_err(format!("invalid receiver metadata {metadata:?}: {e}")))?;
     let local_sha = format!("sha256:{}", hex::encode(hasher.finalize()));
     if remote.size != size || remote.sha256 != local_sha {
         return Err(transfer_err(format!(
@@ -625,8 +659,12 @@ async fn send_to_receiver(
 
 /// Abort the prepared upload after `err`. The original error stays primary; a
 /// failed abort is appended rather than swallowed.
-async fn abort_after(client: &Client, transfer_id: &str, err: ClientError) -> ClientError {
-    match client.upload_abort(transfer_id).await {
+async fn abort_after(control: &impl Control, transfer_id: &str, err: ClientError) -> ClientError {
+    let aborted = match control.client().await {
+        Ok(client) => client.upload_abort(transfer_id).await,
+        Err(e) => Err(e),
+    };
+    match aborted {
         Ok(()) => err,
         Err(abort_err) => transfer_err(format!(
             "{err}; additionally, cleaning up the staged upload failed: {abort_err}"
@@ -638,7 +676,7 @@ async fn abort_after(client: &Client, transfer_id: &str, err: ClientError) -> Cl
 /// file by streaming raw bytes from a dedicated sender process, verifying
 /// size and SHA-256, then atomically installing at `local_path`.
 pub async fn download_file(
-    client: &Client,
+    control: &impl Control,
     endpoint: &Endpoint,
     remote_path: &str,
     local_path: &Path,
@@ -706,15 +744,20 @@ pub async fn download_file(
     }
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    client
-        .download_record(remote_path, size, &sha256, duration_ms)
-        .await
-        .map_err(|e| {
-            transfer_err(format!(
-                "download completed and {local_path:?} was installed, \
+    let recorded = match control.client().await {
+        Ok(client) => {
+            client
+                .download_record(remote_path, size, &sha256, duration_ms)
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    recorded.map_err(|e| {
+        transfer_err(format!(
+            "download completed and {local_path:?} was installed, \
                  but recording the operation on the server failed: {e}"
-            ))
-        })
+        ))
+    })
 }
 
 /// Run the sender until the whole file is in `out` and verified. Returns
@@ -727,27 +770,30 @@ async fn receive_from_sender(
     drop(child.stdin.take());
     let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
 
-    let received = receive_stream(&mut reader, out, endpoint.is_powershell_ssh()).await;
-    if received.is_err() {
-        // A sender that stalled will never exit on its own, so waiting for it
-        // would hang exactly where the stall was supposed to be caught. Killing
-        // it first is what turns a detected stall into a returned error.
-        let _ = child.kill().await;
-    }
-    let status = finish_transfer_child(child, endpoint.is_powershell_ssh()).await?;
-    let (size, sha256) = match received {
+    let (size, sha256) = match receive_stream(&mut reader, out, endpoint.is_powershell_ssh()).await
+    {
         Ok(v) => v,
         Err(e) => {
-            return Err(if status.as_ref().is_none_or(|status| status.success()) {
-                e
-            } else {
-                transfer_err(format!(
-                    "transfer sender failed with {}: {e}",
-                    status.unwrap()
-                ))
-            })
+            // A sender that stalled will never exit on its own, so waiting for
+            // it would hang exactly where the stall was supposed to be caught.
+            // Killing it first is what turns a detected stall into a returned
+            // error. Only a sender that had already exited is blamed: the
+            // status of one killed here says nothing about the remote.
+            let exited = child
+                .try_wait()
+                .map_err(|wait| transfer_err(format!("check transfer sender: {wait}; {e}")))?;
+            if exited.is_none() {
+                let _ = child.kill().await;
+            }
+            return Err(match exited {
+                Some(status) if !status.success() => {
+                    transfer_err(format!("transfer sender failed with {status}: {e}"))
+                }
+                _ => e,
+            });
         }
     };
+    let status = finish_transfer_child(child, endpoint.is_powershell_ssh()).await?;
     if let Some(status) = status {
         if !status.success() {
             return Err(transfer_err(format!(
@@ -782,17 +828,22 @@ async fn receive_stream(
     use std::io::Write;
 
     let started = std::time::Instant::now();
+    // Lines before the header that are not JSON objects come from the remote
+    // shell's startup files, as on the control plane.
     let mut header = String::new();
-    transfer_step(
-        reader.read_line(&mut header),
-        "waiting for the sender's header",
-        0,
-        0,
-        started,
-    )
-    .await?;
-    if header.trim().is_empty() {
-        return Err(transfer_err("sender produced no header"));
+    while !header.trim_start().starts_with('{') {
+        header.clear();
+        let n = transfer_step(
+            reader.read_line(&mut header),
+            "waiting for the sender's header",
+            0,
+            0,
+            started,
+        )
+        .await?;
+        if n == 0 {
+            return Err(transfer_err("sender produced no header"));
+        }
     }
     let header: SendHeader = serde_json::from_str(header.trim())
         .map_err(|e| transfer_err(format!("invalid sender header {header:?}: {e}")))?;

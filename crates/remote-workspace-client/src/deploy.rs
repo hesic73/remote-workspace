@@ -10,7 +10,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::transfer::ssh_prefix;
-use crate::{powershell_quote, shell_quote, RemoteShell};
+use crate::{powershell_quote, shell_quote, Endpoint, RemoteShell};
 
 const DEFAULT_RELEASE_REPO: &str = "https://github.com/hesic73/remote-workspace/releases/download";
 const RELEASE_BASE_ENV: &str = "REMOTE_WORKSPACE_RELEASE_BASE";
@@ -588,12 +588,10 @@ fn upload_and_install(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| DeployError::new("ssh_connect_failed", format!("spawn ssh upload: {e}")))?;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&bytes)
-        .map_err(|e| DeployError::new("remote_install_failed", format!("stream artifact: {e}")))?;
+    // A remote command that fails (mkdir denied, disk full) exits and breaks
+    // the pipe; why it failed is on its stderr, so collect that before
+    // reporting the write error, which only says the pipe broke.
+    let streamed = child.stdin.take().unwrap().write_all(&bytes);
     let up = child
         .wait_with_output()
         .map_err(|e| DeployError::new("remote_install_failed", format!("upload wait: {e}")))?;
@@ -601,11 +599,14 @@ fn upload_and_install(
         return Err(DeployError::new(
             "remote_install_failed",
             format!(
-                "upload failed: {}",
+                "upload failed ({}): {}",
+                up.status,
                 String::from_utf8_lossy(&up.stderr).trim()
             ),
         ));
     }
+    streamed
+        .map_err(|e| DeployError::new("remote_install_failed", format!("stream artifact: {e}")))?;
 
     // Confirm the uploaded binary runs on the remote arch and reports the
     // expected version before we let it install itself.
@@ -729,6 +730,79 @@ pub fn check_custom_bin(host: &str, shell: RemoteShell, bin: &str) -> Result<Ver
     }
 }
 
+/// Refuse a server that does not speak this client's protocol before
+/// connecting to it, so it fails once and says why instead of failing every
+/// call with a parse error -- the server a client upgrade left behind, or one
+/// a newer client upgraded in the meantime.
+pub fn check_protocol(endpoint: &Endpoint) -> Result<()> {
+    let desired = VersionInfo {
+        software_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_version: PROTOCOL_VERSION,
+    };
+    let (place, installed) = match endpoint {
+        Endpoint::Ssh {
+            host,
+            remote_shell,
+            remote_bin,
+            ..
+        } => (
+            format!("{remote_bin} on {host}"),
+            probe_installed(host, *remote_shell, remote_bin)?,
+        ),
+        Endpoint::Local { server_bin, .. } => {
+            let out = Command::new(server_bin)
+                .arg("--version-json")
+                .output()
+                .map_err(|e| {
+                    DeployError::new("server_probe_failed", format!("run {server_bin}: {e}"))
+                })?;
+            let installed = if out.status.success() {
+                Some(serde_json::from_slice(&out.stdout).map_err(|e| {
+                    DeployError::new(
+                        "server_probe_failed",
+                        format!(
+                            "{server_bin} answered --version-json with unparseable output: {e}"
+                        ),
+                    )
+                })?)
+            } else {
+                None
+            };
+            (server_bin.clone(), installed)
+        }
+    };
+    match installed {
+        Some(installed) if installed.protocol_version == desired.protocol_version => Ok(()),
+        Some(installed) if installed.protocol_version > desired.protocol_version => {
+            Err(client_too_old(&installed, &desired))
+        }
+        Some(installed) => Err(server_too_old(
+            &place,
+            &format!(
+                "{} (protocol {})",
+                installed.software_version, installed.protocol_version
+            ),
+            &desired,
+        )),
+        None => Err(server_too_old(
+            &place,
+            "missing or predates --version-json",
+            &desired,
+        )),
+    }
+}
+
+fn server_too_old(place: &str, found: &str, desired: &VersionInfo) -> DeployError {
+    DeployError::new(
+        "server_too_old",
+        format!(
+            "the server {place} is {found}, but this client {} speaks protocol {}; \
+             run `remote-workspace workspace upgrade` (a user-managed binary must be updated by hand)",
+            desired.software_version, desired.protocol_version
+        ),
+    )
+}
+
 fn client_too_old(installed: &VersionInfo, desired: &VersionInfo) -> DeployError {
     DeployError::new(
         "client_too_old",
@@ -750,7 +824,7 @@ fn unique_suffix() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+        .expect("system clock is set before 1970");
     format!("{ts:016x}-{:x}-{n:x}", std::process::id())
 }
 

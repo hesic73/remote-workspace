@@ -56,7 +56,15 @@ impl ProtocolError {
 
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {}", self.code, self.message)?;
+        // The wire spelling (STALE_FILE), which is what tool descriptions and
+        // documentation name.
+        let code = serde_json::to_value(self.code).expect("error code serializes");
+        write!(
+            f,
+            "{}: {}",
+            code.as_str().expect("error code is a string"),
+            self.message
+        )?;
         // Without both hashes a stale edit is unactionable: the caller cannot
         // tell "I passed an older hash of my own" (retry with this one) from
         // "someone else changed the file" (re-read first).

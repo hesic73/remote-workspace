@@ -260,6 +260,8 @@ impl OperationStore {
     /// the Workspace exists, before serving traffic.
     ///
     /// For each prepared-without-commit operation:
+    ///   - a later committed operation on the same path started from
+    ///     expected_after_hash: the rename completed, as below.
     ///   - current file hash == before_hash (or file absent and before None):
     ///     the rename never took effect; drop the prepared marker.
     ///   - current file hash == expected_after_hash: the rename completed but
@@ -300,6 +302,9 @@ impl OperationStore {
             };
             let current = crate::hash::hash_file(&abs)?;
             let outcome = match (&p.before_hash, &current) {
+                // The file has moved on since, through this server: the
+                // mutation landed and only its commit was lost.
+                _ if self.continued_from(p) => RecoveryOutcome::Committed,
                 (Some(b), Some(c)) if b == c => RecoveryOutcome::NoOp,
                 (None, None) => RecoveryOutcome::NoOp,
                 // "sha256:" sentinel means the file should NOT exist after the
@@ -425,6 +430,25 @@ impl OperationStore {
 
     /// Append a real committed FsOperationRecord for a prepared op whose
     /// workspace effect was confirmed, and mark its request Done.
+    /// Whether a committed operation logged after `p`, on the same path,
+    /// started from the state `p` was to leave. A marker outlives its server
+    /// only when the install happened but its sync failed (or on a crash,
+    /// which recovery resolves before anything can follow it), so this is the
+    /// evidence that `p` landed, which the file itself no longer shows.
+    fn continued_from(&self, p: &remote_workspace_protocol::PreparedRecord) -> bool {
+        let g = self.records.lock();
+        let Some(at) = g.iter().position(|r| r.operation_id() == p.operation_id) else {
+            return false;
+        };
+        g[at + 1..].iter().any(|r| match r {
+            AnyOperationRecord::Fs(later) if later.path == p.path => match &later.before_hash {
+                Some(before) => *before == p.expected_after_hash,
+                None => p.expected_after_hash == FILE_DELETED_SENTINEL,
+            },
+            _ => false,
+        })
+    }
+
     fn synthesize_commit(
         &self,
         p: &remote_workspace_protocol::PreparedRecord,
@@ -1090,11 +1114,11 @@ fn acquire_dir_lock(
     let deadline = std::time::Instant::now() + grace;
     loop {
         if crate::locking::try_lock_exclusive(&f, 1 << 32).map_err(io_to_protocol)? {
-            // Record our pid (best effort) so a conflicting starter can name
-            // the holder -- e.g. a zombie server on a half-dead ssh session.
-            let _ = f.set_len(0);
-            let _ = writeln!(&f, "{}", std::process::id());
-            let _ = f.sync_all();
+            // Record our pid so a conflicting starter can name the holder --
+            // e.g. a zombie server on a half-dead ssh session.
+            f.set_len(0).map_err(io_to_protocol)?;
+            writeln!(&f, "{}", std::process::id()).map_err(io_to_protocol)?;
+            f.sync_all().map_err(io_to_protocol)?;
             return Ok(f);
         }
         if std::time::Instant::now() >= deadline {
@@ -1381,7 +1405,7 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .expect("system clock is set before 1970")
 }
 
 fn io_to_protocol(e: std::io::Error) -> ProtocolError {

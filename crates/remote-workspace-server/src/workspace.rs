@@ -97,22 +97,6 @@ impl Workspace {
         }
         Ok((base, base.join(raw)))
     }
-
-    /// Relative form (posix, forward slashes) of an absolute in-root path, for
-    /// reporting in protocol messages.
-    pub fn relative(&self, abs: &Path) -> String {
-        if let Ok(path) = abs.strip_prefix(&self.scratch_root) {
-            let path = path.to_string_lossy().replace('\\', "/");
-            return if path.is_empty() {
-                "@scratch".into()
-            } else {
-                format!("@scratch/{path}")
-            };
-        }
-        abs.strip_prefix(&self.root)
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default()
-    }
 }
 
 /// `path` as programs on the host expect to be given it. On Windows,
@@ -273,7 +257,7 @@ mod tests {
         let w = Workspace::new(dir.path().to_path_buf(), scratch.path().to_path_buf()).unwrap();
         let path = w.resolve("@scratch/logs/test.log").unwrap();
         assert!(path.starts_with(&w.scratch_root));
-        assert_eq!(w.relative(&path), "@scratch/logs/test.log");
+        assert!(path.ends_with("logs/test.log"));
     }
 
     #[test]

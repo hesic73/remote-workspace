@@ -99,16 +99,17 @@ impl Server {
         }
         // Rate-limited inside: a server starts on every reconnect, so the
         // common path here must be a single stat.
-        if let Some(u) = opts
-            .scratch_max_age
-            .and_then(|age| scratch::sweep_if_due(&state_dir, &workspace.scratch_root, age))
-        {
-            if u.removed_files > 0 {
-                tracing::info!(
+        // A failed sweep is reported, not fatal: refusing to start would also
+        // take away the commands that could fix what made it fail.
+        if let Some(age) = opts.scratch_max_age {
+            match scratch::sweep_if_due(&state_dir, &workspace.scratch_root, age) {
+                Ok(Some(u)) if u.removed_files > 0 => tracing::info!(
                     removed_files = u.removed_files,
                     removed_bytes = u.removed_bytes,
                     "swept scratch at startup"
-                );
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "scratch sweep at startup failed"),
             }
         }
         let config = match opts.config_path {
@@ -119,6 +120,7 @@ impl Server {
             }
             None => Arc::new(ServerConfig::default()),
         };
+        let uploads = transfer::UploadRegistry::new(&state_dir)?;
         // Last, so that a `started` with no matching `exit` means one thing
         // only: that server reached the point of serving and has not recorded
         // stopping. A start that fails never claims to have begun; it reports
@@ -145,7 +147,7 @@ impl Server {
             scratch_max_age: opts.scratch_max_age,
             idle_timeout: opts.idle_timeout,
             session_log,
-            uploads: transfer::UploadRegistry::new(&state_dir)?,
+            uploads,
         })
     }
 
@@ -166,18 +168,20 @@ impl Server {
         let server = Arc::new(self);
         let stdout: Arc<tokio::sync::Mutex<W>> = Arc::new(tokio::sync::Mutex::new(write));
         // Reading happens in its own task and is never raced against anything.
-        // `read_line` is not cancellation-safe -- bytes it has already consumed
+        // `read_until` is not cancellation-safe -- bytes it has already consumed
         // are LOST when its future is dropped, which would silently truncate a
         // request that arrived in pieces -- so the idle timeout must not be
         // able to interrupt it. Receiving from this channel is cancel-safe, and
         // its capacity of one keeps the backpressure of reading a line at a
         // time.
-        let (lines_tx, mut lines) = tokio::sync::mpsc::channel::<std::io::Result<String>>(1);
+        let (lines_tx, mut lines) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(1);
         let reading = tokio::spawn(async move {
             let mut reader = BufReader::new(read);
             loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line).await {
+                // Bytes, not `read_line`: a line that is not UTF-8 is one bad
+                // request to answer, not a broken stream to shut down over.
+                let mut line = Vec::new();
+                match reader.read_until(b'\n', &mut line).await {
                     // EOF: dropping the sender is what reports it.
                     Ok(0) => break,
                     Ok(_) => {
@@ -245,13 +249,20 @@ impl Server {
                 None => break "stdin_eof",
             };
             idle_since = tokio::time::Instant::now();
+            // Decoded lossily only to find the request id: a request that is not
+            // UTF-8 is refused, never run against a path with U+FFFD in it.
+            let text = String::from_utf8_lossy(&line);
             // Windows PowerShell 5.1 can put a UTF-8 byte order mark in front of
             // what it writes to a child's stdin, and `trim` keeps it.
-            let trimmed = line.trim().trim_start_matches('\u{feff}');
+            let trimmed = text.trim().trim_start_matches('\u{feff}');
             if trimmed.is_empty() {
                 continue;
             }
-            let req = match serde_json::from_str::<Request>(trimmed) {
+            let parsed = match std::str::from_utf8(&line) {
+                Ok(_) => serde_json::from_str::<Request>(trimmed).map_err(|e| e.to_string()),
+                Err(e) => Err(format!("not UTF-8: {e}")),
+            };
+            let req = match parsed {
                 Ok(r) => r,
                 Err(e) => {
                     // A request this server cannot read -- an op from a newer
@@ -299,8 +310,8 @@ impl Server {
         .await
         .is_ok();
         // Whatever is left is asked to stop rather than carried along: each
-        // task holds an `Arc<Server>`, and with it the state lock. `exec`
-        // children die with their task (kill_on_drop).
+        // task holds an `Arc<Server>`, and with it the state lock. An `exec`'s
+        // process tree dies with its task (see `ProcessGroup`).
         //
         // Aborting only *requests* cancellation, which a handler acts on no
         // earlier than its next yield -- a `gc` sweeping a large tree is
@@ -356,10 +367,29 @@ impl Server {
     ) {
         let request_id = req.request_id.clone();
 
-        // Prepare and abort use their own pending-upload registry. They skip
-        // the request idempotency store because replaying prepare would expose
-        // an obsolete staging path and replaying abort has no useful result.
+        // These skip the request idempotency store. Re-running a read-only
+        // operation is harmless and answers with the state as it is now, while
+        // storing its result would keep file contents on disk and in memory for
+        // nothing. Prepare and abort use their own pending-upload registry:
+        // replaying prepare would expose an obsolete staging path and replaying
+        // abort has no useful result.
         let unpersisted = match &req.body {
+            RequestBody::List {
+                path,
+                offset,
+                limit,
+            } => Some(fs_ops::list(&self.workspace, path, *offset, *limit)),
+            RequestBody::Stat { path } => Some(fs_ops::stat(&self.workspace, path)),
+            RequestBody::Read {
+                path,
+                offset,
+                limit,
+            } => Some(fs_ops::read(&self.workspace, path, *offset, *limit)),
+            RequestBody::History { limit } => Some(self.history(*limit)),
+            RequestBody::OperationGet { operation_id } => Some(self.operation_get(operation_id)),
+            RequestBody::RequestStatus { target } => Some(Ok(ResultBody::RequestStatus(
+                self.store.status_for_request(target),
+            ))),
             RequestBody::UploadPrepare { path, overwrite } => Some(transfer::upload_prepare(
                 &self.workspace,
                 &self.uploads,
@@ -443,38 +473,6 @@ impl Server {
         }
 
         match req.body {
-            RequestBody::List {
-                path,
-                offset,
-                limit,
-            } => {
-                self.finish(
-                    &request_id,
-                    fs_ops::list(&self.workspace, &path, offset, limit),
-                )
-                .await
-                .with_stdout(&stdout)
-                .await;
-            }
-            RequestBody::Stat { path } => {
-                self.finish(&request_id, fs_ops::stat(&self.workspace, &path))
-                    .await
-                    .with_stdout(&stdout)
-                    .await;
-            }
-            RequestBody::Read {
-                path,
-                offset,
-                limit,
-            } => {
-                self.finish(
-                    &request_id,
-                    fs_ops::read(&self.workspace, &path, offset, limit),
-                )
-                .await
-                .with_stdout(&stdout)
-                .await;
-            }
             RequestBody::Create { path, content } => {
                 let guard = self.store.write_guard().await;
                 let result = fs_ops::create(
@@ -531,7 +529,14 @@ impl Server {
                     .with_stdout(&stdout)
                     .await;
             }
-            RequestBody::UploadPrepare { .. } | RequestBody::UploadAbort { .. } => {
+            RequestBody::List { .. }
+            | RequestBody::Stat { .. }
+            | RequestBody::Read { .. }
+            | RequestBody::History { .. }
+            | RequestBody::OperationGet { .. }
+            | RequestBody::RequestStatus { .. }
+            | RequestBody::UploadPrepare { .. }
+            | RequestBody::UploadAbort { .. } => {
                 unreachable!("handled before the idempotency claim")
             }
             RequestBody::UploadCommit {
@@ -580,62 +585,10 @@ impl Server {
                     .with_stdout(&stdout)
                     .await;
             }
-            RequestBody::History { limit } => {
-                let limit = limit.unwrap_or(HISTORY_DEFAULT_LIMIT);
-                let result = if limit > HISTORY_MAX_LIMIT {
-                    Err(remote_workspace_protocol::ProtocolError::new(
-                        ErrorCode::InvalidRequest,
-                        format!("history limit must not exceed {HISTORY_MAX_LIMIT}"),
-                    ))
-                } else {
-                    Ok(ResultBody::History {
-                        operations: self.store.history(Some(limit)),
-                    })
-                };
-                self.finish(&request_id, result)
-                    .await
-                    .with_stdout(&stdout)
-                    .await;
-            }
-            RequestBody::OperationGet { operation_id } => {
-                match self.store.find_record(&operation_id) {
-                    Some(
-                        record @ (remote_workspace_protocol::AnyOperationRecord::Fs(_)
-                        | remote_workspace_protocol::AnyOperationRecord::Exec(_)
-                        | remote_workspace_protocol::AnyOperationRecord::Transfer(_)),
-                    ) => {
-                        self.finish(
-                            &request_id,
-                            Ok(ResultBody::Operation(OperationDetails { record })),
-                        )
-                        .await
-                        .with_stdout(&stdout)
-                        .await;
-                    }
-                    None | Some(_) => {
-                        // Prepared/Aborted already filtered by find_record
-                        let err = remote_workspace_protocol::ProtocolError::new(
-                            ErrorCode::OperationNotFound,
-                            format!("operation not found: {operation_id}"),
-                        );
-                        self.finish_err(&request_id, err)
-                            .await
-                            .with_stdout(&stdout)
-                            .await;
-                    }
-                }
-            }
-            RequestBody::RequestStatus { target: rid } => {
-                let result = self.store.status_for_request(&rid);
-                self.finish(&request_id, Ok(ResultBody::RequestStatus(result)))
-                    .await
-                    .with_stdout(&stdout)
-                    .await;
-            }
             RequestBody::Gc { keep } => {
                 let guard = self.store.write_guard().await;
                 let result = match keep.or(self.history_limit) {
-                    Some(k) => self.store.prune(k).map(|s| {
+                    Some(k) => self.store.prune(k).and_then(|s| {
                         let in_flight = transfer::in_flight_staging(&self.uploads);
                         let removed_stale_staging = transfer::sweep_stale_staging_tree(
                             &self.workspace.root,
@@ -647,14 +600,20 @@ impl Server {
                             transfer::STALE_STAGING_MAX_AGE,
                         );
                         let scratch =
-                            scratch::enforce(&self.workspace.scratch_root, self.scratch_max_age);
-                        ResultBody::Gc(remote_workspace_protocol::GcResult {
+                            scratch::enforce(&self.workspace.scratch_root, self.scratch_max_age)
+                                .map_err(|e| {
+                                    remote_workspace_protocol::ProtocolError::new(
+                                        ErrorCode::IoError,
+                                        format!("scratch sweep failed: {e}"),
+                                    )
+                                })?;
+                        Ok(ResultBody::Gc(remote_workspace_protocol::GcResult {
                             removed_operations: s.removed_operations,
                             removed_requests: s.removed_requests,
                             retained_operations: s.retained_operations,
                             removed_stale_staging,
                             scratch,
-                        })
+                        }))
                     }),
                     None => Err(remote_workspace_protocol::ProtocolError::new(
                         ErrorCode::InvalidRequest,
@@ -667,6 +626,40 @@ impl Server {
                     .with_stdout(&stdout)
                     .await;
             }
+        }
+    }
+
+    fn history(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<ResultBody, remote_workspace_protocol::ProtocolError> {
+        let limit = limit.unwrap_or(HISTORY_DEFAULT_LIMIT);
+        if limit > HISTORY_MAX_LIMIT {
+            return Err(remote_workspace_protocol::ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                format!("history limit must not exceed {HISTORY_MAX_LIMIT}"),
+            ));
+        }
+        Ok(ResultBody::History {
+            operations: self.store.history(Some(limit)),
+        })
+    }
+
+    fn operation_get(
+        &self,
+        operation_id: &str,
+    ) -> Result<ResultBody, remote_workspace_protocol::ProtocolError> {
+        match self.store.find_record(operation_id) {
+            Some(
+                record @ (remote_workspace_protocol::AnyOperationRecord::Fs(_)
+                | remote_workspace_protocol::AnyOperationRecord::Exec(_)
+                | remote_workspace_protocol::AnyOperationRecord::Transfer(_)),
+            ) => Ok(ResultBody::Operation(OperationDetails { record })),
+            // Prepared/Aborted already filtered by find_record
+            None | Some(_) => Err(remote_workspace_protocol::ProtocolError::new(
+                ErrorCode::OperationNotFound,
+                format!("operation not found: {operation_id}"),
+            )),
         }
     }
 
@@ -854,23 +847,6 @@ impl Server {
             },
         }
     }
-
-    async fn finish_err(
-        &self,
-        request_id: &str,
-        err: remote_workspace_protocol::ProtocolError,
-    ) -> FinishResult {
-        match self.store.remember_error(request_id, err.clone()) {
-            Ok(()) => FinishResult::Msg(ServerMessage::Error {
-                request_id: request_id.to_string(),
-                error: err,
-            }),
-            Err(log_err) => FinishResult::Msg(ServerMessage::Error {
-                request_id: request_id.to_string(),
-                error: log_err,
-            }),
-        }
-    }
 }
 
 /// Collect every handler that has finished, so what is left in the set is what
@@ -900,7 +876,7 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .expect("system clock is set before 1970")
 }
 
 fn op_kind_str(body: &RequestBody) -> &str {

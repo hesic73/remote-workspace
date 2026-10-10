@@ -3694,3 +3694,99 @@ async fn unreadable_requests_are_answered_under_their_own_id() {
         ServerMessage::Result { request_id, .. } if request_id == "bom-1"
     ));
 }
+
+#[tokio::test]
+async fn list_offset_past_the_end_is_refused() {
+    let mut h = harness().await;
+    std::fs::write(h.root_path.join("a"), "a").unwrap();
+    h.send(&req(
+        "l",
+        RequestBody::List {
+            path: ".".into(),
+            offset: Some(50),
+            limit: None,
+        },
+    ));
+    match h.recv().await {
+        ServerMessage::Error { error, .. } => assert_eq!(error.code, ErrorCode::InvalidRequest),
+        other => panic!("a page past the end must not look like an empty directory: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stat_reports_a_symlink_as_one() {
+    let mut h = harness().await;
+    std::fs::write(h.root_path.join("target.txt"), "abc").unwrap();
+    std::os::unix::fs::symlink("target.txt", h.root_path.join("link")).unwrap();
+    h.send(&req(
+        "s",
+        RequestBody::Stat {
+            path: "link".into(),
+        },
+    ));
+    match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::Stat { stat },
+            ..
+        } => {
+            assert_eq!(stat.kind, ListKind::Symlink);
+            assert_eq!(stat.size, 3);
+            assert_eq!(stat.hash, Some(hash_of("abc")));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+// One request that is not UTF-8 is a bad request, answered like any other --
+// not a broken stream that takes the server and everything in flight with it.
+#[tokio::test]
+async fn a_request_line_that_is_not_utf8_is_refused_without_stopping_the_server() {
+    let root = tempfile::tempdir().unwrap();
+    let server = Server::new(ServerOptions {
+        root: root.path().to_path_buf(),
+        state_dir: root.path().join(".remote-workspace"),
+        config_path: None,
+        history_limit: None,
+        scratch_max_age: None,
+        idle_timeout: None,
+    })
+    .unwrap();
+    let (client, server_io) = tokio::io::duplex(1 << 16);
+    let (server_read, server_write) = tokio::io::split(server_io);
+    tokio::spawn(server.run(server_read, server_write));
+    let (client_read, mut client_write) = tokio::io::split(client);
+
+    let mut bad = serde_json::to_vec(&req(
+        "bad",
+        RequestBody::Stat {
+            path: "cafX".into(),
+        },
+    ))
+    .unwrap();
+    let x = bad.iter().position(|b| *b == b'X').unwrap();
+    bad[x] = 0xE9;
+    bad.push(b'\n');
+    client_write.write_all(&bad).await.unwrap();
+    let mut good =
+        serde_json::to_vec(&req("good", RequestBody::Stat { path: ".".into() })).unwrap();
+    good.push(b'\n');
+    client_write.write_all(&good).await.unwrap();
+
+    let mut lines = BufReader::new(client_read).lines();
+    let first: ServerMessage =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    match first {
+        ServerMessage::Error { request_id, error } => {
+            assert_eq!(request_id, "bad");
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    let second: ServerMessage =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert!(
+        matches!(&second, ServerMessage::Result { request_id, .. } if request_id == "good"),
+        "{second:?}"
+    );
+}

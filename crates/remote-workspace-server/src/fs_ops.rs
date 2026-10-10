@@ -1,4 +1,4 @@
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use remote_workspace_protocol::{
@@ -51,42 +51,69 @@ pub fn list(
             format!("not a directory: {path}"),
         ));
     }
-    let mut entries: Vec<ListEntry> = std::fs::read_dir(&abs)
-        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("read_dir failed: {e}")))?
-        .filter_map(|e| e.ok())
-        .map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            let m = e.metadata().ok();
-            let kind = file_kind(&e.path());
-            let size = m.as_ref().map(|m| m.len());
-            ListEntry { name, kind, size }
-        })
-        .filter(|e| e.name != ".remote-workspace")
-        .collect();
+    let list_failed =
+        |e: std::io::Error| ProtocolError::new(ErrorCode::IoError, format!("list failed: {e}"));
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&abs).map_err(list_failed)? {
+        let entry = entry.map_err(list_failed)?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        // The server's own state directory, when the root is its home.
+        if abs == ws.root && name == ".remote-workspace" {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            // Removed since the directory was read.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(list_failed(e)),
+        };
+        entries.push(ListEntry {
+            name,
+            kind: list_kind(meta.file_type(), false),
+            size: Some(meta.len()),
+        });
+    }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
+    if offset > 0 && offset >= entries.len() {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "offset {offset} is past the last entry ({} entries)",
+                entries.len()
+            ),
+        ));
+    }
     let end = offset.saturating_add(limit).min(entries.len());
-    let page = if offset >= entries.len() {
-        Vec::new()
-    } else {
-        entries[offset..end].to_vec()
-    };
+    let page = entries[offset..end].to_vec();
     Ok(ResultBody::List(remote_workspace_protocol::ListResult {
         entries: page,
         next_offset: (end < entries.len()).then_some(end),
     }))
 }
 
+/// Follows a symlink, as every other operation does, so size and hash are its
+/// target's; `kind` still says it is one, as `list` does.
 pub fn stat(ws: &Workspace, path: &str) -> Result<ResultBody, ProtocolError> {
     let abs = ws.resolve(path)?;
-    let meta = std::fs::symlink_metadata(&abs).map_err(|e| {
+    let meta = std::fs::metadata(&abs).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ProtocolError::new(ErrorCode::NotFound, format!("not found: {path}"))
         } else {
             ProtocolError::new(ErrorCode::IoError, format!("stat failed: {e}"))
         }
     })?;
-    let entry = entry_for(path, &abs, &meta);
+    let entry = entry_for(path, &abs, &meta, ws.is_symlink(path)?)?;
     Ok(ResultBody::Stat { stat: entry })
+}
+
+fn check_offset(start: u64, file_len: u64) -> Result<(), ProtocolError> {
+    if start > file_len {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("offset {start} is past end of file ({file_len} bytes)"),
+        ));
+    }
+    Ok(())
 }
 
 pub fn read(
@@ -112,7 +139,6 @@ pub fn read(
     if !meta.is_file() {
         return Err(not_a_regular_file(path));
     }
-    let file_len = meta.len();
     let limit = limit.unwrap_or(READ_DEFAULT_LIMIT);
     if limit == 0 || limit > READ_MAX_LIMIT {
         return Err(ProtocolError::new(
@@ -121,24 +147,35 @@ pub fn read(
         ));
     }
     let start = offset.unwrap_or(0);
-    if start > file_len {
-        return Err(ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            format!("offset {start} is past end of file ({file_len} bytes)"),
-        ));
-    }
 
-    // Read only the requested window (plus enough slack to finish a codepoint
-    // straddling its end), never the whole file: paging through a multi-GB exec
-    // log is the documented way to read large output, so cost per page must
-    // depend on the page, not on the file.
+    // The hash exists to be passed back as `edit`'s base_hash, and `edit`
+    // refuses files above MAX_TEXT_BYTES, so only those files get one. It must
+    // be the hash of the bytes this page came from -- hashing a second read
+    // would pair this content with whatever the file holds by then -- so such
+    // a file is read once, whole. A larger one has only the requested window
+    // (plus enough slack to finish a codepoint straddling its end) read:
+    // paging through a multi-GB exec log is the documented way to read large
+    // output, so cost per page must depend on the page, not on the file.
     let mut file = std::fs::File::open(&abs).map_err(io_read_error)?;
-    file.seek(std::io::SeekFrom::Start(start))
-        .map_err(io_read_error)?;
-    let mut window = Vec::new();
-    file.take(limit + UTF8_TAIL_SLACK)
-        .read_to_end(&mut window)
-        .map_err(io_read_error)?;
+    let (file_len, mut window, hash) = if meta.len() <= MAX_TEXT_BYTES as u64 {
+        let mut whole = Vec::new();
+        file.read_to_end(&mut whole).map_err(io_read_error)?;
+        let file_len = whole.len() as u64;
+        check_offset(start, file_len)?;
+        let end = whole.len().min((start + limit + UTF8_TAIL_SLACK) as usize);
+        let window = whole[start as usize..end].to_vec();
+        (file_len, window, Some(crate::hash::hash_bytes(&whole)))
+    } else {
+        let file_len = meta.len();
+        check_offset(start, file_len)?;
+        file.seek(std::io::SeekFrom::Start(start))
+            .map_err(io_read_error)?;
+        let mut window = Vec::new();
+        file.take(limit + UTF8_TAIL_SLACK)
+            .read_to_end(&mut window)
+            .map_err(io_read_error)?;
+        (file_len, window, None)
+    };
 
     // offset/limit are BYTE positions but must land on UTF-8 char boundaries.
     // In valid UTF-8 a boundary is any byte that is not a continuation byte;
@@ -171,14 +208,6 @@ pub fn read(
     })?;
     let next_offset = start + end as u64;
     let truncated = next_offset < file_len;
-    // The hash exists to be passed back as `edit`'s base_hash, and `edit`
-    // refuses files above MAX_TEXT_BYTES. Hashing a larger file would re-read
-    // it in full on every page for a value nothing can consume.
-    let hash = if file_len <= MAX_TEXT_BYTES as u64 {
-        crate::hash::hash_file(&abs).map_err(io_read_error)?
-    } else {
-        None
-    };
     Ok(ResultBody::Read(ReadResult {
         content,
         hash,
@@ -248,23 +277,42 @@ struct StagedWrite {
     new_hash: String,
 }
 
+fn write_temp(dir: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(crate::transfer::WRITE_STAGING_PREFIX)
+        .suffix(crate::transfer::STAGING_SUFFIX)
+        .tempfile_in(dir)
+}
+
+/// Data must be durable before the rename that publishes it: otherwise a
+/// crash right after can leave the new name pointing at an empty file, which
+/// is neither the old content nor the new.
+fn write_synced(tmp: &tempfile::NamedTempFile, content: &[u8]) -> std::io::Result<()> {
+    let mut file = tmp.as_file();
+    file.write_all(content)?;
+    file.sync_all()
+}
+
 /// Write `content` to a temp file in the target's directory, preserving the
-/// target's mode if it exists (so a 0755 script stays 0755).
+/// target's mode (so a 0755 script stays 0755).
 fn stage_write(abs: &Path, content: &[u8]) -> Result<StagedWrite, ProtocolError> {
     let parent = abs
         .parent()
         .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidRequest, "path has no parent"))?;
     std::fs::create_dir_all(parent)
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("mkdir failed: {e}")))?;
-    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+    let tmp = write_temp(parent).map_err(|e| {
         ProtocolError::new(ErrorCode::IoError, format!("temp file create failed: {e}"))
     })?;
-    std::fs::write(tmp.path(), content)
+    write_synced(&tmp, content)
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("temp write failed: {e}")))?;
     #[cfg(unix)]
-    if let Ok(orig_meta) = std::fs::metadata(abs) {
+    {
         use std::os::unix::fs::PermissionsExt;
-        let mode = orig_meta.permissions().mode();
+        let mode = std::fs::metadata(abs)
+            .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("stat failed: {e}")))?
+            .permissions()
+            .mode();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).map_err(
             |e| ProtocolError::new(ErrorCode::IoError, format!("chmod temp failed: {e}")),
         )?;
@@ -435,9 +483,11 @@ impl StagedWrite {
 }
 
 /// Atomically install a NEW file at abs without ever replacing an existing
-/// one: temp file in the same directory, then hard_link into place (which
+/// one: temp file in the same directory, then a no-clobber persist (which
 /// fails with AlreadyExists instead of clobbering, even against a concurrent
-/// creator such as a command run in the workspace).
+/// creator such as a command run in the workspace). A hard link would do the
+/// same on Unix, but on Windows would keep the temp file's TEMPORARY
+/// attribute, which only `persist` clears.
 fn atomic_create_bytes(
     abs: &Path,
     content: &[u8],
@@ -458,19 +508,25 @@ fn atomic_create_bytes(
             "path has no parent",
         ))
     })?;
+    // The highest directory this create is about to make, if any.
+    let first_new = parent
+        .ancestors()
+        .take_while(|dir| matches!(dir.try_exists(), Ok(false)))
+        .last()
+        .map(Path::to_path_buf);
     std::fs::create_dir_all(parent).map_err(|e| {
         not_yet(ProtocolError::new(
             ErrorCode::IoError,
             format!("mkdir failed: {e}"),
         ))
     })?;
-    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+    let tmp = write_temp(parent).map_err(|e| {
         not_yet(ProtocolError::new(
             ErrorCode::IoError,
             format!("temp file create failed: {e}"),
         ))
     })?;
-    std::fs::write(tmp.path(), content).map_err(|e| {
+    write_synced(&tmp, content).map_err(|e| {
         not_yet(ProtocolError::new(
             ErrorCode::IoError,
             format!("temp write failed: {e}"),
@@ -487,17 +543,22 @@ fn atomic_create_bytes(
                 ))
             })?;
     }
-    std::fs::hard_link(tmp.path(), abs).map_err(|e| {
+    tmp.persist_noclobber(abs).map_err(|e| {
+        let e = e.error;
         not_yet(if e.kind() == std::io::ErrorKind::AlreadyExists {
             ProtocolError::new(
                 ErrorCode::AlreadyExists,
                 format!("already exists: {client_path}; modify existing files with edit"),
             )
         } else {
-            ProtocolError::new(ErrorCode::IoError, format!("link into place failed: {e}"))
+            ProtocolError::new(ErrorCode::IoError, format!("install failed: {e}"))
         })
     })?;
-    crate::fsync::fsync_file_or_dir(abs).map_err(|e| InstallFailure {
+    let synced = crate::fsync::fsync_file_or_dir(abs).and_then(|()| match &first_new {
+        Some(top) => crate::fsync::fsync_new_dirs(parent, top),
+        None => Ok(()),
+    });
+    synced.map_err(|e| InstallFailure {
         changed: true,
         error: ProtocolError::new(
             ErrorCode::IoError,
@@ -772,41 +833,37 @@ fn not_a_regular_file(path: &str) -> ProtocolError {
     ProtocolError::new(ErrorCode::NotAFile, format!("not a regular file: {path}"))
 }
 
-fn file_kind(path: &Path) -> ListKind {
-    let ft = match std::fs::symlink_metadata(path) {
-        Ok(m) => m.file_type(),
-        Err(_) => return ListKind::File,
-    };
-    if ft.is_symlink() {
+fn list_kind(file_type: std::fs::FileType, symlink: bool) -> ListKind {
+    if symlink || file_type.is_symlink() {
         ListKind::Symlink
-    } else if ft.is_dir() {
+    } else if file_type.is_dir() {
         ListKind::Dir
     } else {
         ListKind::File
     }
 }
 
-fn entry_for(client_path: &str, abs: &Path, meta: &std::fs::Metadata) -> FileEntry {
-    let kind = if meta.file_type().is_symlink() {
-        ListKind::Symlink
-    } else if meta.is_dir() {
-        ListKind::Dir
+fn entry_for(
+    client_path: &str,
+    abs: &Path,
+    meta: &std::fs::Metadata,
+    symlink: bool,
+) -> Result<FileEntry, ProtocolError> {
+    // Only `edit` consumes a hash, and it refuses files above the cap:
+    // hashing a multi-GB file here would read all of it for nothing.
+    let hash = if meta.is_file() && meta.len() <= MAX_TEXT_BYTES as u64 {
+        hash_file(abs)
+            .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("stat failed: {e}")))?
     } else {
-        ListKind::File
+        None
     };
-    FileEntry {
+    Ok(FileEntry {
         path: client_path.to_string(),
-        kind,
+        kind: list_kind(meta.file_type(), symlink),
         size: meta.len(),
-        // Only `edit` consumes a hash, and it refuses files above the cap:
-        // hashing a multi-GB file here would read all of it for nothing.
-        hash: if meta.is_file() && meta.len() <= MAX_TEXT_BYTES as u64 {
-            hash_file(abs).ok().flatten()
-        } else {
-            None
-        },
+        hash,
         mode: Some(file_mode(meta)),
-    }
+    })
 }
 
 #[cfg(unix)]

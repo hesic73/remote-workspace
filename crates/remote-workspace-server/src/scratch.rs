@@ -32,16 +32,22 @@ struct Entry {
 /// that matters -- in real usage here the legitimate logs are *larger* than the
 /// checkpoints that do not belong. Keeping artifacts out is a job for the agent
 /// guidance, which can talk about kind rather than bytes.
-pub fn enforce(root: &Path, max_age: Option<Duration>) -> ScratchUsage {
+pub fn enforce(root: &Path, max_age: Option<Duration>) -> std::io::Result<ScratchUsage> {
     let now = SystemTime::now();
     let mut entries = Vec::new();
-    collect(root, now, &mut entries);
+    collect(root, now, &mut entries)?;
 
     let mut usage = ScratchUsage::default();
     for e in &entries {
-        if max_age.is_some_and(|limit| e.idle > limit) && std::fs::remove_file(&e.path).is_ok() {
-            usage.removed_files += 1;
-            usage.removed_bytes += e.bytes;
+        if max_age.is_some_and(|limit| e.idle > limit) {
+            match std::fs::remove_file(&e.path) {
+                Ok(()) => {
+                    usage.removed_files += 1;
+                    usage.removed_bytes += e.bytes;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
             continue;
         }
         usage.files += 1;
@@ -49,33 +55,42 @@ pub fn enforce(root: &Path, max_age: Option<Duration>) -> ScratchUsage {
         let days = (e.idle.as_secs() / 86_400) as u32;
         usage.oldest_days = Some(usage.oldest_days.unwrap_or(0).max(days));
     }
-    usage
+    Ok(usage)
 }
 
-fn collect(dir: &Path, now: SystemTime, out: &mut Vec<Entry>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+/// Commands share scratch, so anything here can vanish between being listed
+/// and being looked at; that is not an error.
+fn collect(dir: &Path, now: SystemTime, out: &mut Vec<Entry>) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
     };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
+    for entry in entries {
+        let entry = entry?;
+        let ft = entry.file_type()?;
         if ft.is_dir() {
-            collect(&entry.path(), now, out);
+            collect(&entry.path(), now, out)?;
             continue;
         }
         if !ft.is_file() {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
-        let since = |t: Option<SystemTime>| {
-            t.and_then(|t| now.duration_since(t).ok())
-                .unwrap_or(Duration::MAX)
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
         };
+        // A timestamp ahead of the clock (a clock stepped back, a file
+        // touched with a future date) is as fresh as it gets.
+        let since = |t: SystemTime| now.duration_since(t).unwrap_or(Duration::ZERO);
         out.push(Entry {
             path: entry.path(),
             bytes: meta.len(),
-            idle: since(meta.modified().ok()).min(since(meta.accessed().ok())),
+            idle: since(meta.modified()?).min(since(meta.accessed()?)),
         });
     }
+    Ok(())
 }
 
 /// Sweep at most once per `SWEEP_INTERVAL`, tracked by a marker file in the
@@ -88,21 +103,22 @@ pub fn sweep_if_due(
     state_dir: &Path,
     scratch_root: &Path,
     max_age: Duration,
-) -> Option<ScratchUsage> {
+) -> std::io::Result<Option<ScratchUsage>> {
     let marker = state_dir.join(SWEEP_MARKER);
-    let due = match std::fs::metadata(&marker).and_then(|m| m.modified()) {
-        Ok(t) => SystemTime::now()
-            .duration_since(t)
+    let due = match std::fs::metadata(&marker) {
+        Ok(meta) => SystemTime::now()
+            .duration_since(meta.modified()?)
             .map(|age| age >= SWEEP_INTERVAL)
             .unwrap_or(true),
-        Err(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => return Err(e),
     };
     if !due {
-        return None;
+        return Ok(None);
     }
     // Stamp first: a sweep that fails should not retry on every reconnect.
-    let _ = std::fs::write(&marker, b"");
-    Some(enforce(scratch_root, Some(max_age)))
+    std::fs::write(&marker, b"")?;
+    enforce(scratch_root, Some(max_age)).map(Some)
 }
 
 #[cfg(test)]
@@ -135,7 +151,7 @@ mod tests {
         aged(d.path(), "old.log", 10, 30);
         aged(d.path(), "nested/new.log", 5, 0);
 
-        let u = enforce(d.path(), None);
+        let u = enforce(d.path(), None).unwrap();
         assert_eq!(u.files, 2);
         assert_eq!(u.bytes, 15);
         assert!(u.oldest_days.unwrap() >= 29);
@@ -150,7 +166,7 @@ mod tests {
         aged(d.path(), "deep/also-stale.log", 50, 8);
         aged(d.path(), "fresh.py", 7, 1);
 
-        let u = enforce(d.path(), Some(days(7)));
+        let u = enforce(d.path(), Some(days(7))).unwrap();
         assert_eq!(u.removed_files, 2);
         assert_eq!(u.removed_bytes, 150);
         assert_eq!(u.files, 1);
@@ -173,7 +189,7 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_accessed(SystemTime::now()))
             .unwrap();
 
-        let u = enforce(d.path(), Some(days(7)));
+        let u = enforce(d.path(), Some(days(7))).unwrap();
         assert_eq!(u.removed_files, 0, "a file being read must not be evicted");
         assert!(p.exists());
     }
@@ -185,10 +201,29 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         aged(d.path(), "huge-but-fresh.jsonl", 4_000_000, 0);
 
-        let u = enforce(d.path(), Some(days(7)));
+        let u = enforce(d.path(), Some(days(7))).unwrap();
         assert_eq!(u.removed_files, 0);
         assert_eq!(u.bytes, 4_000_000);
         assert!(d.path().join("huge-but-fresh.jsonl").exists());
+    }
+
+    #[test]
+    fn a_future_timestamp_counts_as_fresh() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("touched-ahead.log");
+        std::fs::write(&p, b"x").unwrap();
+        let t = SystemTime::now() + Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_accessed(t).set_modified(t))
+            .unwrap();
+
+        let u = enforce(d.path(), Some(days(7))).unwrap();
+        assert_eq!(u.removed_files, 0);
+        assert_eq!(u.oldest_days, Some(0));
+        assert!(p.exists());
     }
 
     #[test]
@@ -201,13 +236,16 @@ mod tests {
         assert_eq!(
             sweep_if_due(state.path(), &scratch, days(7))
                 .unwrap()
+                .unwrap()
                 .removed_files,
             1
         );
 
         aged(&scratch, "another-stale.log", 10, 30);
         assert!(
-            sweep_if_due(state.path(), &scratch, days(7)).is_none(),
+            sweep_if_due(state.path(), &scratch, days(7))
+                .unwrap()
+                .is_none(),
             "a second sweep within the interval must not run"
         );
         assert!(scratch.join("another-stale.log").exists());

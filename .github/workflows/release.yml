@@ -113,6 +113,15 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # A client downloads the server artifact pinned to its own version, so a
+      # release whose tag disagrees with the binaries it holds cannot be
+      # installed from.
+      - name: Check the tag matches the built version
+        run: |
+          built=$(jq -r '.software_version' dist/release-manifest.json)
+          [ "v$built" = "$GITHUB_REF_NAME" ] \
+            || { echo "tag $GITHUB_REF_NAME does not match built version $built"; exit 1; }
+
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

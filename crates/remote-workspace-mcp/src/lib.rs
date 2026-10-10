@@ -52,22 +52,18 @@ fn ok_json_in_workspace<T: serde::Serialize>(workspace: &str, value: &T) -> Call
 /// accepted -- anything else still fails.
 mod lenient_int {
     use serde::{Deserialize, Deserializer};
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum NumOrStr {
-        Num(u64),
-        Str(String),
-    }
+    use serde_json::Value;
 
     fn parse<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-        match Option::<NumOrStr>::deserialize(d)? {
-            None => Ok(None),
-            Some(NumOrStr::Num(n)) => Ok(Some(n)),
-            Some(NumOrStr::Str(s)) => s.trim().parse::<u64>().map(Some).map_err(|_| {
-                serde::de::Error::custom(format!("expected an integer, got the string {s:?}"))
-            }),
-        }
+        let parsed = match Option::<Value>::deserialize(d)? {
+            None => return Ok(None),
+            Some(Value::Number(n)) => n.as_u64(),
+            Some(Value::String(s)) => s.trim().parse::<u64>().ok(),
+            Some(_) => None,
+        };
+        parsed
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("expected a non-negative whole number"))
     }
 
     pub fn opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
@@ -80,6 +76,10 @@ mod lenient_int {
 }
 
 // ---- Input structs ----
+//
+// `skip_serializing_if` on optional fields keeps schemars from advertising
+// `"default": null` for an integer, boolean or string, which hosts that
+// validate schemas strictly reject.
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListDirectoryInput {
@@ -87,10 +87,18 @@ pub struct ListDirectoryInput {
     pub workspace: String,
     #[schemars(description = "Directory path in the workspace, or @scratch/...")]
     pub path: String,
-    #[serde(default, deserialize_with = "lenient_int::opt_usize")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_int::opt_usize"
+    )]
     #[schemars(with = "usize", description = "Entry offset to start at (default: 0)")]
     pub offset: Option<usize>,
-    #[serde(default, deserialize_with = "lenient_int::opt_usize")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_int::opt_usize"
+    )]
     #[schemars(
         with = "usize",
         description = "Maximum entries to return (default and maximum: 1000)"
@@ -104,13 +112,21 @@ pub struct ReadFileInput {
     pub workspace: String,
     #[schemars(description = "File path in the workspace, or @scratch/...")]
     pub path: String,
-    #[serde(default, deserialize_with = "lenient_int::opt_u64")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_int::opt_u64"
+    )]
     #[schemars(
         with = "u64",
         description = "Byte offset to start reading from (default 0)"
     )]
     pub offset: Option<u64>,
-    #[serde(default, deserialize_with = "lenient_int::opt_u64")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_int::opt_u64"
+    )]
     #[schemars(
         with = "u64",
         description = "Maximum bytes to read (default and hard maximum: 65536)"
@@ -134,7 +150,7 @@ pub struct EditInput {
     pub old_text: String,
     #[schemars(description = "Replacement text; empty string deletes old_text")]
     pub new_text: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
         with = "bool",
         description = "Replace every occurrence instead of failing when old_text is not unique (default: false)"
@@ -170,19 +186,23 @@ pub struct RunCommandInput {
     pub workspace: String,
     #[schemars(description = "Command and arguments, e.g. [\"pytest\", \"-q\"]")]
     pub argv: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
         with = "String",
         description = "Working directory in the workspace, or @scratch/... (default: root)"
     )]
     pub cwd: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
         with = "String",
         description = "Environment profile name (configured server-side)"
     )]
     pub profile: Option<String>,
-    #[serde(default, deserialize_with = "lenient_int::opt_u64")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_int::opt_u64"
+    )]
     #[schemars(
         with = "u64",
         description = "Timeout in milliseconds (default: 300000; maximum: 3600000)"
@@ -194,11 +214,13 @@ pub struct RunCommandInput {
 pub struct UploadFileInput {
     #[schemars(description = "Destination workspace name")]
     pub workspace: String,
-    #[schemars(description = "Absolute or relative path of the local source file")]
+    #[schemars(
+        description = "Path of the local source file; a relative path is resolved against this MCP server's working directory"
+    )]
     pub local_path: String,
     #[schemars(description = "Destination path in the workspace, or @scratch/...")]
     pub remote_path: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
         with = "bool",
         description = "Replace an existing destination file (default: false)"
@@ -212,9 +234,11 @@ pub struct DownloadFileInput {
     pub workspace: String,
     #[schemars(description = "Source path in the workspace, or @scratch/...")]
     pub remote_path: String,
-    #[schemars(description = "Absolute or relative path of the local destination file")]
+    #[schemars(
+        description = "Path of the local destination file; a relative path is resolved against this MCP server's working directory, and the result reports the absolute path"
+    )]
     pub local_path: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
         with = "bool",
         description = "Replace an existing destination file (default: false)"
@@ -235,6 +259,9 @@ struct WorkspaceHandle {
     /// (e.g. sshd resetting the connection), so tool calls fetch it through
     /// `client()`, which reconnects on demand.
     slot: tokio::sync::Mutex<Option<Arc<Client>>>,
+    /// Set once the server is known to speak this client's protocol. Checked
+    /// before the first connection only: each check is an SSH round trip.
+    protocol_checked: std::sync::atomic::AtomicBool,
 }
 
 impl WorkspaceHandle {
@@ -317,6 +344,7 @@ fn build_snapshot(old: &Snapshot, fleet: BTreeMap<String, Workspace>) -> Snapsho
                 _ => Arc::new(WorkspaceHandle {
                     endpoint: ws.endpoint,
                     slot: tokio::sync::Mutex::new(None),
+                    protocol_checked: std::sync::atomic::AtomicBool::new(false),
                 }),
             };
             (
@@ -405,6 +433,21 @@ impl RemoteWorkspaceServer {
                 return Ok((c.clone(), handle.clone()));
             }
         }
+        if !handle
+            .protocol_checked
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let endpoint = handle.endpoint.clone();
+            tokio::task::spawn_blocking(move || {
+                remote_workspace_client::deploy::check_protocol(&endpoint)
+            })
+            .await
+            .map_err(|e| format!("protocol_check_failed: {e}"))?
+            .map_err(|e| e.to_string())?;
+            handle
+                .protocol_checked
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         // `code` is a stable keyword so agents can tell transport failures
         // (connect_failed) apart from a reachable-but-unhealthy workspace
         // (probe_failed: server spawned, the round-trip did not survive).
@@ -429,7 +472,7 @@ impl RemoteWorkspaceServer {
                 serial: handle.endpoint.is_powershell_ssh(),
             };
             match Client::connect(transport, log.clone()).await {
-                Ok(c) => match c.stat(".").await {
+                Ok(c) => match c.probe().await {
                     Ok(_) => {
                         let c = Arc::new(c);
                         *slot = Some(c.clone());
@@ -449,6 +492,29 @@ impl RemoteWorkspaceServer {
         Err(format!(
             "{code}: cannot reach workspace '{workspace}' after {CONNECT_ATTEMPTS} attempts ({last})"
         ))
+    }
+}
+
+/// The agent cannot see this process's working directory, so a relative path
+/// is made absolute here and reported back in that form.
+fn local_absolute(path: &str) -> Result<std::path::PathBuf, String> {
+    std::path::absolute(path).map_err(|e| format!("invalid local path {path:?}: {e}"))
+}
+
+/// Reconnects as any tool call would, so a transfer that outlasts its first
+/// connection finishes on a fresh one.
+struct WorkspaceControl<'a> {
+    server: &'a RemoteWorkspaceServer,
+    workspace: &'a str,
+}
+
+impl remote_workspace_client::Control for WorkspaceControl<'_> {
+    async fn client(&self) -> Result<Arc<Client>, remote_workspace_client::ClientError> {
+        self.server
+            .client(self.workspace)
+            .await
+            .map(|(client, _)| client)
+            .map_err(remote_workspace_client::ClientError::Connect)
     }
 }
 
@@ -674,14 +740,21 @@ impl RemoteWorkspaceServer {
             overwrite,
         }): Parameters<UploadFileInput>,
     ) -> CallToolResult {
-        let (client, handle) = match self.client(&workspace).await {
+        let local_path = match local_absolute(&local_path) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        let (_, handle) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match remote_workspace_client::upload_file(
-            &client,
+            &WorkspaceControl {
+                server: self,
+                workspace: &workspace,
+            },
             &handle.endpoint,
-            std::path::Path::new(&local_path),
+            &local_path,
             &remote_path,
             overwrite.unwrap_or(false),
         )
@@ -704,15 +777,22 @@ impl RemoteWorkspaceServer {
             overwrite,
         }): Parameters<DownloadFileInput>,
     ) -> CallToolResult {
-        let (client, handle) = match self.client(&workspace).await {
+        let local_path = match local_absolute(&local_path) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        let (_, handle) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match remote_workspace_client::download_file(
-            &client,
+            &WorkspaceControl {
+                server: self,
+                workspace: &workspace,
+            },
             &handle.endpoint,
             &remote_path,
-            std::path::Path::new(&local_path),
+            &local_path,
             overwrite.unwrap_or(false),
         )
         .await
@@ -720,7 +800,7 @@ impl RemoteWorkspaceServer {
             Ok(mut r) => {
                 // For a download the useful path is the local destination; the
                 // server-side record keeps the remote logical path.
-                r.path = local_path;
+                r.path = local_path.to_string_lossy().into_owned();
                 ok_json_in_workspace(&workspace, &r)
             }
             Err(e) => err(format!("{e}")),

@@ -53,7 +53,7 @@ mod transfer;
 
 pub use log_writer::ClientLog;
 pub use platform::home_dir;
-pub use transfer::{download_file, upload_file, Endpoint};
+pub use transfer::{download_file, upload_file, Control, Endpoint};
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -73,6 +73,9 @@ pub enum ClientError {
     Serde(#[from] serde_json::Error),
     #[error("transfer failed: {0}")]
     Transfer(String),
+    /// No live connection could be made; the text is the connecting layer's.
+    #[error("{0}")]
+    Connect(String),
     /// A reply to this request that the client cannot parse, such as a new
     /// error code from a newer server on the same protocol.
     #[error("unreadable reply from server: {0}")]
@@ -413,6 +416,29 @@ impl Client {
         body: RequestBody,
         timeout: std::time::Duration,
     ) -> Result<(RequestId, ServerMessage), ClientError> {
+        self.send(body, timeout, true).await
+    }
+
+    /// A round trip that shows the connection works. It is left out of the
+    /// client log, whose counts are of the calls the agent made.
+    pub async fn probe(&self) -> Result<(), ClientError> {
+        let (_, msg) = self
+            .send(
+                RequestBody::Stat { path: ".".into() },
+                DEFAULT_REQUEST_TIMEOUT,
+                false,
+            )
+            .await?;
+        Self::unpack(msg).map(|_| ())
+    }
+
+    async fn send(
+        &self,
+        body: RequestBody,
+        timeout: std::time::Duration,
+        logged: bool,
+    ) -> Result<(RequestId, ServerMessage), ClientError> {
+        let log = self.log.as_ref().filter(|_| logged);
         if self.is_closed() {
             return Err(self.closed_error().await);
         }
@@ -431,13 +457,13 @@ impl Client {
             request_id: request_id.clone(),
             body,
         };
-        let (tx, rx) = oneshot::channel::<Reply>();
+        let (tx, mut rx) = oneshot::channel::<Reply>();
         self.reply_map
             .lock()
             .await
             .insert(request_id.clone(), Pending { tx, _slot: slot });
         let line = serde_json::to_string(&req)?;
-        if let Some(l) = &self.log {
+        if let Some(l) = log {
             l.log_request(&request_id, &line).await;
         }
         {
@@ -467,9 +493,19 @@ impl Client {
         // if the server/SSH disappears, the reader drains reply_map (closing
         // `tx`) and notifies here; if the server stalls, the timeout fires.
         // Either way we never block indefinitely.
+        //
+        // The reply comes first: a server that answers and then dies at once
+        // has still answered, and the caller must not be told otherwise.
         let msg = tokio::select! {
             biased;
-            () = self.wait_closed() => return Err(self.closed_error().await),
+            m = &mut rx => match m {
+                Ok(reply) => reply?,
+                Err(_) => return Err(self.closed_error().await),
+            },
+            () = self.wait_closed() => match rx.try_recv() {
+                Ok(reply) => reply?,
+                Err(_) => return Err(self.closed_error().await),
+            },
             () = tokio::time::sleep_until(deadline) => {
                 // A serial connection keeps the entry, and with it the slot,
                 // until the late reply or a close arrives.
@@ -478,12 +514,8 @@ impl Client {
                 }
                 return Err(ClientError::Timeout);
             }
-            m = rx => match m {
-                Ok(reply) => reply?,
-                Err(_) => return Err(self.closed_error().await),
-            },
         };
-        if let Some(l) = &self.log {
+        if let Some(l) = log {
             l.log_response(&request_id, &msg).await;
         }
         Ok((request_id, msg))
@@ -948,7 +980,7 @@ fn unique_id() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+        .expect("system clock is set before 1970");
     format!("{ts:016x}-{:08x}-{n:08x}", std::process::id())
 }
 

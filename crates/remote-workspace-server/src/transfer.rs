@@ -21,6 +21,10 @@ const BASE64_TRANSFER_BUF_SIZE: usize = 3 * 1024;
 /// pattern and never touch anyone else's `.part` files.
 pub const STAGING_PREFIX: &str = ".remote-workspace-upload.";
 pub const STAGING_SUFFIX: &str = ".part";
+/// Temp files of `create`/`edit`. They exist for milliseconds, but one left by
+/// a killed server is swept like an upload's.
+pub const WRITE_STAGING_PREFIX: &str = ".remote-workspace-write.";
+const STAGING_NAME_BYTES: usize = 64;
 /// A staging file whose mtime is older than this is considered abandoned (an
 /// in-progress upload keeps its mtime fresh with every written chunk).
 pub const STALE_STAGING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
@@ -118,7 +122,7 @@ fn new_transfer_id() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+        .expect("system clock is set before 1970");
     format!("xfer-{ts:016x}-{n:04x}")
 }
 
@@ -171,11 +175,18 @@ pub fn upload_prepare(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let file_name = abs
+    let mut file_name = abs
         .file_name()
         .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidRequest, "path has no file name"))?
         .to_string_lossy()
         .into_owned();
+    // The name is only there to make a leftover recognizable. Kept whole, a
+    // target name near the 255-byte limit would push the staging name over it.
+    let mut keep = file_name.len().min(STAGING_NAME_BYTES);
+    while !file_name.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    file_name.truncate(keep);
     // A retried upload lands in the same directory as any staging file a
     // crashed predecessor left behind, so this is the natural place to sweep.
     let removed =
@@ -404,7 +415,8 @@ pub fn sweep_stale_staging_dir(
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(STAGING_PREFIX) || !name.ends_with(STAGING_SUFFIX) {
+        let staging = name.starts_with(STAGING_PREFIX) || name.starts_with(WRITE_STAGING_PREFIX);
+        if !staging || !name.ends_with(STAGING_SUFFIX) {
             continue;
         }
         let path = entry.path();
@@ -598,7 +610,7 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .expect("system clock is set before 1970")
 }
 
 #[cfg(test)]

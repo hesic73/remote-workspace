@@ -221,9 +221,10 @@ rehash the staging file -- rehashing would read large files twice, and the
 workspace is not defended against the same OS user anyway (that is the
 documented trust model).
 
-A hard-killed or interrupted upload can leave its staging file behind.
-Cleanup is conservative and best-effort: only files matching the exact
-`.remote-workspace-upload.*.part` convention, older than 24 hours by mtime (an
+A hard-killed or interrupted upload can leave its staging file behind, and a
+server killed mid-`create`/`edit` its `.remote-workspace-write.*.part` temp
+file. Cleanup is conservative and best-effort: only files matching the exact
+`.remote-workspace-upload.*.part` or `.remote-workspace-write.*.part` conventions, older than 24 hours by mtime (an
 active upload keeps its mtime fresh), and not registered as in-flight are
 deleted. A registration outlives its server only while its staging file is
 younger than those 24 hours, so an upload whose client died between prepare
@@ -359,10 +360,12 @@ after reconnect) are exactly the reason the state must outlive them.
 
 ## Idempotency and reconnect
 
-Every request has a globally unique `request_id`. The server persists results
-in `requests.jsonl` and reloads them on restart, so resending the same
-`request_id` returns the stored result without re-executing, and
-`request.status` reports what became of one.
+Every request has a globally unique `request_id`. The server persists the
+results of state-changing requests in `requests.jsonl` and reloads them on
+restart, so resending the same `request_id` returns the stored result without
+re-executing, and `request.status` reports what became of one. Read-only
+requests are not stored: re-running one is harmless, and storing it would keep
+file contents on the remote disk for nothing.
 
 No shipped client draws on this yet. The MCP layer generates a fresh id per
 send and never replays: a dropped connection surfaces as an error and the
@@ -447,6 +450,9 @@ never downgrades a newer one.** A missing or legacy server (one that does not
 understand `--version-json`) is installed; an older protocol or, at equal
 protocol, older software is upgraded; equal or newer software is left alone; a
 newer protocol is refused with `client_too_old` and the remote is untouched.
+The MCP server repeats the protocol check before its first connection to each
+workspace, so a server a client upgrade left behind is refused once with
+`server_too_old` instead of failing call by call.
 
 Each SSH identity has exactly one active managed binary at
 `~/.local/lib/remote-workspace/remote-workspace-server`, shared by every workspace on

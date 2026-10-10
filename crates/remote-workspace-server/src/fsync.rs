@@ -39,3 +39,19 @@ pub fn fsync_dir(_path: &Path) -> std::io::Result<()> {
     // the filesystem journal and is therefore a weaker durability boundary.
     Ok(())
 }
+
+/// Sync the entries of the directories `create_dir_all` just made, from `dir`
+/// up to and including `top`: each one exists only in its parent's metadata.
+pub fn fsync_new_dirs(dir: &Path, top: &Path) -> std::io::Result<()> {
+    let mut current = dir;
+    loop {
+        let parent = current
+            .parent()
+            .ok_or_else(|| std::io::Error::other(format!("{current:?} has no parent")))?;
+        fsync_dir(parent)?;
+        if current == top {
+            return Ok(());
+        }
+        current = parent;
+    }
+}

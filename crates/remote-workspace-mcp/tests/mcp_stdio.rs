@@ -479,6 +479,12 @@ fn mcp_integer_parameters_accept_numeric_strings() {
         serde_json::json!({"workspace": "test", "path": "a.txt", "limit": "soon"}),
     );
     assert!(e, "a non-numeric string must still be rejected: {text}");
+
+    let (e, text) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "a.txt", "offset": -1}),
+    );
+    assert!(e && text.contains("non-negative whole number"), "{text}");
 }
 
 #[test]
@@ -511,8 +517,51 @@ fn mcp_tool_call_failure_is_error() {
     );
     assert!(e, "reading a missing file must be isError=true");
     assert!(
-        text.contains("NotFound"),
+        text.contains("NOT_FOUND"),
         "error text should mention the error: {text}"
+    );
+}
+
+// A server the local client has moved past is refused before the first call,
+// with what to do about it -- not left to fail every call on a field it lacks.
+#[cfg(unix)]
+#[test]
+fn mcp_refuses_a_server_on_an_older_protocol() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let old_server = dir.path().join("old-server");
+    std::fs::write(
+        &old_server,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version-json ]; then echo '{{\"software_version\":\"0.4.0\",\"protocol_version\":2}}'; exit 0; fi\nexec {:?} \"$@\"\n",
+            server_bin()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&old_server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fleet = dir.path().join(".fleet.toml");
+    std::fs::write(
+        &fleet,
+        format!(
+            "[workspaces.test]\nroot = {root:?}\nbin = {:?}\nstate_base = {:?}\n",
+            old_server.to_string_lossy(),
+            format!("{root}/.remote-workspace-test"),
+        ),
+    )
+    .unwrap();
+    let mut s = McpSession::spawn_fleet(&fleet);
+    s.initialize();
+
+    let (e, text) = s.tool(
+        "list_directory",
+        serde_json::json!({"workspace": "test", "path": "."}),
+    );
+    assert!(e, "an incompatible server must be refused: {text}");
+    assert!(
+        text.contains("server_too_old") && text.contains("workspace upgrade"),
+        "{text}"
     );
 }
 
@@ -647,7 +696,7 @@ fn mcp_full_tool_surface() {
         serde_json::json!({"workspace": "test", "path": "f.txt", "content": "other"}),
     );
     assert!(e, "re-creating an existing file must be isError=true");
-    assert!(text.contains("AlreadyExists"), "unexpected text: {text}");
+    assert!(text.contains("ALREADY_EXISTS"), "unexpected text: {text}");
 
     // read_file returns the hash edit_file needs as base_hash.
     let (e, text) = s.tool(
@@ -670,7 +719,7 @@ fn mcp_full_tool_surface() {
             "edits": [{"old_text": "nope", "new_text": "x"}]}),
     );
     assert!(e, "no-match edit must be isError=true");
-    assert!(text.contains("NoMatch"), "unexpected text: {text}");
+    assert!(text.contains("NO_MATCH"), "unexpected text: {text}");
 
     let (e, text) = s.tool(
         "edit_file",

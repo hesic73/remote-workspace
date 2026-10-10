@@ -46,7 +46,9 @@ impl SessionLog {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        writeln!(f, "{line}")
+        // One write per line: with O_APPEND, a single write is not interleaved
+        // with another process's, while `writeln!` may issue two.
+        f.write_all(format!("{line}\n").as_bytes())
     }
 
     /// Drop all but the newest `KEEP_LINES` lines once the file passes the size
@@ -88,7 +90,7 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .expect("system clock is set before 1970")
 }
 
 #[cfg(test)]

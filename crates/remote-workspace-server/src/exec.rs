@@ -164,6 +164,7 @@ pub async fn exec(
             }
         }
     }
+    process_group.release();
 
     Ok(ExecOutcome {
         operation_id,
@@ -226,26 +227,45 @@ impl OutputCapture {
     }
 
     fn finish(mut self) -> ExecOutput {
-        let kept_bytes = self.prefix.len() + self.suffix.len();
+        let (prefix, prefix_bytes) = fit(&self.prefix, OUTPUT_PREFIX_LIMIT, Keep::Start);
+        let (suffix, suffix_bytes) = fit(
+            self.suffix.make_contiguous(),
+            OUTPUT_SUFFIX_LIMIT,
+            Keep::End,
+        );
         ExecOutput {
-            prefix: bounded_lossy(&self.prefix, OUTPUT_PREFIX_LIMIT),
-            suffix: bounded_lossy(self.suffix.make_contiguous(), OUTPUT_SUFFIX_LIMIT),
+            prefix,
+            suffix,
             total_bytes: self.total_bytes,
-            omitted_bytes: self.total_bytes.saturating_sub(kept_bytes as u64),
+            omitted_bytes: self
+                .total_bytes
+                .saturating_sub((prefix_bytes + suffix_bytes) as u64),
         }
     }
 }
 
-fn bounded_lossy(bytes: &[u8], limit: usize) -> String {
-    let mut text = decode(bytes);
-    if text.len() > limit {
-        let mut end = limit;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
+enum Keep {
+    Start,
+    End,
+}
+
+/// Decodes `bytes`, giving up raw bytes on the side away from `keep` until the
+/// text fits in `limit`, and returns how many raw bytes the text covers.
+/// Decoding can grow a byte into three (U+FFFD for invalid UTF-8), so the
+/// window is trimmed before decoding rather than the text after, which would
+/// cut the end off a suffix.
+fn fit(mut bytes: &[u8], limit: usize, keep: Keep) -> (String, usize) {
+    loop {
+        let text = decode(bytes);
+        if text.len() <= limit {
+            return (text, bytes.len());
         }
-        text.truncate(end);
+        let excess = ((text.len() - limit) / 3).max(1);
+        bytes = match keep {
+            Keep::Start => &bytes[..bytes.len() - excess],
+            Keep::End => &bytes[excess..],
+        };
     }
-    text
 }
 
 #[cfg(unix)]
@@ -459,6 +479,21 @@ mod tests {
         assert!(output.suffix.is_char_boundary(output.suffix.len()));
         assert!(output.prefix.len() <= OUTPUT_PREFIX_LIMIT);
         assert!(output.suffix.len() <= OUTPUT_SUFFIX_LIMIT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_keeps_the_end_of_the_suffix() {
+        let mut bytes = vec![b'a'; OUTPUT_PREFIX_LIMIT];
+        bytes.extend(vec![0xE9; 20_000]);
+        bytes.extend_from_slice(b"\nFATAL: build failed\n");
+        let mut capture = OutputCapture::default();
+        capture.push(&bytes);
+        let output = capture.finish();
+        assert!(output.suffix.ends_with("FATAL: build failed\n"));
+        assert!(output.suffix.len() <= OUTPUT_SUFFIX_LIMIT);
+        let kept_raw = OUTPUT_PREFIX_LIMIT + output.suffix.matches('\u{FFFD}').count() + 21;
+        assert_eq!(output.omitted_bytes, (bytes.len() - kept_raw) as u64);
     }
 
     #[cfg(windows)]
