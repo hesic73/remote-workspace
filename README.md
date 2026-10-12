@@ -3,51 +3,33 @@
 **Remote workspaces for coding agents, over plain SSH.**
 
 The agent runs on your machine; the code, toolchain, and GPUs stay on the
-remote host. Instead of installing an agent on every server, the remote side
-runs one small binary exposing atomic file operations, bounded command
-execution, and a durable operation log.
+remote host, which runs one small binary exposing atomic file operations,
+bounded command execution, and a durable operation log.
 
 ```
 coding agent  ->  remote-workspace (CLI) or remote-workspace-mcp (MCP)  ->  ssh stdio  ->  remote-workspace-server  ->  workspace
 ```
 
 The transport is JSON Lines over an SSH process's stdin/stdout: no daemon, no
-open port, no public IP, and no workspace sync. If `ssh <host>` works, this
-works -- `~/.ssh/config`, ProxyJump, Tailscale, SSH agent, and ControlMaster
-all apply unchanged.
+open port, no workspace sync. If `ssh <host>` works, this works --
+`~/.ssh/config`, ProxyJump, Tailscale, and ControlMaster all apply.
 
 Design rationale and protocol details: [`docs/design.md`](docs/design.md).
 
 ## Install
 
-Download the server artifact from a
-[release](https://github.com/hesic73/remote-workspace/releases) or build locally:
+Linux x86_64:
 
 ```bash
-cargo build --release --locked
-# target/release/remote-workspace         client + CLI
-# target/release/remote-workspace-server  server (runs on the remote host)
-# target/release/remote-workspace-mcp     MCP server for coding agents
+BASE=https://github.com/hesic73/remote-workspace/releases/latest/download
+mkdir -p ~/.local/bin
+for b in remote-workspace remote-workspace-mcp; do
+  curl -fsSL "$BASE/$b-linux-x86_64-musl" -o ~/.local/bin/$b
+  chmod +x ~/.local/bin/$b
+done
 ```
 
-For Linux x86_64 targets, `workspace add` copies the released static musl
-server automatically. Windows releases currently contain the client and MCP,
-not a server artifact: build `remote-workspace-server.exe` on the Windows host,
-place it there yourself, and pass its absolute path with `--remote-bin`.
-
-## Platform support
-
-| Local client / MCP | Remote host | Server installation |
-| --- | --- | --- |
-| Linux x86_64 | Linux x86_64, POSIX shell | Automatic static musl server download |
-| Windows x64 | Linux x86_64, POSIX shell | Automatic static musl server download |
-| Windows x64 | Windows, PowerShell OpenSSH default shell | Build and place the server manually; pass `--remote-bin` |
-
-Linux clients cannot connect to PowerShell endpoints. Other POSIX targets need a
-compatible server built and installed manually. Published Windows assets contain
-only the client and MCP, not the server.
-
-On Windows, download the client and MCP in PowerShell:
+Windows x64 (PowerShell):
 
 ```powershell
 $releaseBase = "https://github.com/hesic73/remote-workspace/releases/latest/download"
@@ -56,22 +38,37 @@ New-Item -ItemType Directory -Force $installDir | Out-Null
 foreach ($name in @("remote-workspace", "remote-workspace-mcp")) {
     Invoke-WebRequest "$releaseBase/$name-windows-x86_64.exe" -OutFile "$installDir\$name.exe"
 }
-$env:Path = "$installDir;$env:Path"
-remote-workspace --version
+$env:Path = "$installDir;$env:Path"   # this shell only; add it to your user PATH
 ```
 
-The PATH change applies to the current shell; add that directory to your user PATH
-for future shells, or use the absolute binary path in MCP registrations. Linux
-checksums are in `SHA256SUMS`; Windows checksums are in `SHA256SUMS-windows-x86_64`.
+Checksums: `SHA256SUMS` (Linux), `SHA256SUMS-windows-x86_64` (Windows). Or build
+from source:
 
-For a Windows remote, build `cargo build --release --locked -p remote-workspace-server`
-in a checkout of the same release on that host. Place the resulting
-`target\release\remote-workspace-server.exe` at a persistent path. From a Windows
-client, with PowerShell configured as the remote OpenSSH `DefaultShell`:
+```bash
+cargo build --release --locked
+# target/release/remote-workspace         client + CLI
+# target/release/remote-workspace-server  server (runs on the remote host)
+# target/release/remote-workspace-mcp     MCP server for coding agents
+```
+
+### Platform support
+
+| Local client / MCP | Remote host | Server installation |
+| --- | --- | --- |
+| Linux x86_64 or Windows x64 | Linux x86_64, POSIX shell | Automatic (static musl) |
+| Windows x64 | Windows, PowerShell as OpenSSH `DefaultShell` | Manual, with `--remote-bin` |
+
+Linux clients cannot connect to PowerShell endpoints. Other POSIX targets need a
+server built and installed manually. For a Windows remote, build
+`cargo build --release --locked -p remote-workspace-server` from the same release
+on that host, place the `.exe` at a persistent path, and from a Windows client:
 
 ```powershell
 remote-workspace workspace add windows --host user@windows-host --root C:/projects/app --remote-bin C:/tools/remote-workspace-server.exe --remote-shell powershell
 ```
+
+PowerShell endpoints use one short SSH/server process per request, so requests
+to one workspace are serialized and pay SSH startup each time.
 
 ## Quick start
 
@@ -95,9 +92,7 @@ Adding workspace 'robot'
 Workspace 'robot' is ready.
 ```
 
-Then use it from an agent through MCP. The CLI reaches the same workspace, but
-it does not read the fleet file -- point it at the server `workspace add`
-installed:
+The CLI does not read the fleet file; point it at the installed server:
 
 ```bash
 BIN=/home/robot/.local/lib/remote-workspace/remote-workspace-server
@@ -105,11 +100,7 @@ remote-workspace --host robot@workstation --root /home/robot/project --remote-bi
 remote-workspace --host robot@workstation --root /home/robot/project --remote-bin $BIN exec -- pytest -q
 ```
 
-Without `--remote-bin` the CLI looks for `remote-workspace-server` on the
-remote PATH, where `workspace add` does not put it.
-
-`--local` runs the server as a subprocess instead of over SSH, which is handy
-for trying things out on one machine.
+`--local` runs the server as a local subprocess instead of over SSH.
 
 ## Use from a coding agent (MCP)
 
@@ -119,35 +110,18 @@ codex mcp add remote-workspace -- remote-workspace-mcp
 grok mcp add --scope user remote-workspace -- remote-workspace-mcp
 ```
 
-You can register the MCP before adding any workspace. A missing fleet file, an
-empty file, or `[workspaces]` with no entries is a valid unconfigured state:
-`list_workspaces` returns `[]`, and `--check` succeeds with an onboarding hint.
-No workspace is added automatically. Add the first one later; the running MCP
-picks it up on its next call. Invalid TOML, unknown fields, and unreadable files
-remain errors. Removing the fleet file or its last entry clears the available
-workspaces without stopping the MCP.
+One MCP serves the whole fleet. Tools: `list_workspaces`, `list_directory`,
+`read_file`, `create_file`, `edit_file`, `delete_file`, `run_command`,
+`upload_file`, `download_file`. Search, Git, builds, and tests all go through
+`run_command`. Every tool except `list_workspaces` takes a **required**
+`workspace` argument, so a call never lands on a machine by default. Inspecting
+history (`history`, `op`, `status`) is a CLI job, not an agent tool.
 
-`remote-workspace-mcp` multiplexes the whole fleet over stdio. Tools:
-`list_workspaces`, `list_directory`, `read_file`, `create_file`, `edit_file`,
-`delete_file`, `run_command`, `upload_file`, `download_file`.
-
-There is exactly one canonical tool per intent -- search, file discovery, Git,
-builds, and tests all go through `run_command`, with no wrapper tools. Every
-tool except `list_workspaces` takes a **required** `workspace` argument, so a
-call can never land on the wrong machine because a default filled itself in.
-
-Inspecting what happened -- `history`, `op`, `status` -- is a CLI job: the
-reader is you, not the agent that wrote the record.
-
-Register the MCP with `--log-dir DIR` to record every request and response,
-one JSONL file per workspace, then `remote-workspace stats` for per-tool call
-and error counts. It is the only record of the read-only calls, and is off by
-default because a logged request carries the full content of a `create_file`
-or `edit_file`.
-
-Conventions for the agent itself live in one canonical place,
-[`AGENT_GUIDANCE.md`](crates/remote-workspace-mcp/AGENT_GUIDANCE.md), which the MCP
-server embeds verbatim in its initialization instructions.
+The MCP can be registered before any workspace exists: an empty or missing fleet
+is valid, and workspaces added later are picked up on the next call. Agent
+conventions live in
+[`AGENT_GUIDANCE.md`](crates/remote-workspace-mcp/AGENT_GUIDANCE.md), embedded in
+the MCP's initialization instructions.
 
 Diagnose the fleet without starting the MCP:
 
@@ -155,18 +129,22 @@ Diagnose the fleet without starting the MCP:
 remote-workspace-mcp --check
 ```
 
-It validates the config and probes every workspace once, printing per-workspace
-status and exiting nonzero if anything is unhealthy. Each failure carries a
-stable code (`connect_failed`, `probe_failed`) so it says which layer broke; a
-tool call naming a workspace that is not configured gets `unknown_workspace`.
+It probes every workspace once and exits nonzero if any is unhealthy. Errors
+start with a stable code: `connect_failed` (SSH), `probe_failed` (server reached,
+round-trip failed), `unknown_workspace`, `fleet_reload_failed`, and, from tool
+calls, `server_too_old` / `client_too_old` when the two sides speak different
+protocols.
+
+Register with `--log-dir DIR` to record every request and response (one JSONL
+file per workspace), then run `remote-workspace stats` for per-tool call and
+error counts. It is off by default because logs carry full file contents.
 
 ## Configuration
 
 ### Fleet
 
 Workspaces live in `~/.remote-workspace/workspaces.toml` (override with
-`--fleet`). A workspace is a `(machine, root)` pair; two roots on one machine
-and one root each on two machines are the same concept.
+`--fleet`). A workspace is a `(machine, root)` pair.
 
 ```toml
 [workspaces.robot]
@@ -178,42 +156,22 @@ label = "ROS workspace"      # optional, shown by list_workspaces
 # config / state_base optional, same meaning as the server flags
 ```
 
-Prefer `workspace add` over editing this by hand: it validates the target and
-rewrites the file atomically, preserving your comments and other entries. New
-SSH entries always record their detected `remote_shell`; entries created by
-older versions without the field are still read as POSIX. Use
-`--remote-shell` during `workspace add` only when detection needs an explicit
-answer. A running MCP picks up changes on its next call -- no restart, and workspaces
-whose entry did not change keep their open connections. A file that does not
-parse is never partially applied; calls report `fleet_reload_failed` until it
-is valid again.
-
-The new field is intentionally not backward-compatible with 0.5.0's strict
-fleet parser. Upgrade the client and MCP everywhere that reads a shared fleet
-before adding a workspace with this release; no server change is needed just
-to parse the fleet. PowerShell SSH endpoints require the client and MCP to run
-on Windows. The Windows OpenSSH server must also have PowerShell configured as
-its `DefaultShell`: platform detection invokes PowerShell explicitly, but the
-actual SSH sessions are parsed by the configured default shell. These endpoints
-use one short SSH/server process per request, so requests to one workspace are
-serialized and pay SSH startup cost. Install the newer client and MCP on every
-machine sharing a fleet before adding a PowerShell entry.
+Prefer `workspace add` over hand edits: it validates the target and rewrites the
+file atomically, keeping comments and other entries. A running MCP picks up
+changes on its next call, keeping connections to unchanged workspaces. A file
+that does not parse is never partially applied.
 
 ### Execution profiles
 
 Every `exec` spawns a fresh process, so `conda activate` never leaks between
-commands. Re-apply environment setup per command with server-side profiles, in
-a TOML file on the remote host (point the server at it with `--config`, or the
-fleet's `config` field):
+commands. Re-apply environment setup per command with profiles in a TOML file on
+the remote host (pass it with `--config`, or the fleet's `config` field):
 
 ```toml
-default_profile = "user-zsh"
-
-[profiles.user-zsh]
-shell = ["zsh", "-lic"]      # reuse the user's real login environment
-setup = ""
+default_profile = "robot"
 
 [profiles.robot]
+shell = ["bash", "-lc"]
 setup = """
 source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate robot
@@ -221,104 +179,71 @@ source /opt/ros/humble/setup.bash
 """
 ```
 
-A profile decides only which shell to start and what to run before the command.
-With no profile at all, the argv is spawned directly with no shell. Parsing is
-strict: unknown fields, an empty `shell`, or a `default_profile` naming no
-declared profile fail server startup rather than silently running commands in
-the wrong environment.
-
-On a Windows server the default `shell` is Windows PowerShell, and `setup` is
-PowerShell code. The command then starts as its own process: environment
-variables and `Set-Location` from the setup carry over, while functions and
-aliases it defines do not. Bare command names are found as PowerShell finds
-them, so `.cmd` shims such as `npm` work with or without a profile.
+With no profile, the argv is spawned directly with no shell. Parsing is strict:
+unknown fields, an empty `shell`, or an undeclared `default_profile` fail server
+startup. On a Windows server the default `shell` is Windows PowerShell; variables
+and `Set-Location` from `setup` carry over to the command, functions and aliases
+do not.
 
 ### Server state
 
-Server state (history, idempotency table, scratch) lives **outside
-the workspace**, on the remote host, keyed by canonical root path:
+History, the idempotency table, and scratch live **outside the workspace**, on
+the remote host:
 
 ```
 ~/.remote-workspace/state/<rootname>-<hash>/
 ```
 
-So the workspace has no dotdir, nothing shows up in `git status`, and a
-destructive command inside the workspace cannot take the operation log with it.
-`--state-base /data/$USER` relocates the base when home is tight; deleting the
-state directory is always safe. Growth is bounded by `--history-limit`
-(default 1000) and `gc`.
+Nothing shows up in `git status`, and a command inside the workspace cannot
+delete the log. `--state-base` relocates it; deleting it is always safe. History
+is bounded by `--history-limit` (default 1000) and `gc`; scratch files idle for
+7 days are swept.
 
-One server serves a workspace root at a time, so a workspace in use by another
-session is refused with the pid holding it. A server also exits on its own
-after `--idle-timeout-secs` (default 900) with no request arriving and none
-running, releasing the lock; the next tool call reconnects. Without that, a
-session that dies with its network -- a closed laptop, a dropped VPN -- leaves
-the remote server waiting on a connection nobody will ever close again, and the
-workspace looks occupied until the host's TCP keepalives give up hours later.
-`<state>/server.jsonl` on the remote records each start, refusal, and exit.
+One server serves a workspace root at a time; another session is refused with
+the pid holding it. A server exits after `--idle-timeout-secs` (default 900)
+with nothing arriving or running, so a dead SSH session does not hold the lock
+for hours. `<state>/server.jsonl` records each start, refusal, and exit.
 
 ## CLI
 
 | Command | Purpose |
 |---------|---------|
 | `workspace add <name> --host H --root R` | Onboard a new workspace: install the server, record it in the fleet |
-| `workspace upgrade [<name>]` | Install/upgrade the managed server for workspaces already in the fleet |
+| `workspace upgrade [<name>]` | Install/upgrade the managed server for workspaces in the fleet |
 | `ls <path>` | List a directory |
 | `stat <path>` | Stat a file or directory |
 | `cat <path>` | Read a file |
-| `create <path> [--file F]` | Create a new file; fails if it exists |
+| `create <path> [--file F]` | Create a new file (stdin by default); fails if it exists |
 | `edit <path> --base-hash H --old-text S --new-text S` | Exact text replacement in an existing file |
 | `rm <path>` | Delete a file |
 | `exec [--cwd D] [--profile P] -- argv...` | Run a command |
 | `history [--limit N]` | List recorded operations |
 | `op <operation_id>` | Details of one operation |
 | `status <request_id>` | Status of a previously-issued request |
-| `gc [--keep N]` | Prune stored history; also sweeps expired scratch and reports what it holds |
-| `stats [--log-dir D]` | Per-tool call and error counts from the MCP interaction logs (local only) |
+| `gc [--keep N]` | Prune history, sweep expired scratch, report scratch usage |
+| `stats [--log-dir D]` | Per-tool call and error counts from MCP logs (local only) |
 
-Connection flags: `--host`, `--root`, `--remote-bin`, `--config`,
-`--state-base`, `--local`, `--log <file>`. `workspace add` is an
-administrative command with its own `--host`/`--root` and does not use them.
+Connection flags: `--host`, `--root`, `--remote-bin`, `--remote-shell`,
+`--config`, `--state-base`, `--local`, `--log <file>`.
 
 ## Upgrades
 
-`remote-workspace-server --version-json` reports two fields: `software_version`
-(the release) and `protocol_version` (bumped only on incompatible changes).
-A newer client upgrades an older server; an older client never downgrades a
-newer one.
+The client installs only the server release matching **its own** version, so
+upgrade in this order:
 
-Upgrading is two steps, in this order. The client only ever fetches the
-release matching **its own** version, so a stale client installs a stale
-server and reports success.
+1. Your own binaries: rerun the [install](#install) commands, then restart the
+   MCP host.
+2. The remote servers: `remote-workspace workspace upgrade` (or
+   `workspace upgrade robot` for one).
 
-```bash
-# 1. your own machine -- the same command that installed them
-BASE=https://github.com/hesic73/remote-workspace/releases/latest/download
-for b in remote-workspace remote-workspace-mcp; do
-  curl -fsSL "$BASE/$b-linux-x86_64-musl" -o ~/.local/bin/$b
-  chmod +x ~/.local/bin/$b
-done
+`upgrade` installs once per SSH identity, transfers nothing when a host is
+current, never downgrades a newer server, and never edits the fleet file. Each
+SSH identity holds one managed server at
+`~/.local/lib/remote-workspace/remote-workspace-server`. A server given with
+`--remote-bin` is user-managed: checked for compatibility, never overwritten.
 
-# 2. the remote servers
-remote-workspace workspace upgrade            # every workspace in the fleet
-remote-workspace workspace upgrade robot      # or just one
-```
-
-Restart the MCP host after step 1: MCP servers are loaded at startup.
-
-`upgrade` installs once per SSH identity however many workspaces share it,
-reports `up to date` and transfers nothing when a host is already current, and
-never edits the fleet file. (`add` is for new workspaces only; it refuses a
-name already in the fleet.)
-
-Each SSH identity holds one managed server at
-`~/.local/lib/remote-workspace/remote-workspace-server`, shared by every workspace on
-that host. Passing `--remote-bin` marks a server user-managed: checked for
-compatibility, never installed or overwritten. Releases are cut by pushing a
-tag (`git tag -a vX.Y.Z && git push origin vX.Y.Z`): CI builds the static
-artifacts and publishes them with a manifest and checksums. The workflow can
-also be run by hand; it builds either way, and publishes only when the ref it
-runs against is a tag.
+`remote-workspace-server --version-json` reports `software_version` and
+`protocol_version` (bumped only on incompatible changes).
 
 ## Development
 
@@ -331,21 +256,20 @@ crates/
 ```
 
 ```bash
-cargo build --workspace --locked       # binaries used by integration tests
-cargo test --workspace --all-targets --locked # includes end-to-end tests against the
-                                       # real server and MCP binaries
+cargo build --workspace --locked                # binaries used by integration tests
+cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-CI runs the workspace tests, formatting, and Clippy on Linux and Windows. It also
-builds static Linux artifacts and Windows client/MCP executables; tagged releases
-publish only after all jobs pass. MCP stdio tests run on both platforms, except
-the Unix process-kill/reconnect test.
+CI runs tests, formatting, and Clippy on Linux and Windows, and builds the
+release artifacts. Releases are cut by pushing a tag
+(`git tag -a vX.Y.Z && git push origin vX.Y.Z`); publishing requires every job to
+pass and the tag to match the built version.
 
-The real Windows-client SSH transfer smoke test is opt-in, not exercised by the
-hosted CI runners. To run it from Windows, set `REMOTE_WORKSPACE_TEST_HOST`,
-`REMOTE_WORKSPACE_TEST_ROOT`, `REMOTE_WORKSPACE_TEST_BIN`, and
-`REMOTE_WORKSPACE_TEST_SHELL` (`posix` or `powershell`) to a prepared target, then:
+The Windows-client SSH smoke test is opt-in. From Windows, set
+`REMOTE_WORKSPACE_TEST_HOST`, `REMOTE_WORKSPACE_TEST_ROOT`,
+`REMOTE_WORKSPACE_TEST_BIN`, and `REMOTE_WORKSPACE_TEST_SHELL` (`posix` or
+`powershell`), then:
 
 ```powershell
 cargo test -p remote-workspace-client --test windows_remote_smoke -- --ignored

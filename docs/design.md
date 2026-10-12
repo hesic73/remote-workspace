@@ -118,7 +118,7 @@ Creation and modification are deliberately separate, so there is exactly one
 canonical way to perform each:
 
 * `create` makes a NEW text file and fails with `ALREADY_EXISTS` if the path
-  exists (installed atomically via an exclusive link, so even a concurrent
+  exists (installed with an atomic no-clobber rename, so even a concurrent
   creator cannot be clobbered).
 * `edit` modifies an EXISTING text file by exact text replacement, the
   editing semantics coding models already know: `old_text` must match the
@@ -170,8 +170,8 @@ The result is synchronous and bounded: each stream retains its first 4 KiB and
 last 12 KiB. `exec` promises no transactionality -- it can do anything the
 remote user can.
 
-`exec` owns the command's process tree (the child runs in its own session via
-`setsid`, whose failure aborts the spawn). The central invariant: every
+`exec` owns the command's process tree (on POSIX the child runs in its own
+session via `setsid`; on Windows, in a Job object). The central invariant: every
 invocation reaches a terminal response within a bounded period, including
 subprocess cleanup. After the direct child exits, output collection waits a
 short grace period (2 s) for stdout/stderr to reach EOF; a descendant that
@@ -179,16 +179,18 @@ inherited the pipes and still holds them at the deadline is SIGKILLed along
 with the rest of the process group, the readers are abandoned, and the result
 carries `drain_timed_out: true` to say collection stopped before pipe EOF. A
 descendant that redirected its output away (the tmux/nohup pattern) closes
-the pipes at exit and survives. Timeout kills the whole process group
-immediately. Detached workloads are not a supported property of `exec`.
+the pipes at exit and survives. Timeout, and an abort on server shutdown, kill
+the whole tree immediately. Detached workloads are not a supported property of
+`exec`.
 
 ### File transfer
 
 `upload_file`/`download_file` (exposed as MCP tools and client-library
 functions) move single regular files without pushing content through the JSONL
-protocol. The control plane stays on the resident connection; the data plane is
-a separate short-lived process per transfer, spawned over the same SSH
-configuration:
+protocol. The control steps run on the workspace's control connection, fetched
+again after streaming, so commit may land on a different server process than
+prepare; the data plane is a separate short-lived process per transfer, spawned
+over the same SSH configuration:
 
 ```text
 remote-workspace-server --transfer-receive <staging> --expect-size N   # stdin -> staging file
@@ -206,10 +208,9 @@ the target's directory; `upload_commit` verifies the staged size, installs
 atomically (rename for overwrite, hard-link-then-unlink for race-free
 no-replace), fsyncs, and appends the operation record; `upload_abort` deletes
 the staging file after a failure. The staging path travels only between the
-server and the client and is never shown to the agent. It is held in memory on
-persistent POSIX sessions and in an atomically replaced
-`pending_uploads.json` registry for PowerShell, where prepare and commit run in
-different server processes.
+server and the client and is never shown to the agent. It is registered in an
+atomically replaced `pending_uploads.json`, which is what lets commit run in a
+different server process than prepare.
 Downloads verify size and SHA-256 against the sender's framing, install
 locally via temp file + (no-clobber) rename, then append a `download_record`.
 
@@ -234,7 +235,7 @@ scratch trees on `gc`, which reports the count as `removed_stale_staging`.
 Startup deliberately does not walk the tree: a server starts on every
 reconnect, and an unbounded scan there would tax large workspaces.
 
-Both directions stream through fixed 64 KiB buffers; memory does not grow
+Both directions stream through fixed-size buffers; memory does not grow
 with file size. Operation records are metadata-only (direction, remote
 logical path, size, hash, duration) -- no local paths, no content. Transfers
 are synchronous and have no resume/job machinery: a
@@ -248,24 +249,18 @@ kill healthy transfers. Instead each step is bounded by a stall window
 *anything* is still moving; crossing it fails with `transfer_stalled` and the
 byte position, so a transfer that died at 42 of 100 MiB says so. Every other
 transfer error carries the same position and average rate. Detecting the stall
-is not sufficient on its own: a sender that has stopped producing will also
-never exit, so the child is killed before it is reaped -- otherwise the call
-hangs at the reap, precisely where the stall was supposed to surface.
+is not sufficient on its own: on a stall the child is killed before it is
+reaped, or the reap itself would hang.
 
 ## No reversal
 
-Nothing here undoes a file operation. An `undo` operation existed through
-protocol 1, restoring a `create`/`edit`/`delete` from a stored before-blob
-while the file was untouched since. It was removed in protocol 2, because the
-cases it covered are the ones a caller can already redo -- an agent that just
-wrote an edit still holds the old text, and a tracked file is a `git checkout`
-away -- while everything genuinely destructive (`rm -rf`, `mv`, `sed -i`, a
-bad `git` invocation) runs through `exec` and was never reversible anyway. A
-safety net that catches only what does not fall is worth less than the cost of
-carrying it: a before-blob written and fsync'd on every mutation, plus its own
-recovery and pruning paths.
+Nothing here undoes a file operation. `undo` (removed in protocol 2) only
+covered what a caller can already redo -- the agent still holds the old text, a
+tracked file is a `git checkout` away -- while genuinely destructive changes go
+through `exec` and were never reversible. It was not worth a fsync'd
+before-blob on every mutation.
 
-What remains is the record, not the rescue: `history` and `operation.get` say
+What remains is the record, not the rescue: `history` and `operation_get` say
 exactly what happened, and durability against mistakes belongs to version
 control. A state directory written by an older server hands its now-unreadable
 `blobs/` back as disk on first start.
@@ -277,13 +272,14 @@ the canonical root path:
 
 ```text
 ~/.remote-workspace/state/<rootname>-<hash>/
-|-- operations.jsonl   one record per operation (fs + exec)
-|-- requests.jsonl     request idempotency table
-|-- pending_uploads.json  cross-process upload registry (PowerShell)
-|-- scratch/           agent-visible runtime artifacts (`@scratch/...`)
-|-- lock               single-writer flock
-|-- server.jsonl       server lifecycle: start, lock refusal, exit reason
-`-- op-counter         id high-water mark (prevents reuse after pruning)
+|-- operations.jsonl      fs, exec, and transfer records, plus prepared/aborted markers
+|-- requests.jsonl        request idempotency table
+|-- pending_uploads.json  cross-process upload registry
+|-- scratch/              agent-visible runtime artifacts (`@scratch/...`)
+|-- scratch-swept         marker limiting the scratch sweep to once a day
+|-- lock                  single-writer flock
+|-- server.jsonl          server lifecycle: start, lock refusal, exit reason
+`-- op-counter            id high-water mark (prevents reuse after pruning)
 ```
 
 The workspace stays untouched -- nothing for `git status`, nothing a
@@ -324,7 +320,9 @@ after reconnect) are exactly the reason the state must outlive them.
   ids are never reallocated.
 * **Scratch expires.** Files idle -- neither written nor read -- beyond
   `--scratch-max-age-days` (default 7; 0 disables) are deleted, and `gc`
-  reports what scratch holds either way. *Idle* counts reads deliberately:
+  reports what scratch holds. An entry that cannot be read or removed does not
+  stop the sweep; failures are reported after it (a `gc` error, a startup
+  warning). *Idle* counts reads deliberately:
   under `relatime` an agent paging through a large log leaves mtime untouched,
   so evicting on mtime alone would delete the file mid-read. There is no
   daemon; the sweep rides on server startup and a marker file limits it to
@@ -332,47 +330,34 @@ after reconnect) are exactly the reason the state must outlive them.
   cleanup are therefore driven by the same event -- use -- and a workspace
   nobody touches is never swept because it is not growing either.
 
-  Age is the only criterion. A size ceiling was considered and rejected twice
-  over: a total cap deletes the wrong file (something perfectly good goes
-  because something else was just written, which makes the same workflow
-  succeed or fail depending on unrelated activity), and a per-file cap cannot
-  express the distinction that matters -- in real usage here the legitimate
-  logs are *larger* than the checkpoints that do not belong. What scratch is
-  for is a question of kind, not bytes, so it is stated in the agent guidance
-  instead: working material yes, results no.
+  Age is the only criterion: a size cap evicts the wrong files, and what
+  belongs in scratch is a matter of kind, not bytes, which the agent guidance
+  covers (working material yes, results no).
 * **Single writer.** The state directory is protected by an exclusive flock
   held for the server's lifetime (auto-released by the kernel on death). A
   second server on the same root fails fast with a clear error; reconnects
   get a short grace period while the predecessor shuts down.
-* **The server outlives no one.** Stdin EOF is the ordinary way a server
-  exits, but it depends on the far end of the SSH session noticing that its
-  peer is gone -- which a suspended laptop, a switched network, or a dropped
-  VPN can delay for as long as TCP keepalives take (hours). The client's own
-  detection is aggressive by comparison (`ServerAliveInterval=30`,
-  `ServerAliveCountMax=4`), so without a deadline of its own the server spends
-  that entire gap holding a lock for a client that is already gone and
-  reconnecting -- which is what makes a workspace look occupied when nobody is
-  using it. So the server also exits after `--idle-timeout-secs` (default 900;
-  0 disables) with no request arriving *and none running*: a single hour-long
-  `exec` is silence, not idleness, and must not be killed by the timer waiting
-  on it. Timing out is cheap because connections are rebuilt on demand -- the
-  next tool call pays one SSH connect.
+* **The server outlives no one.** Stdin EOF is the ordinary exit, but a
+  suspended laptop or dropped VPN can leave the SSH session undetected for
+  hours, holding the lock while the client has long reconnected. So the server
+  also exits after `--idle-timeout-secs` (default 900; 0 disables) with no
+  request arriving *and none running* -- an hour-long `exec` is not idleness.
+  Reconnecting costs the next call one SSH connect.
 
 ## Idempotency and reconnect
 
 Every request has a globally unique `request_id`. The server persists the
-results of state-changing requests in `requests.jsonl` and reloads them on
-restart, so resending the same `request_id` returns the stored result without
-re-executing, and `request.status` reports what became of one. Read-only
-requests are not stored: re-running one is harmless, and storing it would keep
-file contents on the remote disk for nothing.
+results of operation-producing requests (`create`, `edit`, `delete`, `exec`,
+`upload_commit`, `download_record`, `gc`) in `requests.jsonl` and reloads them
+on restart, so resending the same `request_id` returns the stored result
+without re-executing, and `request_status` reports what became of one.
+Read-only requests and the upload `prepare`/`abort` steps are not stored:
+re-running them is harmless, and storing reads would keep file contents on the
+remote disk for nothing.
 
-No shipped client draws on this yet. The MCP layer generates a fresh id per
-send and never replays: a dropped connection surfaces as an error and the
-next call reconnects. The table is still worth its one append per request --
-it is what makes replay possible at all -- but the recovery it enables is a
-capability, not a behavior. `exec` is never auto-retried in any case, since
-re-running a command may not be safe.
+No shipped client replays yet: the MCP generates a fresh id per send and never
+retries, so the table enables replay rather than performing it. `exec` is never
+auto-retried, since re-running a command may not be safe.
 
 The replay window equals the retention window: request entries older than the
 newest `--history-limit` operations are pruned along with them. Reconnect
@@ -404,14 +389,10 @@ the MCP exposes only already-configured workspaces; the agent chooses among
 them. There is no `add_workspace`, `install_server`, or reload tool.
 
 Onboarding probes POSIX first and PowerShell second, then records
-`remote_shell = "posix"` or `remote_shell = "powershell"`. An omitted field in
-an older fleet still means POSIX, but newly written entries are intentionally
-not readable by 0.5.0's strict parser. Upgrade every client/MCP sharing a fleet
-before adding workspaces with this release. Every
-later control and transfer connection uses that recorded quoting model without
-probing, retrying, or guessing. `--remote-shell` provides an explicit override
-for hosts whose environment makes automatic detection ambiguous. Fleet entries
-from releases before this field existed retain POSIX behavior.
+`remote_shell = "posix"` or `remote_shell = "powershell"` (an omitted field
+means POSIX). Every later control and transfer connection uses that recorded
+quoting model without probing or guessing. `--remote-shell` overrides detection
+for hosts where it is ambiguous.
 
 PowerShell endpoints require a Windows client/MCP. Their control proxy uses one
 SSH connection and server process per request, forces that process's idle
@@ -450,9 +431,10 @@ never downgrades a newer one.** A missing or legacy server (one that does not
 understand `--version-json`) is installed; an older protocol or, at equal
 protocol, older software is upgraded; equal or newer software is left alone; a
 newer protocol is refused with `client_too_old` and the remote is untouched.
-The MCP server repeats the protocol check before its first connection to each
-workspace, so a server a client upgrade left behind is refused once with
-`server_too_old` instead of failing call by call.
+The MCP server repeats the protocol check before connecting to a workspace
+until it passes once, so a server a client upgrade left behind is refused with
+`server_too_old` (or `client_too_old`) up front instead of failing with parse
+errors. An SSH failure during the check is retried like a connect failure.
 
 Each SSH identity has exactly one active managed binary at
 `~/.local/lib/remote-workspace/remote-workspace-server`, shared by every workspace on
@@ -519,20 +501,10 @@ call can never land on the wrong machine because a default silently filled
 in. Results echo the workspace name, since operation and request IDs are
 only unique within one workspace.
 
-`history`, `operation.get` and `request.status` are protocol operations
-without MCP tools. Across ~3,000 logged calls, `history` was used three times
-(all while testing this server) and the other two never. `request.status`
-never could be: request ids are generated per send and appear in no result or
-error, so the agent cannot obtain the argument. `operation.get` could be, but
-an agent that just made an edit already knows what it did. Both stay on the
-CLI, where the reader is a person rather than the agent that wrote the
-record.
-
-`list_directory` survives a similar test for the opposite reason. Agents
-rarely call it either, preferring `ls` for its flags and composition, but it
-is the only file discovery that enforces the workspace boundary, and a
-surface that can read a path but not find one is incoherent. An unpopular
-tool is not a dead one.
+`history`, `operation_get` and `request_status` stay CLI-only: across ~3,000
+logged calls agents used `history` three times and the others never (request
+ids are not even visible to the agent). `list_directory` is rarely called too,
+but stays as the only file discovery that enforces the workspace boundary.
 
 The MCP process keeps one independent, lazily-opened connection per
 workspace, so a dead machine costs only its own calls, and the fleet needs
@@ -542,9 +514,8 @@ no server-side coordination at all -- there is no cross-workspace operation
 
 * Protocol errors map to MCP `isError` results, so failures are visible to
   the agent.
-* `run_command` returns one synchronous terminal result. The server drains both
-  pipes but retains only the first 4 KiB and last 12 KiB of each stream, with
-  total and omitted byte counts. No streaming output path exists.
+* `run_command` returns one synchronous, bounded result (see [Exec](#exec)); no
+  streaming output path exists.
 * `read_file` returns at most 64 KiB per call; directory listings return at
   most 1,000 entries with `next_offset`. History defaults to 50 records,
   rejects limits above 100, and omits exec preview text.
@@ -568,20 +539,16 @@ no server-side coordination at all -- there is no cross-workspace operation
   file never drops a live SSH session; new entries get slots, removed or
   materially changed ones lose theirs. An invalid file is never partially
   applied: the last known-good snapshot is retained and every operation returns
-  `fleet_reload_failed` until the file parses again. Reporting the breakage once
-  and then quietly serving a stale fleet would turn a real misconfiguration into
-  a silent one, so the failure is deliberately persistent rather than a
-  one-shot warning. Because `workspace add` writes only fully validated
+  `fleet_reload_failed` until the file parses again. Because `workspace add` writes only fully validated
   configuration atomically, a new workspace simply appears on the next call --
   without restarting Claude Code, Codex, or the MCP process.
 * Connections are rebuilt on demand: a dead link is replaced on the next
   tool call (retries with backoff, probed with a real round-trip), while a
   call that dies mid-flight surfaces as an error and is never auto-retried.
-  `initialize` never blocks on connecting, and the transport child carries
-  PDEATHSIG so a killed MCP cannot orphan its ssh (which would keep the
-  remote server -- and the state lock -- alive). PDEATHSIG covers a dead
-  *process*; a dead *link* is covered from the far end by the server's idle
-  timeout.
+  `initialize` never blocks on connecting. On Linux the transport child
+  carries PDEATHSIG so a killed MCP cannot orphan its ssh (which would keep
+  the remote server -- and the state lock -- alive); a dead *link* is covered
+  from the far end by the server's idle timeout.
 * The transport child's stderr is captured, not inherited, and its tail is
   attached to `server closed connection`. A server that refuses to start says
   why and exits; inheriting that text scatters it into the MCP host's log,
@@ -628,7 +595,4 @@ the alternative is a multi-process operation log -- per-append locking, id
 allocation through the counter file, and in-memory tables demoted to caches
 with invalidation -- which puts the WAL and idempotency core at risk to serve a
 case with a simple workaround. Point the second session at a different root, or
-wait for the first to exit -- bounded by the idle timeout, so "wait for it" is
-minutes rather than however long a dead session goes unnoticed. Which server
-holds the lock, and whether it was ever knocked on, is in the holder's
-`server.jsonl`.
+wait for the first to exit (bounded by the idle timeout).

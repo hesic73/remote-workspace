@@ -109,16 +109,10 @@ remote-workspace-server     (on the remote; automatic install on Linux x86_64)</
 
 <h2>Install</h2>
 
-<p>You need two binaries on your own machine. For Linux x86_64 remotes, the server
-is installed automatically when you add a workspace. Windows remotes currently
-require a manually built and placed server plus <code>--remote-bin</code>.</p>
+<p>You need two binaries on your own machine. The server is installed on Linux
+x86_64 remotes for you when you add a workspace.</p>
 
-<h3>Download</h3>
-
-<p>Version 0.6.0 adds Windows x64 client/MCP downloads alongside the static Linux x86_64 builds.
-The Windows release does not include a managed server artifact.</p>
-
-<h4>Linux x86_64</h4>
+<h3>Linux x86_64</h3>
 <pre><code>BASE=https://github.com/hesic73/remote-workspace/releases/latest/download
 
 mkdir -p ~/.local/bin
@@ -129,19 +123,17 @@ done
 
 remote-workspace --version</code></pre>
 
-<h4>Windows x64 (PowerShell)</h4>
+<h3>Windows x64 (PowerShell)</h3>
 <pre><code>$releaseBase = "https://github.com/hesic73/remote-workspace/releases/latest/download"
 $installDir = "$env:LOCALAPPDATA\remote-workspace\bin"
 New-Item -ItemType Directory -Force $installDir | Out-Null
 foreach ($name in @("remote-workspace", "remote-workspace-mcp")) {
     Invoke-WebRequest "$releaseBase/$name-windows-x86_64.exe" -OutFile "$installDir\$name.exe"
 }
-$env:Path = "$installDir;$env:Path"
+$env:Path = "$installDir;$env:Path"   # this shell only; add it to your user PATH
 remote-workspace --version</code></pre>
-<p>The PATH change applies to this shell. Add the directory to your user PATH for
-future shells, or register MCP with the absolute executable path.</p>
-<p class="muted">Release checksums: <code>SHA256SUMS</code> for Linux and
-<code>SHA256SUMS-windows-x86_64</code> for Windows.</p>
+<p class="muted">Checksums: <code>SHA256SUMS</code> (Linux),
+<code>SHA256SUMS-windows-x86_64</code> (Windows).</p>
 
 <h3>Build from source</h3>
 
@@ -161,7 +153,7 @@ install -m755 target/release/remote-workspace \
 </tbody>
 </table>
 <p>Linux clients cannot use PowerShell endpoints. Other POSIX targets need a
-compatible server built and installed manually.</p>
+server built and installed manually.</p>
 
 <h2>Add a workspace</h2>
 
@@ -193,10 +185,8 @@ Add as many workspaces as you like, on as many machines as you like.</p>
 <code>target\release\remote-workspace-server.exe</code> at a persistent path and
 configure PowerShell as the OpenSSH <code>DefaultShell</code>. From a Windows client:</p>
 <pre><code>remote-workspace workspace add windows --host user@windows-host --root C:/projects/app --remote-bin C:/tools/remote-workspace-server.exe --remote-shell powershell</code></pre>
-<p>PowerShell requests use one short SSH/server process per request and are
-serialized per workspace. Windows server installation and upgrades are manual.
-Upgrade every client/MCP sharing a fleet before adding these entries: the
-<code>remote_shell</code> field is rejected by version 0.5.0.</p>
+<p>PowerShell endpoints use one short SSH/server process per request, serialized
+per workspace. Installing and upgrading a Windows server is manual.</p>
 
 <div class="note">
 <strong>Adding is for new workspaces.</strong> A name already in the fleet is refused;
@@ -205,14 +195,9 @@ moving registered hosts onto a newer release is <a href="#upgrading">upgrading</
 
 <h2>Connect it to your agent</h2>
 
-<p>One entry serves your whole fleet, so adding a workspace later needs no change here.
-Restart the host application afterwards, since MCP servers are loaded at startup.</p>
-<p>You can connect the MCP before adding a workspace. A missing or empty fleet is
-valid: <code>list_workspaces</code> returns <code>[]</code>, and
-<code>--check</code> succeeds with instructions for adding the first workspace.
-Nothing is registered automatically. Adding the first workspace takes effect on
-the next call; deleting the fleet file or its last entry clears the list. Invalid
-configuration and unreadable files still produce errors.</p>
+<p>One entry serves your whole fleet, and it can be added before any workspace
+exists: workspaces added later are picked up on the next call. Restart the host
+application after registering, since MCP servers are loaded at startup.</p>
 
 <h3>Claude Code</h3>
 <pre><code>claude mcp add --scope user remote-workspace -- remote-workspace-mcp</code></pre>
@@ -251,15 +236,6 @@ except <code>list_workspaces</code> takes a required <code>workspace</code> argu
 call cannot land on the wrong machine by default. Inspecting what happened afterwards
 is a job for the <code>remote-workspace</code> CLI, not a tool the agent carries.</p>
 
-<h3>What CI verifies</h3>
-<p>Linux and Windows CI run workspace tests, including MCP stdio startup and fleet
-reload, plus formatting and Clippy. Separate jobs build and run the Linux static
-artifacts and Windows client/MCP executables. Publishing is gated on all jobs.</p>
-<p>The real Windows-client SSH transfer smoke test requires a prepared SSH host
-and is opt-in; hosted CI does not validate a live Windows OpenSSH deployment.
-The <a href="https://github.com/hesic73/remote-workspace#development">development instructions</a>
-show how to run it. The process-kill/reconnect MCP test is Unix-only.</p>
-
 <h2>Making conda work</h2>
 
 <p>Every command runs in a fresh process, so <code>conda activate</code> in one call never
@@ -284,21 +260,17 @@ setup = ""</code></pre>
 <code>--config /home/robot/.remote-workspace/config.toml</code>.</p>
 
 <div class="note">
-<strong>Prefer an explicit setup over an interactive shell.</strong> Asking for
-<code>bash -lic</code> does load your dotfiles, but an interactive shell with no terminal
-prints job control warnings on every command, and on zsh it can drag in prompt plugins
-that fail noisily. Sourcing what you need is quieter and more predictable. Shells also
-differ: bash reaches <code>.bashrc</code> through <code>.profile</code> even when not
-interactive, while zsh reads <code>.zshrc</code> only for interactive shells, so dropping
-<code>-i</code> on a zsh host without an explicit setup can silently change which
-<code>python</code> runs.
+<strong>Prefer an explicit setup over an interactive shell.</strong> <code>bash -lic</code>
+loads your dotfiles, but without a terminal it prints job-control warnings on every
+command, and zsh prompt plugins can fail noisily. Sourcing what you need is quieter.
+Note that zsh reads <code>.zshrc</code> only when interactive, so dropping <code>-i</code>
+without an explicit setup can change which <code>python</code> runs.
 </div>
 
 <h2 id="upgrading">Upgrading</h2>
 
-<p>Two steps, in this order. Your own binaries first: the client only ever fetches the
-release matching <strong>its own</strong> version, so a stale client installs a stale
-server and cheerfully reports success.</p>
+<p>Your own binaries first: the client installs only the server release matching
+<strong>its own</strong> version.</p>
 
 <pre><code>BASE=https://github.com/hesic73/remote-workspace/releases/latest/download
 
@@ -309,15 +281,11 @@ done
 
 remote-workspace workspace upgrade</code></pre>
 
-<p>The second command installs once per SSH identity, however many workspaces share it,
-and reports <em>up to date</em> without transferring anything when a host already
-matches. It never edits your fleet file. Restart the host application afterwards, since
-MCP servers are loaded at startup.</p>
-
-<p class="muted">The upgrade never downgrades a server newer than itself, and an older
-one is upgraded rather than worked around. Nothing negotiates at connection time, so
-upgrade your own binaries and your workspaces together: a client and a server from
-releases that disagree about the protocol fail per request, not up front.</p>
+<p>The second command installs once per SSH identity, transfers nothing when a host is
+current, never downgrades a newer server, and never edits your fleet file. Restart the
+host application afterwards, since MCP servers are loaded at startup. If you skip it,
+the MCP refuses a server on a different protocol with <code>server_too_old</code> or
+<code>client_too_old</code> instead of failing call by call.</p>
 
 <h2>Where things live</h2>
 
@@ -357,7 +325,11 @@ your agent writes.</p>
   </tr>
   <tr>
     <td><code>probe_failed</code>, <em>state directory is locked</em></td>
-    <td>Usually not a fault: another session is using that workspace, and one server serves one workspace root at a time by design. A server left behind by a session that died with its network releases the lock about fifteen minutes after its last activity -- longer if a command it started is still running. <code>server.jsonl</code> in the state directory records when each server started and why it stopped, which dates the holder; the lock itself is released by the kernel, so a server that was killed leaves no <code>exit</code> line and no lock either.</td>
+    <td>Another session is using that workspace; one server serves a root at a time. A server orphaned by a dropped connection releases the lock about fifteen minutes after its last activity (longer if a command is still running). <code>server.jsonl</code> in the state directory records when each server started and stopped.</td>
+  </tr>
+  <tr>
+    <td><code>server_too_old</code>, <code>client_too_old</code></td>
+    <td>Your binaries and the remote server are on different protocols. See <a href="#upgrading">upgrading</a>.</td>
   </tr>
   <tr>
     <td>Connected, but the wrong <code>python</code></td>
