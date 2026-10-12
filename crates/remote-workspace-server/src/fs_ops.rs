@@ -852,8 +852,17 @@ fn entry_for(
     // Only `edit` consumes a hash, and it refuses files above the cap:
     // hashing a multi-GB file here would read all of it for nothing.
     let hash = if meta.is_file() && meta.len() <= MAX_TEXT_BYTES as u64 {
-        hash_file(abs)
-            .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("stat failed: {e}")))?
+        match hash_file(abs) {
+            Ok(hash) => hash,
+            // No hash to give; `mode.readable` reports why.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(e) => {
+                return Err(ProtocolError::new(
+                    ErrorCode::IoError,
+                    format!("stat failed: {e}"),
+                ))
+            }
+        }
     } else {
         None
     };

@@ -433,21 +433,6 @@ impl RemoteWorkspaceServer {
                 return Ok((c.clone(), handle.clone()));
             }
         }
-        if !handle
-            .protocol_checked
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            let endpoint = handle.endpoint.clone();
-            tokio::task::spawn_blocking(move || {
-                remote_workspace_client::deploy::check_protocol(&endpoint)
-            })
-            .await
-            .map_err(|e| format!("protocol_check_failed: {e}"))?
-            .map_err(|e| e.to_string())?;
-            handle
-                .protocol_checked
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
         // `code` is a stable keyword so agents can tell transport failures
         // (connect_failed) apart from a reachable-but-unhealthy workspace
         // (probe_failed: server spawned, the round-trip did not survive).
@@ -466,6 +451,30 @@ impl RemoteWorkspaceServer {
         for attempt in 1..=CONNECT_ATTEMPTS {
             if attempt > 1 {
                 tokio::time::sleep(CONNECT_BACKOFF).await;
+            }
+            if !handle
+                .protocol_checked
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let endpoint = handle.endpoint.clone();
+                let checked = tokio::task::spawn_blocking(move || {
+                    remote_workspace_client::deploy::check_protocol(&endpoint)
+                })
+                .await
+                .map_err(|e| format!("protocol_check_failed: {e}"))?;
+                match checked {
+                    Ok(()) => handle
+                        .protocol_checked
+                        .store(true, std::sync::atomic::Ordering::Relaxed),
+                    // The check is its own ssh connection, as exposed to a
+                    // transient reset as the control connection below.
+                    Err(e) if e.code == "ssh_connect_failed" => {
+                        code = "connect_failed";
+                        last = format!("attempt {attempt}: {e}");
+                        continue;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
             }
             let transport = remote_workspace_client::ArgvTransport {
                 argv: handle.endpoint.control_argv(),

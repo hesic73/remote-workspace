@@ -522,6 +522,51 @@ async fn a_marker_superseded_by_a_later_commit_is_recovered_as_a_commit() {
     );
 }
 
+// Two edits in a row both keep their markers (each sync failed after its
+// rename). The later marker is the only evidence the earlier one landed, so
+// recovery must resolve it first.
+#[tokio::test]
+async fn a_marker_followed_by_another_marker_is_recovered_as_a_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let state = root.join("state");
+    std::fs::write(root.join("f.txt"), "v3\n").unwrap();
+
+    let (first, second) = {
+        let store = OperationStore::new(state.clone()).unwrap();
+        let first = store
+            .prepare_fs_record(
+                "req-1",
+                OperationKind::Edit,
+                "f.txt",
+                Some(hash_of("v1\n")),
+                hash_of("v2\n"),
+            )
+            .unwrap();
+        let second = store
+            .prepare_fs_record(
+                "req-2",
+                OperationKind::Edit,
+                "f.txt",
+                Some(hash_of("v2\n")),
+                hash_of("v3\n"),
+            )
+            .unwrap();
+        (first, second)
+    };
+
+    let ws = Workspace::new(root, dir.path().join("scratch")).unwrap();
+    let store = OperationStore::new(state).unwrap();
+    store.recover(&ws).unwrap();
+    let history = store.history(None);
+    for op in [&first, &second] {
+        assert!(
+            history.iter().any(|r| r.operation_id() == *op),
+            "an edit that landed was dropped from history"
+        );
+    }
+}
+
 // `gc` rewrites the operation log from the in-memory table, so anything missing
 // there is erased. A prepared marker is not history but pending state -- the
 // only thing that lets the next start work out what became of a mutation whose
@@ -922,4 +967,21 @@ async fn stat_hashes_only_files_edit_could_accept() {
     std::fs::write(f.ws.root.join("big.log"), vec![b'x'; MAX_TEXT_BYTES + 1]).unwrap();
     assert_eq!(stat_hash(&f, "small.txt"), Some(hash_of("hi")));
     assert_eq!(stat_hash(&f, "big.log"), None);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn stat_reports_an_unreadable_file_instead_of_failing() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    let path = f.ws.root.join("secret.txt");
+    std::fs::write(&path, "hi").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    match fs_ops::stat(&f.ws, "secret.txt").unwrap() {
+        ResultBody::Stat { stat } => {
+            assert_eq!(stat.hash, None);
+            assert!(!stat.mode.unwrap().readable);
+        }
+        other => panic!("expected stat result, got {other:?}"),
+    }
 }

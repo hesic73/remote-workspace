@@ -35,10 +35,14 @@ struct Entry {
 pub fn enforce(root: &Path, max_age: Option<Duration>) -> std::io::Result<ScratchUsage> {
     let now = SystemTime::now();
     let mut entries = Vec::new();
-    collect(root, now, &mut entries)?;
+    // One entry that cannot be read or removed (a root-owned file a container
+    // left, a read-only module cache) must not stop the rest from being swept,
+    // so failures are collected and reported once the walk is done.
+    let mut failed = Vec::new();
+    collect(root, now, &mut entries, &mut failed);
 
     let mut usage = ScratchUsage::default();
-    for e in &entries {
+    for e in entries {
         if max_age.is_some_and(|limit| e.idle > limit) {
             match std::fs::remove_file(&e.path) {
                 Ok(()) => {
@@ -46,7 +50,7 @@ pub fn enforce(root: &Path, max_age: Option<Duration>) -> std::io::Result<Scratc
                     usage.removed_bytes += e.bytes;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
+                Err(err) => failed.push((e.path, err)),
             }
             continue;
         }
@@ -55,41 +59,70 @@ pub fn enforce(root: &Path, max_age: Option<Duration>) -> std::io::Result<Scratc
         let days = (e.idle.as_secs() / 86_400) as u32;
         usage.oldest_days = Some(usage.oldest_days.unwrap_or(0).max(days));
     }
+    if let Some((path, err)) = failed.first() {
+        return Err(std::io::Error::other(format!(
+            "{} scratch entries could not be swept (first: {}: {err})",
+            failed.len(),
+            path.display()
+        )));
+    }
     Ok(usage)
 }
 
 /// Commands share scratch, so anything here can vanish between being listed
 /// and being looked at; that is not an error.
-fn collect(dir: &Path, now: SystemTime, out: &mut Vec<Entry>) -> std::io::Result<()> {
+fn collect(
+    dir: &Path,
+    now: SystemTime,
+    out: &mut Vec<Entry>,
+    failed: &mut Vec<(PathBuf, std::io::Error)>,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => return failed.push((dir.to_path_buf(), e)),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                failed.push((dir.to_path_buf(), e));
+                continue;
+            }
+        };
+        if let Err(e) = visit(&entry, now, out, failed) {
+            failed.push((entry.path(), e));
+        }
+    }
+}
+
+fn visit(
+    entry: &std::fs::DirEntry,
+    now: SystemTime,
+    out: &mut Vec<Entry>,
+    failed: &mut Vec<(PathBuf, std::io::Error)>,
+) -> std::io::Result<()> {
+    let ft = entry.file_type()?;
+    if ft.is_dir() {
+        collect(&entry.path(), now, out, failed);
+        return Ok(());
+    }
+    if !ft.is_file() {
+        return Ok(());
+    }
+    let meta = match entry.metadata() {
+        Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    for entry in entries {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            collect(&entry.path(), now, out)?;
-            continue;
-        }
-        if !ft.is_file() {
-            continue;
-        }
-        let meta = match entry.metadata() {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
-        // A timestamp ahead of the clock (a clock stepped back, a file
-        // touched with a future date) is as fresh as it gets.
-        let since = |t: SystemTime| now.duration_since(t).unwrap_or(Duration::ZERO);
-        out.push(Entry {
-            path: entry.path(),
-            bytes: meta.len(),
-            idle: since(meta.modified()?).min(since(meta.accessed()?)),
-        });
-    }
+    // A timestamp ahead of the clock (a clock stepped back, a file
+    // touched with a future date) is as fresh as it gets.
+    let since = |t: SystemTime| now.duration_since(t).unwrap_or(Duration::ZERO);
+    out.push(Entry {
+        path: entry.path(),
+        bytes: meta.len(),
+        idle: since(meta.modified()?).min(since(meta.accessed()?)),
+    });
     Ok(())
 }
 
@@ -174,6 +207,24 @@ mod tests {
         assert!(!d.path().join("stale.log").exists());
         assert!(!d.path().join("deep/also-stale.log").exists());
         assert!(d.path().join("fresh.py").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unremovable_file_does_not_stop_the_sweep() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        aged(d.path(), "a-locked/stuck.log", 10, 30);
+        aged(d.path(), "z-stale.log", 20, 30);
+        let locked = d.path().join("a-locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = enforce(d.path(), Some(days(7)));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("stuck.log"), "{err}");
+        assert!(!d.path().join("z-stale.log").exists());
     }
 
     // A log an agent is still paging through keeps a fresh atime while its

@@ -287,7 +287,9 @@ impl OperationStore {
                 .collect()
         };
 
-        for p in &prepareds {
+        // Newest first: a later marker resolved as committed becomes the
+        // record `continued_from` needs to recognize an earlier one as landed.
+        for p in prepareds.iter().rev() {
             let abs = match ws.resolve(&p.path) {
                 Ok(abs) => abs,
                 Err(_) => {

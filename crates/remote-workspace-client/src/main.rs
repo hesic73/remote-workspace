@@ -262,6 +262,13 @@ async fn async_main_real() -> Result<()> {
         }
     };
 
+    // Read the content before connecting: the one-shot server exits after a
+    // second without a request, so slow stdin would outlive it.
+    let create_content = match &cli.command {
+        Command::Create { file, .. } => Some(read_input(file.clone())?),
+        _ => None,
+    };
+
     let transport = ArgvTransport {
         argv: endpoint.one_shot_control_argv(),
         serial: endpoint.is_powershell_ssh(),
@@ -307,8 +314,8 @@ async fn async_main_real() -> Result<()> {
                 eprintln!("\n[truncated: use --offset {next}]");
             }
         }
-        Command::Create { path, file } => {
-            let content = read_input(file)?;
+        Command::Create { path, .. } => {
+            let content = create_content.expect("read before connecting");
             let res = client.create(&path, &content).await?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
