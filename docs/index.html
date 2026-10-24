@@ -228,8 +228,8 @@ does not inherit your shell's <code>PATH</code>.</p>
 robot [robot@workstation:/home/robot/project]: ok
 lab   [lab-gpu-1:/data/experiments]: ok</code></pre>
 
-<p>Your agent now has nine tools: list, read, create, edit and delete files, run commands,
-and transfer single files in either direction. One <code>edit_file</code> call carries up to a
+<p>Your agent now has ten tools: list, read, create, edit and delete files, run commands,
+wait for long-running work to finish, and transfer single files in either direction. One <code>edit_file</code> call carries up to a
 hundred replacements: they apply in order, and either all of them land or the file is
 left untouched. Every tool
 except <code>list_workspaces</code> takes a required <code>workspace</code> argument, so a

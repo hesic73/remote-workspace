@@ -181,7 +181,36 @@ carries `drain_timed_out: true` to say collection stopped before pipe EOF. A
 descendant that redirected its output away (the tmux/nohup pattern) closes
 the pipes at exit and survives. Timeout, and an abort on server shutdown, kill
 the whole tree immediately. Detached workloads are not a supported property of
-`exec`.
+`exec`; they run under tmux or slurm and are awaited with [Wait](#wait).
+
+### Wait
+
+```json
+{"request_id":"r4","op":"wait","argv":["tmux","has-session","-t","=train"],"timeout_ms":600000}
+{"request_id":"r4","type":"wait","outcome":"gone","first_check":false,"checks":9,"waited_ms":131022,"last_check":{"termination":{"kind":"exited","code":1},"stdout":{...},"stderr":{...}}}
+```
+
+`wait` runs `argv` as an `exec` (same profile and cwd rules) every 1 s,
+backing off to 30 s, until it exits 1 (`gone`) or `timeout_ms` passes
+(`timed_out`). Exit 0 means the awaited thing still exists. Any other
+termination, including a check over 30 s, ends the wait as `check_failed`, so a
+mistyped or broken check is not read as "gone". The deadline is checked between
+checks, so a wait can overrun it by one check.
+
+The point is what is waited on. An agent that waits for a result -- a log line,
+an output file -- waits forever when the work never started. Waiting on the
+work itself cannot hang that way: a process, session, or job that does not
+exist is `gone` at the first check, and `first_check: true` says so. What it
+cannot catch is work that exists but makes no progress, a job pending forever or
+a hung process; the timeout and the last check's output (`squeue -o '%T %r'`
+prints the pending reason) are the defense there. The check is written by the
+agent, so the scheduler-specific knowledge stays in commands rather than in
+per-scheduler code here.
+
+A wait only observes, so like the reads it is neither recorded in the operation
+log nor replayed by request id; asking again answers with the state as it is
+now. The check must therefore not change state. A long wait from Claude Code is
+moved to the background after two minutes and reported when it returns.
 
 ### File transfer
 
@@ -420,7 +449,7 @@ stable probe that mutates nothing, needs no config, and never starts the JSONL
 server:
 
 ```json
-{"software_version": "0.6.2", "protocol_version": 3}
+{"software_version": "0.6.2", "protocol_version": 4}
 ```
 
 `software_version` identifies the release and its CI artifact;
@@ -493,7 +522,7 @@ root)` pair; "two roots on one machine" and "one root each on two machines"
 are the same concept, because all server-side state is already keyed per
 root. The agent sees tools: `list_workspaces`, `list_directory`,
 `read_file`, `create_file`, `edit_file`, `delete_file`, `run_command`,
-`upload_file`, `download_file` -- one canonical tool per intent (search, file
+`wait_while`, `upload_file`, `download_file` -- one canonical tool per intent (search, file
 discovery, Git, builds, and tests all go through `run_command`; no wrapper
 tools), and each (except `list_workspaces`) with a required
 `workspace` argument. Making it required, with no default, is deliberate: a

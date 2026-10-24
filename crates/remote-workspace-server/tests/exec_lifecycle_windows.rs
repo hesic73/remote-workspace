@@ -35,7 +35,6 @@ async fn run_bounded(workspace: &Workspace, script: &str, timeout_ms: u64) -> Ex
             None,
             &argv,
             Some(timeout_ms),
-            "op-test".into(),
         ),
     )
     .await

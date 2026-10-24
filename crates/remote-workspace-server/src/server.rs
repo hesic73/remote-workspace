@@ -367,6 +367,38 @@ impl Server {
     ) {
         let request_id = req.request_id.clone();
 
+        // A wait only observes, so like the reads below it is neither recorded
+        // nor replayed: asking again answers with the state as it is now.
+        if let RequestBody::Wait {
+            argv,
+            cwd,
+            profile,
+            timeout_ms,
+        } = &req.body
+        {
+            let result = exec::wait(
+                &self.workspace,
+                &self.config,
+                cwd.as_deref(),
+                profile.as_deref(),
+                argv,
+                *timeout_ms,
+            )
+            .await;
+            let msg = match result {
+                Ok(r) => ServerMessage::Result {
+                    request_id,
+                    result: ResultBody::Wait(r),
+                },
+                Err(e) => ServerMessage::Error {
+                    request_id,
+                    error: e,
+                },
+            };
+            write_line(&stdout, &msg).await;
+            return;
+        }
+
         // These skip the request idempotency store. Re-running a read-only
         // operation is harmless and answers with the state as it is now, while
         // storing its result would keep file contents on disk and in memory for
@@ -530,6 +562,7 @@ impl Server {
                     .await;
             }
             RequestBody::List { .. }
+            | RequestBody::Wait { .. }
             | RequestBody::Stat { .. }
             | RequestBody::Read { .. }
             | RequestBody::History { .. }
@@ -687,7 +720,6 @@ impl Server {
             profile.as_deref(),
             &argv,
             timeout_ms,
-            operation_id.clone(),
         )
         .await;
 
@@ -705,7 +737,7 @@ impl Server {
                     remote_workspace_protocol::ExecDisposition::Completed
                 };
                 let result = remote_workspace_protocol::ExecResult {
-                    operation_id: o.operation_id.clone(),
+                    operation_id: operation_id.clone(),
                     termination: o.termination,
                     duration_ms: o.duration_ms,
                     drain_timed_out: o.drain_timed_out,
@@ -713,7 +745,7 @@ impl Server {
                     stderr: o.stderr.clone(),
                 };
                 let record = remote_workspace_protocol::ExecOperationRecord {
-                    operation_id: o.operation_id.clone(),
+                    operation_id: operation_id.clone(),
                     request_id: request_id.to_string(),
                     argv,
                     cwd,
@@ -887,6 +919,7 @@ fn op_kind_str(body: &RequestBody) -> &str {
         RequestBody::Create { .. } => "create",
         RequestBody::Edit { .. } => "edit",
         RequestBody::Exec { .. } => "exec",
+        RequestBody::Wait { .. } => "wait",
         RequestBody::Delete { .. } => "delete",
         RequestBody::UploadPrepare { .. } => "upload_prepare",
         RequestBody::UploadCommit { .. } => "upload_commit",

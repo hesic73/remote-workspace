@@ -76,6 +76,18 @@ pub enum RequestBody {
     Delete {
         path: String,
     },
+    /// Run `argv` repeatedly until it exits 1 or `timeout_ms` passes. Exit 0
+    /// means the awaited thing still exists; any other termination ends the
+    /// wait as a failed check. Not recorded: the check must not change state.
+    Wait {
+        argv: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        profile: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
     /// Reserve an upload target and create a staging file next to it. The
     /// returned staging path is client-internal plumbing for the raw receiver;
     /// it must never surface in MCP tool results, history, or logs.
@@ -155,6 +167,8 @@ pub enum ResultBody {
     Mutation(MutationResult),
     #[serde(rename = "exec")]
     Exec(ExecResult),
+    #[serde(rename = "wait")]
+    Wait(WaitResult),
     /// Legacy result from the removed undo operation. No longer produced, kept
     /// so request logs written by older servers still deserialize.
     #[serde(rename = "undo")]
@@ -261,6 +275,34 @@ pub enum ExecTermination {
     Signaled {
         signal: i32,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitOutcome {
+    /// The check exited 1.
+    Gone,
+    TimedOut,
+    /// The check exited with neither 0 nor 1, was killed, or hit its own timeout.
+    CheckFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitCheck {
+    pub termination: ExecTermination,
+    pub stdout: ExecOutput,
+    pub stderr: ExecOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitResult {
+    pub outcome: WaitOutcome,
+    /// The outcome was decided by the first check: `gone` here means the thing
+    /// never existed while the wait was running.
+    pub first_check: bool,
+    pub checks: u32,
+    pub waited_ms: u64,
+    pub last_check: WaitCheck,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -7,7 +7,8 @@ pub use remote_workspace_protocol::EditSpec;
 
 use remote_workspace_protocol::{
     ErrorCode, ExecResult, FileEntry, ListResult, MutationResult, OperationDetails, ProtocolError,
-    ReadResult, Request, RequestBody, RequestId, RequestStatusResult, ServerMessage,
+    ReadResult, Request, RequestBody, RequestId, RequestStatusResult, ServerMessage, WaitResult,
+    WAIT_CHECK_TIMEOUT_MS,
 };
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -670,6 +671,40 @@ impl Client {
             _ => Err(ClientError::Server(ProtocolError::new(
                 ErrorCode::InvalidRequest,
                 "unexpected result body for exec",
+            ))),
+        }
+    }
+
+    /// Run `argv` until it exits 1 or `timeout_ms` passes; see `RequestBody::Wait`.
+    pub async fn wait(
+        &self,
+        argv: Vec<String>,
+        cwd: Option<String>,
+        profile: Option<String>,
+        timeout_ms: Option<u64>,
+    ) -> Result<WaitResult, ClientError> {
+        let reply = std::time::Duration::from_millis(
+            timeout_ms
+                .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS)
+                .saturating_add(WAIT_CHECK_TIMEOUT_MS)
+                .saturating_add(30_000),
+        );
+        let (_, msg) = self
+            .send_request_with_timeout(
+                RequestBody::Wait {
+                    argv,
+                    cwd,
+                    profile,
+                    timeout_ms,
+                },
+                reply,
+            )
+            .await?;
+        match Self::unpack(msg)? {
+            remote_workspace_protocol::ResultBody::Wait(result) => Ok(result),
+            _ => Err(ClientError::Server(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "unexpected result body for wait",
             ))),
         }
     }

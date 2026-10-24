@@ -187,7 +187,7 @@ fn mcp_empty_fleet_starts_and_reloads_without_restart() {
         assert!(!error, "{text}");
         assert_eq!(text, "[]");
         let tools = s.call("tools/list", serde_json::json!({}));
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 10);
         let (error, text) = s.tool(
             "list_directory",
             serde_json::json!({"workspace": "first", "path": "."}),
@@ -342,6 +342,7 @@ fn mcp_tools_list_has_expected_tools() {
         "run_command",
         "upload_file",
         "download_file",
+        "wait_while",
     ];
     for tool in expected {
         assert!(names.contains(&tool), "missing tool {tool}; have {names:?}");
@@ -580,6 +581,33 @@ fn mcp_unknown_workspace_is_a_clear_error() {
         text.contains("unknown_workspace") && text.contains("'nope'") && text.contains("test"),
         "error must carry the stable code, the bad name, and the available names: {text}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_wait_while_reports_gone_and_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = McpSession::spawn(dir.path().to_str().unwrap());
+    s.initialize();
+
+    let (e, text) = s.tool(
+        "wait_while",
+        serde_json::json!({"workspace": "test", "argv": ["false"]}),
+    );
+    assert!(!e, "{text}");
+    let r: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(r["outcome"], "gone");
+    assert_eq!(r["first_check"], true);
+    assert_eq!(r["workspace"], "test");
+
+    let (e, text) = s.tool(
+        "wait_while",
+        serde_json::json!({"workspace": "test", "argv": ["true"], "timeout_ms": 1200}),
+    );
+    assert!(!e, "{text}");
+    let r: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(r["outcome"], "timed_out");
+    assert_eq!(r["first_check"], false);
 }
 
 #[test]

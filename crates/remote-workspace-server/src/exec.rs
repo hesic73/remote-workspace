@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use remote_workspace_protocol::{
-    ErrorCode, ExecOutput, ExecTermination, OperationId, ProtocolError,
+    ErrorCode, ExecOutput, ExecTermination, ProtocolError, WaitCheck, WaitOutcome, WaitResult,
+    WAIT_CHECK_TIMEOUT_MS,
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -21,8 +22,10 @@ pub const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 /// abandoned. Detached workloads are not a supported property of exec.
 pub const DRAIN_GRACE_MS: u64 = 2_000;
 
+/// Checks start one second apart and back off to this.
+const WAIT_MAX_INTERVAL: Duration = Duration::from_secs(30);
+
 pub struct ExecOutcome {
-    pub operation_id: OperationId,
     pub termination: ExecTermination,
     pub stdout: ExecOutput,
     pub stderr: ExecOutput,
@@ -42,7 +45,6 @@ pub async fn exec(
     profile: Option<&str>,
     argv: &[String],
     timeout_ms: Option<u64>,
-    operation_id: OperationId,
 ) -> Result<ExecOutcome, ProtocolError> {
     if argv.is_empty() {
         return Err(ProtocolError::new(
@@ -167,13 +169,67 @@ pub async fn exec(
     process_group.release();
 
     Ok(ExecOutcome {
-        operation_id,
         termination,
         stdout: captured_stdout.finish(),
         stderr: captured_stderr.finish(),
         duration_ms: start.elapsed().as_millis() as u64,
         drain_timed_out,
     })
+}
+
+/// Runs `argv` until it exits 1 (`Gone`) or `timeout_ms` passes, so a wait
+/// ends as soon as what it waits on is no longer there. Each check is a full
+/// `exec` under the same profile and cwd rules. The deadline is checked
+/// between checks, so the wait can overrun it by one check.
+pub async fn wait(
+    ws: &Workspace,
+    config: &ServerConfig,
+    cwd: Option<&str>,
+    profile: Option<&str>,
+    argv: &[String],
+    timeout_ms: Option<u64>,
+) -> Result<WaitResult, ProtocolError> {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"),
+        ));
+    }
+    let start = std::time::Instant::now();
+    let deadline = start + Duration::from_millis(timeout_ms);
+    let mut interval = Duration::from_secs(1);
+    let mut checks = 0;
+    loop {
+        let o = exec(ws, config, cwd, profile, argv, Some(WAIT_CHECK_TIMEOUT_MS)).await?;
+        checks += 1;
+        let outcome = match o.termination {
+            ExecTermination::Exited { code: 0 } => None,
+            ExecTermination::Exited { code: 1 } => Some(WaitOutcome::Gone),
+            _ => Some(WaitOutcome::CheckFailed),
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let outcome = match outcome {
+            Some(outcome) => outcome,
+            None if remaining.is_zero() => WaitOutcome::TimedOut,
+            None => {
+                tokio::time::sleep(interval.min(remaining)).await;
+                interval = (interval * 2).min(WAIT_MAX_INTERVAL);
+                continue;
+            }
+        };
+        return Ok(WaitResult {
+            outcome,
+            first_check: checks == 1,
+            checks,
+            waited_ms: start.elapsed().as_millis() as u64,
+            last_check: WaitCheck {
+                termination: o.termination,
+                stdout: o.stdout,
+                stderr: o.stderr,
+            },
+        });
+    }
 }
 
 fn spawn_reader<R, F>(mut reader: R, tx: tokio::sync::mpsc::Sender<StreamEvent>, wrap: F)

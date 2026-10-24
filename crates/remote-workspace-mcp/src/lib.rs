@@ -119,7 +119,7 @@ pub struct ReadFileInput {
     )]
     #[schemars(
         with = "u64",
-        description = "Byte offset to start reading from (default 0)"
+        description = "Byte offset to start reading from (default: 0)"
     )]
     pub offset: Option<u64>,
     #[serde(
@@ -206,6 +206,38 @@ pub struct RunCommandInput {
     #[schemars(
         with = "u64",
         description = "Timeout in milliseconds (default: 300000; maximum: 3600000)"
+    )]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WaitWhileInput {
+    #[schemars(description = "Workspace name")]
+    pub workspace: String,
+    #[schemars(
+        description = "Check command and arguments, e.g. [\"tmux\", \"has-session\", \"-t\", \"=train\"]: exit 0 while the work exists, 1 once it is gone. Any other exit, a kill, or a run over 30 s is check_failed. It runs repeatedly and unrecorded, so it must not change anything."
+    )]
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        with = "String",
+        description = "Working directory in the workspace, or @scratch/... (default: root)"
+    )]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        with = "String",
+        description = "Environment profile name (configured server-side)"
+    )]
+    pub profile: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_int::opt_u64"
+    )]
+    #[schemars(
+        with = "u64",
+        description = "Longest to wait, in milliseconds (default: 300000; maximum: 3600000)"
     )]
     pub timeout_ms: Option<u64>,
 }
@@ -530,7 +562,7 @@ impl remote_workspace_client::Control for WorkspaceControl<'_> {
 #[tool_router]
 impl RemoteWorkspaceServer {
     #[tool(
-        description = "List the configured workspaces: name, host, root directory, optional label, and the connection state this process last observed -- a hint about which are already warm, not a reachability check."
+        description = "List the configured workspaces: name, host, root directory, optional label, and the connection state this process last observed (a hint, not a reachability check)."
     )]
     async fn list_workspaces(&self) -> CallToolResult {
         if let Err(e) = self.refresh_fleet_if_changed() {
@@ -661,7 +693,7 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Modify an existing text file by exact text replacement, atomically. Pass one or more edits: they are applied in order, each to the result of the one before it, and either all of them land or the file is left untouched. Each old_text must match the content it is applied to exactly: zero occurrences fail with NO_MATCH, several with AMBIGUOUS_MATCH unless replace_all is set. One base_hash covers the whole call; a stale one fails with STALE_FILE, so re-read and retry."
+        description = "Modify an existing text file by exact text replacement: all edits land or the file is left untouched. An old_text that occurs zero times fails with NO_MATCH, several times with AMBIGUOUS_MATCH unless replace_all is set. A base_hash that is no longer current fails with STALE_FILE."
     )]
     async fn edit_file(
         &self,
@@ -732,6 +764,29 @@ impl RemoteWorkspaceServer {
             Err(e) => return err(e),
         };
         match client.exec(argv, cwd, profile, timeout_ms).await {
+            Ok(result) => ok_json_in_workspace(&workspace, &result),
+            Err(e) => err(format!("{e}")),
+        }
+    }
+
+    #[tool(
+        description = "Wait until a process, job, or session on the workspace is gone, by repeating a check command. Wait on what does the work, never on its output: output that never appears waits forever, while work that never started is gone at the first check. Returns outcome (gone, timed_out, or check_failed), first_check (the first check decided it), and the last check's output."
+    )]
+    async fn wait_while(
+        &self,
+        Parameters(WaitWhileInput {
+            workspace,
+            argv,
+            cwd,
+            profile,
+            timeout_ms,
+        }): Parameters<WaitWhileInput>,
+    ) -> CallToolResult {
+        let (client, _) = match self.client(&workspace).await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match client.wait(argv, cwd, profile, timeout_ms).await {
             Ok(result) => ok_json_in_workspace(&workspace, &result),
             Err(e) => err(format!("{e}")),
         }

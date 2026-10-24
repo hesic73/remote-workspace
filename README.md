@@ -112,8 +112,9 @@ grok mcp add --scope user remote-workspace -- remote-workspace-mcp
 
 One MCP serves the whole fleet. Tools: `list_workspaces`, `list_directory`,
 `read_file`, `create_file`, `edit_file`, `delete_file`, `run_command`,
-`upload_file`, `download_file`. Search, Git, builds, and tests all go through
-`run_command`. Every tool except `list_workspaces` takes a **required**
+`wait_while`, `upload_file`, `download_file`. Search, Git, builds, and tests all
+go through `run_command`; long work runs under tmux or slurm, and `wait_while`
+waits for it to be gone. Every tool except `list_workspaces` takes a **required**
 `workspace` argument, so a call never lands on a machine by default. Inspecting
 history (`history`, `op`, `status`) is a CLI job, not an agent tool.
 

@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use remote_workspace_protocol::ExecTermination;
+use remote_workspace_protocol::{ExecTermination, WaitOutcome, WaitResult};
 use remote_workspace_server::config::ServerConfig;
 use remote_workspace_server::exec::{self, ExecOutcome, DRAIN_GRACE_MS};
 use remote_workspace_server::workspace::Workspace;
@@ -27,7 +27,6 @@ async fn run_bounded(w: &Workspace, script: &str, timeout_ms: u64) -> ExecOutcom
             None,
             &argv,
             Some(timeout_ms),
-            "op-test".into(),
         ),
     )
     .await
@@ -183,15 +182,7 @@ async fn dropping_a_running_exec_kills_its_process_tree() {
     );
     let argv = vec!["bash".to_string(), "-c".to_string(), script];
     let config = ServerConfig::default();
-    let running = exec::exec(
-        &w,
-        &config,
-        None,
-        None,
-        &argv,
-        Some(60_000),
-        "op-test".into(),
-    );
+    let running = exec::exec(&w, &config, None, None, &argv, Some(60_000));
     let deadline = Instant::now() + Duration::from_secs(10);
     let pid = tokio::select! {
         _ = running => panic!("exec finished before it was dropped"),
@@ -209,4 +200,107 @@ async fn dropping_a_running_exec_kills_its_process_tree() {
         } => pid,
     };
     assert_process_gone(pid);
+}
+
+async fn wait_bounded(
+    w: &Workspace,
+    argv: &[&str],
+    timeout_ms: u64,
+) -> Result<WaitResult, remote_workspace_protocol::ProtocolError> {
+    let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        exec::wait(
+            w,
+            &ServerConfig::default(),
+            None,
+            None,
+            &argv,
+            Some(timeout_ms),
+        ),
+    )
+    .await
+    .expect("wait must return within a bounded period")
+}
+
+#[tokio::test]
+async fn wait_on_something_already_gone_returns_at_the_first_check() {
+    let (_d, w) = ws();
+    let r = wait_bounded(&w, &["sh", "-c", "echo none; exit 1"], 60_000)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WaitOutcome::Gone);
+    assert!(r.first_check);
+    assert_eq!(r.checks, 1);
+    assert_eq!(r.last_check.stdout.prefix, "none\n");
+}
+
+#[tokio::test]
+async fn wait_returns_once_the_check_says_gone() {
+    let (d, w) = ws();
+    let flag = d.path().join("alive");
+    std::fs::write(&flag, "").unwrap();
+    let remover = {
+        let flag = flag.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            std::fs::remove_file(flag).unwrap();
+        })
+    };
+    let start = Instant::now();
+    let r = wait_bounded(&w, &["test", "-e", flag.to_str().unwrap()], 60_000)
+        .await
+        .unwrap();
+    remover.await.unwrap();
+    assert_eq!(r.outcome, WaitOutcome::Gone);
+    assert!(!r.first_check);
+    assert!(r.checks >= 2);
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn wait_times_out_with_the_last_check_output() {
+    let (_d, w) = ws();
+    let start = Instant::now();
+    let r = wait_bounded(&w, &["sh", "-c", "echo PENDING; exit 0"], 1_500)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WaitOutcome::TimedOut);
+    assert!(start.elapsed() >= Duration::from_millis(1_500));
+    assert!(r.checks >= 2);
+    assert_eq!(r.last_check.stdout.prefix, "PENDING\n");
+}
+
+#[tokio::test]
+async fn a_check_that_neither_succeeds_nor_exits_1_fails_the_wait() {
+    let (_d, w) = ws();
+    let r = wait_bounded(&w, &["sh", "-c", "echo broken >&2; exit 2"], 60_000)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WaitOutcome::CheckFailed);
+    assert_eq!(
+        r.last_check.termination,
+        ExecTermination::Exited { code: 2 }
+    );
+    assert_eq!(r.last_check.stderr.prefix, "broken\n");
+
+    let missing = wait_bounded(&w, &["sh", "-c", "no-such-command-xyz"], 60_000)
+        .await
+        .unwrap();
+    assert_eq!(missing.outcome, WaitOutcome::CheckFailed);
+    assert_eq!(
+        missing.last_check.termination,
+        ExecTermination::Exited { code: 127 }
+    );
+}
+
+#[tokio::test]
+async fn wait_rejects_bad_requests_instead_of_waiting() {
+    let (_d, w) = ws();
+    assert!(wait_bounded(&w, &["true"], 0).await.is_err());
+    assert!(wait_bounded(&w, &["true"], 3_600_001).await.is_err());
+    assert!(wait_bounded(&w, &[], 1_000).await.is_err());
+    assert!(wait_bounded(&w, &["definitely-not-a-program-xyz"], 1_000)
+        .await
+        .is_err());
 }
