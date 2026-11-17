@@ -466,7 +466,7 @@ stable probe that mutates nothing, needs no config, and never starts the JSONL
 server:
 
 ```json
-{"software_version": "0.7.1", "protocol_version": 5}
+{"software_version": "0.8.0", "protocol_version": 5}
 ```
 
 `software_version` identifies the release and its CI artifact;
