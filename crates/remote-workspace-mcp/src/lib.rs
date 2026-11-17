@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use remote_workspace_client::{Client, Endpoint};
-use remote_workspace_protocol::ListKind;
+use remote_workspace_protocol::{ListKind, ReadOptions, ReadResult, ServerInfoResult};
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Content, ProgressNotificationParam, ServerCapabilities, ServerInfo},
@@ -121,7 +121,7 @@ pub struct ReadFileInput {
     )]
     #[schemars(
         with = "u64",
-        description = "Byte offset to start reading from (default: 0)"
+        description = "Byte paging mode: 0-based byte offset to start reading from (default: 0; for >4 MiB files, rg -b gives exact byte offsets)"
     )]
     pub offset: Option<u64>,
     #[serde(
@@ -131,9 +131,49 @@ pub struct ReadFileInput {
     )]
     #[schemars(
         with = "u64",
-        description = "Maximum bytes to read (default and hard maximum: 65536)"
+        description = "Byte paging mode: maximum bytes to read (1..=65536, default: 65536)"
     )]
     pub limit: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_int::opt_u64"
+    )]
+    #[schemars(
+        with = "u64",
+        description = "Line range mode (files <= 4 MiB): 1-based line number to start at (default: 1)"
+    )]
+    pub start_line: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_int::opt_u64"
+    )]
+    #[schemars(
+        with = "u64",
+        description = "Line range mode (files <= 4 MiB): maximum lines to read (1..=2000, default: 2000; also capped at 64 KiB)"
+    )]
+    pub max_lines: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_int::opt_u64"
+    )]
+    #[schemars(
+        with = "u64",
+        description = "Tail mode: read the last N lines (1..=2000, up to 64 KiB) from the end of the file (works on files of any size)"
+    )]
+    pub tail_lines: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_int::opt_u64"
+    )]
+    #[schemars(
+        with = "u64",
+        description = "Tail mode: read the last N bytes (1..=65536) from the end of the file, snapping to a UTF-8 boundary (works on files of any size)"
+    )]
+    pub tail_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -166,12 +206,20 @@ pub struct EditFileInput {
     pub workspace: String,
     #[schemars(description = "File path in the workspace, or @scratch/...")]
     pub path: String,
-    #[schemars(description = "Current file hash, as returned by read_file")]
+    #[schemars(description = "Current file hash, as returned in the read_file metadata header")]
     pub base_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
-        description = "Replacements to apply in order, each to the result of the one before it, at most 100. A replacement that does not match rejects the whole call and leaves the file untouched; a list whose net effect leaves the file unchanged is refused."
+        with = "Vec<EditInput>",
+        description = "Replacements (1..=100) applied in order, each to the result of the one before it. Mutually exclusive with replace_content. Any failing replacement rejects the whole call; net no-op edits are refused."
     )]
-    pub edits: Vec<EditInput>,
+    pub edits: Option<Vec<EditInput>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        with = "String",
+        description = "Full replacement content for an existing text file (<= 4 MiB), applied atomically when base_hash matches. Mutually exclusive with edits."
+    )]
+    pub replace_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -186,7 +234,9 @@ pub struct DeleteFileInput {
 pub struct RunCommandInput {
     #[schemars(description = "Workspace name")]
     pub workspace: String,
-    #[schemars(description = "Command and arguments, e.g. [\"pytest\", \"-q\"]")]
+    #[schemars(
+        description = "Command and arguments, e.g. [\"pytest\", \"-q\"]. NEVER parsed by a shell (even with a profile, each element is shell-quoted and exec'd); pass [\"bash\", \"-c\", \"...\"] for pipes, globs, or redirection."
+    )]
     pub argv: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
@@ -217,7 +267,7 @@ pub struct WaitWhileInput {
     #[schemars(description = "Workspace name")]
     pub workspace: String,
     #[schemars(
-        description = "Check command and arguments, e.g. [\"tmux\", \"has-session\", \"-t\", \"=train\"]: exit 0 while the work exists, 1 once it is gone. Any other exit, a kill, or a run over 30 s is check_failed. It runs repeatedly and unrecorded, so it must not change anything."
+        description = "Check command and arguments (never shell-split unless using [\"bash\", \"-c\", \"...\"]): exit 0 while the work exists, 1 once it is gone, any other exit or >30 s is check_failed. Must not mutate state; may print log tail lines (on exit 0) or an exit-code file (on exit 1) so last_check returns progress or outcome in one call."
     )]
     pub argv: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,7 +289,7 @@ pub struct WaitWhileInput {
     )]
     #[schemars(
         with = "u64",
-        description = "Longest to wait, in milliseconds (default: 300000; maximum: 3600000)"
+        description = "Longest to wait in this call, in milliseconds (default: 300000; maximum: 3600000; prefer bounded waits such as 60000-120000 and repeat on timed_out)"
     )]
     pub timeout_ms: Option<u64>,
 }
@@ -296,19 +346,21 @@ struct WorkspaceHandle {
     /// Set once the server is known to speak this client's protocol. Checked
     /// before the first connection only: each check is an SSH round trip.
     protocol_checked: std::sync::atomic::AtomicBool,
+    /// Metadata reported by the server's `server_info` probe on the latest
+    /// successful connection.
+    server_info: std::sync::RwLock<Option<ServerInfoResult>>,
 }
 
 impl WorkspaceHandle {
     /// What this process last observed about the connection, without touching
     /// the network. Deliberately not a health check: probing every workspace
-    /// would open an SSH session and take each server's state lock, which is
-    /// itself a way to break a workspace someone else is using. A real call
-    /// still reports `connect_failed` / `probe_failed` at the moment it
-    /// matters; this only says which workspaces are already warm.
+    /// would open an SSH session per host. A real call reports `connect_failed`
+    /// or `probe_failed` at the moment it matters; this only says which
+    /// workspaces are already warm.
     fn connection(&self) -> &'static str {
         match self.slot.try_lock() {
-            // Held means a call is connecting or in flight right now.
-            Err(_) => "in_use",
+            // Held only while `client()` is establishing and probing a connection.
+            Err(_) => "connecting",
             Ok(slot) => match slot.as_deref() {
                 None => "not_connected",
                 Some(c) if c.is_closed() => "disconnected",
@@ -379,6 +431,7 @@ fn build_snapshot(old: &Snapshot, fleet: BTreeMap<String, Workspace>) -> Snapsho
                     endpoint: ws.endpoint,
                     slot: tokio::sync::Mutex::new(None),
                     protocol_checked: std::sync::atomic::AtomicBool::new(false),
+                    server_info: std::sync::RwLock::new(None),
                 }),
             };
             (
@@ -516,7 +569,8 @@ impl RemoteWorkspaceServer {
             };
             match Client::connect(transport, log.clone()).await {
                 Ok(c) => match c.probe().await {
-                    Ok(_) => {
+                    Ok(info) => {
+                        *handle.server_info.write().unwrap() = Some(info);
                         let c = Arc::new(c);
                         *slot = Some(c.clone());
                         return Ok((c, handle.clone()));
@@ -606,10 +660,41 @@ impl remote_workspace_client::Control for WorkspaceControl<'_> {
     }
 }
 
+fn format_read_result(workspace: &str, path: &str, r: &ReadResult) -> String {
+    let mut parts = vec![
+        format!("workspace={workspace}"),
+        format!("path={path}"),
+        format!(
+            "bytes={}..{}/{}",
+            r.start_offset, r.end_offset, r.total_bytes
+        ),
+    ];
+    if let (Some(s), Some(e), Some(tl)) = (r.start_line, r.end_line, r.total_lines) {
+        parts.push(format!("lines={s}..{e}/{tl}"));
+    } else if let Some(tl) = r.total_lines {
+        parts.push(format!("lines=0/{tl}"));
+    }
+    parts.push(format!("trailing_newline={}", r.trailing_newline));
+    if r.truncated {
+        parts.push("truncated=true".into());
+        if let Some(nl) = r.next_line {
+            parts.push(format!("next_line={nl}"));
+        }
+        if let Some(no) = r.next_offset {
+            parts.push(format!("next_offset={no}"));
+        }
+    }
+    if let Some(hash) = &r.hash {
+        parts.push(format!("hash={hash}"));
+    }
+    format!("[{}]\n---\n{}", parts.join(" "), r.content)
+}
+
 #[tool_router]
 impl RemoteWorkspaceServer {
     #[tool(
-        description = "List the configured workspaces: name, host, root directory, optional label, and the connection state this process last observed (a hint, not a reachability check)."
+        description = "List the configured workspaces: name, host, root directory, optional label, connection state last observed by this process (`connected`, `connecting`, `not_connected`, `disconnected` -- a local hint, not a reachability check), and once connected, `platform`, `profiles`, and `default_profile`.",
+        annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn list_workspaces(&self) -> CallToolResult {
         if let Err(e) = self.refresh_fleet_if_changed() {
@@ -632,6 +717,13 @@ impl RemoteWorkspaceServer {
                 if let Some(label) = &entry.label {
                     row["label"] = serde_json::Value::String(label.clone());
                 }
+                if let Some(info) = entry.handle.server_info.read().unwrap().as_ref() {
+                    row["platform"] = serde_json::Value::String(info.platform.clone());
+                    row["profiles"] = serde_json::json!(info.profiles);
+                    if let Some(default_profile) = &info.default_profile {
+                        row["default_profile"] = serde_json::Value::String(default_profile.clone());
+                    }
+                }
                 row
             })
             .collect();
@@ -641,7 +733,10 @@ impl RemoteWorkspaceServer {
         }
     }
 
-    #[tool(description = "List the contents of a directory in a workspace.")]
+    #[tool(
+        description = "List the contents of a directory in a workspace.",
+        annotations(read_only_hint = true, destructive_hint = false)
+    )]
     async fn list_directory(
         &self,
         Parameters(ListDirectoryInput {
@@ -683,7 +778,8 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Read a text file, paging with the returned next offset. Also returns the hash to pass to edit_file as base_hash, omitted for files too large to edit. Refuses non-UTF-8 files."
+        description = "Read a UTF-8 text file in one of three mutually exclusive modes: (1) byte paging via offset/limit (max 65536 bytes; for >4 MiB files rg -b gives exact byte offsets), (2) line range via start_line/max_lines (1-based, max 2000 lines; files <= 4 MiB), or (3) tail via tail_lines (1..=2000) or tail_bytes (1..=65536) from end of file (works on multi-GB logs, snapping to a UTF-8 boundary). Returns a single-line `[...]` metadata header (carrying bytes, lines when known, pagination cursors, and hash for files <= 4 MiB) followed by `\\n---\\n` and the raw content.",
+        annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn read_file(
         &self,
@@ -692,31 +788,33 @@ impl RemoteWorkspaceServer {
             path,
             offset,
             limit,
+            start_line,
+            max_lines,
+            tail_lines,
+            tail_bytes,
         }): Parameters<ReadFileInput>,
     ) -> CallToolResult {
         let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        match client.read(&path, offset, limit).await {
-            Ok(r) => {
-                let mut out = r.content;
-                if let Some(next) = r.next_offset {
-                    out.push_str(&format!(
-                        "\n\n[output truncated; use offset={next} to read more]"
-                    ));
-                }
-                if let Some(hash) = &r.hash {
-                    out.push_str(&format!("\n\n[hash: {hash}]"));
-                }
-                ok(out)
-            }
+        let opts = ReadOptions {
+            offset,
+            limit,
+            start_line,
+            max_lines,
+            tail_lines,
+            tail_bytes,
+        };
+        match client.read_with(&path, opts).await {
+            Ok(r) => ok(format_read_result(&workspace, &path, &r)),
             Err(e) => err(format!("{e}")),
         }
     }
 
     #[tool(
-        description = "Create a new text file atomically. Fails with ALREADY_EXISTS if the path exists; modify existing files with edit_file."
+        description = "Create a new text file atomically. Fails with ALREADY_EXISTS if the path exists; modify existing files with edit_file.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn create_file(
         &self,
@@ -740,7 +838,8 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Modify an existing text file by exact text replacement: all edits land or the file is left untouched. An old_text that occurs zero times fails with NO_MATCH, several times with AMBIGUOUS_MATCH unless replace_all is set. A base_hash that is no longer current fails with STALE_FILE."
+        description = "Modify an existing text file (<= 4 MiB) gated by base_hash. Pass EITHER `edits` (1..=100 ordered exact replacements, applied atomically: zero occurrences fail with NO_MATCH, several with AMBIGUOUS_MATCH unless replace_all is set) OR `replace_content` (atomic whole-file replacement), never both. Fails with STALE_FILE if base_hash is no longer current.",
+        annotations(read_only_hint = false)
     )]
     async fn edit_file(
         &self,
@@ -749,12 +848,28 @@ impl RemoteWorkspaceServer {
             path,
             base_hash,
             edits,
+            replace_content,
         }): Parameters<EditFileInput>,
     ) -> CallToolResult {
+        if edits.is_some() && replace_content.is_some() {
+            return err(
+                "protocol error from server: [INVALID_REQUEST] edits and replace_content are mutually exclusive",
+            );
+        }
         let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
+        if let Some(content) = replace_content {
+            return match client.replace(&path, &base_hash, &content).await {
+                Ok(w) => ok(format!(
+                    "Edited {path} in workspace '{workspace}' (replaced content). operation_id={}, new_hash={}",
+                    w.operation_id, w.new_hash
+                )),
+                Err(e) => err(format!("{e}")),
+            };
+        }
+        let edits = edits.unwrap_or_default();
         let count = edits.len();
         let edits = edits
             .into_iter()
@@ -775,7 +890,10 @@ impl RemoteWorkspaceServer {
         }
     }
 
-    #[tool(description = "Delete a file. Permanent: nothing here restores it.")]
+    #[tool(
+        description = "Delete a file. Permanent: nothing here restores it.",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
     async fn delete_file(
         &self,
         Parameters(DeleteFileInput { workspace, path }): Parameters<DeleteFileInput>,
@@ -794,7 +912,8 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Run a command synchronously. Returns termination, duration, and a bounded preview of each output stream (first 4 KiB, last 12 KiB)."
+        description = "Run a command synchronously in its own process tree. `argv` is NEVER parsed by a shell (even under a profile, each element is shell-quoted and exec'd; for pipes, globs, or redirection pass [\"bash\", \"-c\", \"...\"]). Returns termination, duration, and a bounded preview of each output stream (first 4 KiB, last 12 KiB); redirect large output to `$REMOTE_WORKSPACE_SCRATCH/...` and read `@scratch/...`.",
+        annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn run_command(
         &self,
@@ -818,7 +937,8 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Wait until a process, job, or session on the workspace is gone, by repeating a check command. Wait on what does the work, never on its output: output that never appears waits forever, while work that never started is gone at the first check. Returns outcome (gone, timed_out, or check_failed), first_check (the first check decided it), and the last check's output."
+        description = "Wait until a process, job, or session on the workspace is gone by repeating a check command (exit 0 = running, 1 = gone, anything else or >30 s = check_failed). Wait on what does the work, never on its output file. Use a bounded timeout_ms (e.g. 60000-120000) and repeat on timed_out after checking progress. The check command can print log tail lines (on exit 0) or an exit-code file (on exit 1) so `last_check` returns progress or outcome in one call.",
+        annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn wait_while(
         &self,
@@ -842,7 +962,8 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Upload one local file to a workspace as raw streamed bytes; the content never enters the model context. Use this, not create_file, for binary or large files. A long-running call is normal for a big file."
+        description = "Upload one local file to a workspace as raw streamed bytes; the content never enters the model context. Use this, not create_file, for binary or large files. A long-running call is normal for a big file.",
+        annotations(read_only_hint = false)
     )]
     async fn upload_file(
         &self,
@@ -880,7 +1001,8 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Download one file from a workspace to the local machine as raw streamed bytes; the content never enters the model context. Use this, not read_file, for binary or large files. A long-running call is normal for a big file."
+        description = "Download one file from a workspace to the local machine as raw streamed bytes; the content never enters the model context. Use this, not read_file, for binary or large files. A long-running call is normal for a big file.",
+        annotations(read_only_hint = false)
     )]
     async fn download_file(
         &self,
@@ -932,5 +1054,44 @@ impl ServerHandler for RemoteWorkspaceServer {
         info.instructions = Some(AGENT_GUIDANCE.into());
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_guidance_fits_mcp_host_budget() {
+        assert!(
+            AGENT_GUIDANCE.len() < 4096,
+            "AGENT_GUIDANCE is {} bytes (must be < 4096)",
+            AGENT_GUIDANCE.len()
+        );
+    }
+
+    #[test]
+    fn read_header_never_modifies_raw_content() {
+        let r = ReadResult {
+            content: "line1\n[hash: fake]".into(),
+            total_bytes: 100,
+            start_offset: 0,
+            end_offset: 18,
+            trailing_newline: false,
+            start_line: Some(1),
+            end_line: Some(2),
+            total_lines: Some(10),
+            next_line: Some(3),
+            hash: Some("sha256:abc".into()),
+            truncated: true,
+            next_offset: Some(18),
+        };
+        let out = format_read_result("ws", "src/lib.rs", &r);
+        let (header, body) = out.split_once("\n---\n").unwrap();
+        assert_eq!(
+            header,
+            "[workspace=ws path=src/lib.rs bytes=0..18/100 lines=1..2/10 trailing_newline=false truncated=true next_line=3 next_offset=18 hash=sha256:abc]"
+        );
+        assert_eq!(body, "line1\n[hash: fake]");
     }
 }

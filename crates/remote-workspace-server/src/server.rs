@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use remote_workspace_protocol::{
-    ErrorCode, OperationDetails, Request, RequestBody, ResultBody, ServerMessage,
+    ErrorCode, GcResult, OperationDetails, ProtocolError, ReadOptions, Request, RequestBody,
+    ResultBody, ServerInfoResult, ServerMessage, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -17,12 +18,8 @@ use crate::workspace::Workspace;
 
 const HISTORY_DEFAULT_LIMIT: usize = 50;
 const HISTORY_MAX_LIMIT: usize = 100;
-/// How long, after stdin ends, handlers still running get to finish and write
-/// their replies. Deliberately short: shutdown must not become the reason a
-/// successor cannot start, and a request that needs longer than this is not
-/// one worth holding the connection open for.
+const OPPORTUNISTIC_SHARD_THRESHOLD: usize = 64;
 const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
-/// How long the abort that follows a timed-out drain gets to take effect.
 const ABORT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub struct Server {
@@ -33,7 +30,6 @@ pub struct Server {
     scratch_max_age: Option<std::time::Duration>,
     idle_timeout: Option<std::time::Duration>,
     session_log: Arc<SessionLog>,
-    /// Pending uploads (staging file created, commit not yet received).
     uploads: transfer::UploadRegistry,
 }
 
@@ -45,21 +41,12 @@ impl std::fmt::Debug for Server {
 
 pub struct ServerOptions {
     pub root: PathBuf,
-    /// Resolved state directory (operation log, request table, scratch).
     pub state_dir: PathBuf,
     pub config_path: Option<PathBuf>,
-    /// Keep only this many recent operations; pruned automatically at startup
-    /// and on `gc`. `None` disables automatic pruning.
+    /// Keep only this many recent operations on `gc` (and opportunistically at
+    /// startup once closed shards exceed `OPPORTUNISTIC_SHARD_THRESHOLD`).
     pub history_limit: Option<usize>,
-    /// Evict scratch files idle beyond this, on `gc` and at most once a day at
-    /// startup. `None` disables sweeping.
     pub scratch_max_age: Option<std::time::Duration>,
-    /// Exit after this long with no request arriving and none still running.
-    /// The only other way this server ever stops is EOF on stdin, which
-    /// depends on the far end of the SSH session noticing that its peer is
-    /// gone -- something a suspended laptop or a dropped link can delay for
-    /// hours, during which the state lock makes the workspace look occupied.
-    /// `None` disables the timeout and restores that dependency.
     pub idle_timeout: Option<std::time::Duration>,
 }
 
@@ -71,36 +58,20 @@ impl Server {
         let store = OperationStore::new(opts.state_dir).map_err(|e| anyhow::anyhow!(e))?;
         let session_log = Arc::new(SessionLog::new(&state_dir));
         session_log.trim_if_large();
-        // Run WAL recovery before serving: reconcile any prepared markers left
-        // by a crash, and clear requests stuck InProgress so they become retryable.
-        let actions = store
-            .recover(&workspace)
-            .map_err(|e| anyhow::anyhow!("startup recovery failed: {e}"))?;
-        for a in &actions {
-            tracing::info!(action = ?a, "recovery");
-        }
-        if actions
-            .iter()
-            .any(|a| matches!(a, crate::store::RecoveryAction::Conflict { .. }))
-        {
-            tracing::warn!("startup recovery encountered one or more conflicts; affected requests are marked Error");
-        }
+
         if let Some(keep) = opts.history_limit {
-            let stats = store
-                .prune(keep)
-                .map_err(|e| anyhow::anyhow!("startup prune failed: {e}"))?;
-            if stats.removed_operations > 0 || stats.removed_requests > 0 {
-                tracing::info!(
-                    removed_operations = stats.removed_operations,
-                    removed_requests = stats.removed_requests,
-                    "pruned history at startup"
-                );
+            if store.shard_count_exceeds(OPPORTUNISTIC_SHARD_THRESHOLD) {
+                match store.prune(keep) {
+                    Ok(stats) if stats.removed_operations > 0 => tracing::info!(
+                        removed_operations = stats.removed_operations,
+                        "compacted operation shards at startup"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "opportunistic shard compaction failed"),
+                }
             }
         }
-        // Rate-limited inside: a server starts on every reconnect, so the
-        // common path here must be a single stat.
-        // A failed sweep is reported, not fatal: refusing to start would also
-        // take away the commands that could fix what made it fail.
+
         if let Some(age) = opts.scratch_max_age {
             match scratch::sweep_if_due(&state_dir, &workspace.scratch_root, age) {
                 Ok(Some(u)) if u.removed_files > 0 => tracing::info!(
@@ -112,6 +83,7 @@ impl Server {
                 Err(e) => tracing::warn!(error = %e, "scratch sweep at startup failed"),
             }
         }
+
         let config = match opts.config_path {
             Some(p) => {
                 let text = std::fs::read_to_string(&p)
@@ -120,11 +92,8 @@ impl Server {
             }
             None => Arc::new(ServerConfig::default()),
         };
-        let uploads = transfer::UploadRegistry::new(&state_dir)?;
-        // Last, so that a `started` with no matching `exit` means one thing
-        // only: that server reached the point of serving and has not recorded
-        // stopping. A start that fails never claims to have begun; it reports
-        // itself on stderr, which the client now carries.
+        let uploads = transfer::UploadRegistry::new(&state_dir);
+
         session_log.record(
             "started",
             serde_json::json!({
@@ -167,22 +136,13 @@ impl Server {
         let started = std::time::Instant::now();
         let server = Arc::new(self);
         let stdout: Arc<tokio::sync::Mutex<W>> = Arc::new(tokio::sync::Mutex::new(write));
-        // Reading happens in its own task and is never raced against anything.
-        // `read_until` is not cancellation-safe -- bytes it has already consumed
-        // are LOST when its future is dropped, which would silently truncate a
-        // request that arrived in pieces -- so the idle timeout must not be
-        // able to interrupt it. Receiving from this channel is cancel-safe, and
-        // its capacity of one keeps the backpressure of reading a line at a
-        // time.
+
         let (lines_tx, mut lines) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(1);
         let reading = tokio::spawn(async move {
             let mut reader = BufReader::new(read);
             loop {
-                // Bytes, not `read_line`: a line that is not UTF-8 is one bad
-                // request to answer, not a broken stream to shut down over.
                 let mut line = Vec::new();
                 match reader.read_until(b'\n', &mut line).await {
-                    // EOF: dropping the sender is what reports it.
                     Ok(0) => break,
                     Ok(_) => {
                         if lines_tx.send(Ok(line)).await.is_err() {
@@ -196,39 +156,23 @@ impl Server {
                 }
             }
         });
-        // Owns every handler task, which answers all three questions asked
-        // about them: how many are still running (the idle timeout's), when the
-        // last one finishes (shutdown's), and how to let go of the ones that
-        // never will -- dropping the set aborts them, releasing the `Arc<Server>`
-        // they hold and with it the state lock.
+
         let mut handlers = tokio::task::JoinSet::new();
         let mut served: u64 = 0;
         let mut read_error: Option<std::io::Error> = None;
         let mut idle_since = tokio::time::Instant::now();
 
         let reason = loop {
-            // Idleness is time since the last thing that happened -- a line
-            // arriving OR a handler finishing -- not time since the last read.
-            // Measured from the read alone, a request that completes just
-            // before the deadline is followed by an exit milliseconds later,
-            // closing a connection the client has every reason to believe is
-            // still good because it just got its reply on it.
             let event = match idle_timeout {
                 None => lines.recv().await,
                 Some(d) => tokio::select! {
                     biased;
                     ev = lines.recv() => ev,
-                    // Armed only while something is running: on an empty set
-                    // `join_next` returns immediately and would spin.
                     _ = handlers.join_next(), if !handlers.is_empty() => {
                         idle_since = tokio::time::Instant::now();
                         continue;
                     }
                     _ = tokio::time::sleep_until(idle_since + d) => {
-                        // A single `exec` may legitimately run for an hour
-                        // without the client sending anything, so idleness
-                        // means no work in flight either -- otherwise the
-                        // timeout would kill the very request it waits on.
                         if handlers.is_empty() {
                             break "idle_timeout";
                         }
@@ -239,9 +183,6 @@ impl Server {
             };
             let line = match event {
                 Some(Ok(line)) => line,
-                // Broken input is a shutdown like any other: it must still
-                // drain and record its exit, so the error travels out rather
-                // than returning from here.
                 Some(Err(e)) => {
                     read_error = Some(e);
                     break "read_error";
@@ -249,11 +190,7 @@ impl Server {
                 None => break "stdin_eof",
             };
             idle_since = tokio::time::Instant::now();
-            // Decoded lossily only to find the request id: a request that is not
-            // UTF-8 is refused, never run against a path with U+FFFD in it.
             let text = String::from_utf8_lossy(&line);
-            // Windows PowerShell 5.1 can put a UTF-8 byte order mark in front of
-            // what it writes to a child's stdin, and `trim` keeps it.
             let trimmed = text.trim().trim_start_matches('\u{feff}');
             if trimmed.is_empty() {
                 continue;
@@ -265,16 +202,13 @@ impl Server {
             let req = match parsed {
                 Ok(r) => r,
                 Err(e) => {
-                    // A request this server cannot read -- an op from a newer
-                    // client, say -- usually still names itself, and echoing
-                    // that id is what lets the sender stop waiting for a reply.
                     let request_id = serde_json::from_str::<serde_json::Value>(trimmed)
                         .ok()
                         .and_then(|v| v.get("request_id")?.as_str().map(str::to_owned))
                         .unwrap_or_else(|| "(parse-error)".into());
                     let msg = ServerMessage::Error {
                         request_id,
-                        error: remote_workspace_protocol::ProtocolError::new(
+                        error: ProtocolError::new(
                             ErrorCode::InvalidRequest,
                             format!("invalid request line: {e}"),
                         ),
@@ -289,52 +223,20 @@ impl Server {
             handlers.spawn(async move {
                 server.handle(req, stdout).await;
             });
-            // Finished handlers stay in the set until collected, so reap on the
-            // way past: a long session serves thousands of requests and the set
-            // must not grow with them.
             reap(&mut handlers);
         };
 
-        // Handlers run in their own tasks, so returning straight from the loop
-        // would drop whatever is still running: a mutation already applied to
-        // the workspace would never report its result, and the caller could not
-        // tell whether it landed. Stdin ending does not imply stdout has --
-        // a client that closes its end of the pipe is still listening -- so
-        // finishing the reply is worth a short wait. Bounded, because it must
-        // stay well inside the successor's grace for the state lock, and
-        // because a long `exec` is not something to wait for here: its request
-        // is resolved by recovery on the next start.
         let drained = tokio::time::timeout(SHUTDOWN_DRAIN, async {
             while handlers.join_next().await.is_some() {}
         })
         .await
         .is_ok();
-        // Whatever is left is asked to stop rather than carried along: each
-        // task holds an `Arc<Server>`, and with it the state lock. An `exec`'s
-        // process tree dies with its task (see `ProcessGroup`).
-        //
-        // Aborting only *requests* cancellation, which a handler acts on no
-        // earlier than its next yield -- a `gc` sweeping a large tree is
-        // synchronous from one end to the other. So this is bounded, not
-        // guaranteed: a handler still working when the grace expires keeps the
-        // lock until it finishes, and a successor starting in that window is
-        // correctly refused, because the work the lock protects really is still
-        // running. In the shipped binary the process exit right after this
-        // releases the lock either way; `drained` records which happened.
         handlers.abort_all();
         let _ = tokio::time::timeout(ABORT_GRACE, async {
             while handlers.join_next().await.is_some() {}
         })
         .await;
-        // The reader is blocked in a read that only a closed input can end, and
-        // dropping the receiving half does not wake it. Nothing is going to be
-        // read again, so it is aborted rather than left holding the stream for
-        // as long as the runtime lives -- which for an embedder is not the
-        // process exit the shipped binary can rely on.
         reading.abort();
-        // Awaited, because aborting only asks: until the task is polled again
-        // it still holds the input stream, and returning from here is supposed
-        // to mean it does not.
         let _ = tokio::time::timeout(ABORT_GRACE, reading).await;
 
         let uptime_ms = started.elapsed().as_millis() as u64;
@@ -361,186 +263,163 @@ impl Server {
     }
 
     async fn handle<W: tokio::io::AsyncWrite + Unpin + Send>(
-        &self,
+        self: Arc<Self>,
         req: Request,
         stdout: Arc<tokio::sync::Mutex<W>>,
     ) {
-        let request_id = req.request_id.clone();
+        let request_id = req.request_id;
 
-        // A wait only observes, so like the reads below it is neither recorded
-        // nor replayed: asking again answers with the state as it is now.
         if let RequestBody::Wait {
             argv,
             cwd,
             profile,
             timeout_ms,
-        } = &req.body
+        } = req.body
         {
             let result = exec::wait(
                 &self.workspace,
                 &self.config,
                 cwd.as_deref(),
                 profile.as_deref(),
-                argv,
-                *timeout_ms,
+                &argv,
+                timeout_ms,
             )
             .await;
-            let msg = match result {
-                Ok(r) => ServerMessage::Result {
-                    request_id,
-                    result: ResultBody::Wait(r),
-                },
-                Err(e) => ServerMessage::Error {
-                    request_id,
-                    error: e,
-                },
-            };
+            let msg = reply_for(request_id, result.map(ResultBody::Wait));
             write_line(&stdout, &msg).await;
             return;
         }
 
-        // These skip the request idempotency store. Re-running a read-only
-        // operation is harmless and answers with the state as it is now, while
-        // storing its result would keep file contents on disk and in memory for
-        // nothing. Prepare and abort use their own pending-upload registry:
-        // replaying prepare would expose an obsolete staging path and replaying
-        // abort has no useful result.
         let unpersisted = match &req.body {
+            RequestBody::ServerInfo {} => {
+                let srv = self.clone();
+                Some(run_blocking(move || srv.server_info()).await)
+            }
             RequestBody::List {
                 path,
                 offset,
                 limit,
-            } => Some(fs_ops::list(&self.workspace, path, *offset, *limit)),
-            RequestBody::Stat { path } => Some(fs_ops::stat(&self.workspace, path)),
+            } => {
+                let srv = self.clone();
+                let path = path.clone();
+                let (offset, limit) = (*offset, *limit);
+                Some(run_blocking(move || fs_ops::list(&srv.workspace, &path, offset, limit)).await)
+            }
+            RequestBody::Stat { path } => {
+                let srv = self.clone();
+                let path = path.clone();
+                Some(run_blocking(move || fs_ops::stat(&srv.workspace, &path)).await)
+            }
             RequestBody::Read {
                 path,
                 offset,
                 limit,
-            } => Some(fs_ops::read(&self.workspace, path, *offset, *limit)),
-            RequestBody::History { limit } => Some(self.history(*limit)),
-            RequestBody::OperationGet { operation_id } => Some(self.operation_get(operation_id)),
-            RequestBody::RequestStatus { target } => Some(Ok(ResultBody::RequestStatus(
-                self.store.status_for_request(target),
-            ))),
-            RequestBody::UploadPrepare { path, overwrite } => Some(transfer::upload_prepare(
-                &self.workspace,
-                &self.uploads,
-                path,
-                *overwrite,
-            )),
+                start_line,
+                max_lines,
+                tail_lines,
+                tail_bytes,
+            } => {
+                let srv = self.clone();
+                let path = path.clone();
+                let opts = ReadOptions {
+                    offset: *offset,
+                    limit: *limit,
+                    start_line: *start_line,
+                    max_lines: *max_lines,
+                    tail_lines: *tail_lines,
+                    tail_bytes: *tail_bytes,
+                };
+                Some(run_blocking(move || fs_ops::read(&srv.workspace, &path, opts)).await)
+            }
+            RequestBody::History { limit } => {
+                let srv = self.clone();
+                let limit = *limit;
+                Some(run_blocking(move || srv.history(limit)).await)
+            }
+            RequestBody::OperationGet { operation_id } => {
+                let srv = self.clone();
+                let operation_id = operation_id.clone();
+                Some(run_blocking(move || srv.operation_get(&operation_id)).await)
+            }
+            RequestBody::UploadPrepare { path, overwrite } => {
+                let srv = self.clone();
+                let path = path.clone();
+                let overwrite = *overwrite;
+                Some(
+                    run_blocking(move || {
+                        transfer::upload_prepare(&srv.workspace, &srv.uploads, &path, overwrite)
+                    })
+                    .await,
+                )
+            }
             RequestBody::UploadAbort { transfer_id } => {
-                Some(transfer::upload_abort(&self.uploads, transfer_id))
+                let srv = self.clone();
+                let transfer_id = transfer_id.clone();
+                Some(run_blocking(move || transfer::upload_abort(&srv.uploads, &transfer_id)).await)
             }
             _ => None,
         };
         if let Some(result) = unpersisted {
-            let msg = match result {
-                Ok(body) => ServerMessage::Result {
-                    request_id,
-                    result: body,
-                },
-                Err(e) => ServerMessage::Error {
-                    request_id,
-                    error: e,
-                },
-            };
+            let msg = reply_for(request_id, result);
             write_line(&stdout, &msg).await;
             return;
         }
 
-        // Idempotency via atomic claim: if we have seen this request_id, replay
-        // its stored result without re-executing. Otherwise this call wins
-        // ownership and proceeds. claim_request is a single locked
-        // check-and-insert, so concurrent duplicate requests cannot both run.
-        let op_kind = op_kind_str(&req.body);
-        match self.store.claim_request(&request_id, op_kind) {
-            Ok(None) => {}
-            Ok(Some(entry)) => match entry.result {
-                Some(StoredResult::Done(m)) => {
-                    write_line(&stdout, &m).await;
-                    return;
-                }
-                Some(StoredResult::Error(e)) => {
-                    write_line(
-                        &stdout,
-                        &ServerMessage::Error {
-                            request_id,
-                            error: e,
-                        },
-                    )
-                    .await;
-                    return;
-                }
-                // Two requests sharing an id can be in flight at once, since
-                // handlers run concurrently. No shipped client does it; refuse
-                // rather than re-execute.
-                None => {
-                    write_line(
-                        &stdout,
-                        &ServerMessage::Error {
-                            request_id,
-                            error: remote_workspace_protocol::ProtocolError::new(
-                                ErrorCode::InvalidRequest,
-                                "request already in progress",
-                            ),
-                        },
-                    )
-                    .await;
-                    return;
-                }
-            },
-            // Claiming the request failed (e.g. request log is not writable).
-            // Surface the error; do NOT execute, since we cannot record state.
-            Err(e) => {
-                write_line(
-                    &stdout,
-                    &ServerMessage::Error {
-                        request_id,
-                        error: e,
-                    },
-                )
-                .await;
-                return;
-            }
+        if let Some(existing) = self.store.claim_request(&request_id) {
+            let msg = match existing {
+                Some(StoredResult::Done(m)) => m,
+                Some(StoredResult::Error(e)) => ServerMessage::Error {
+                    request_id,
+                    error: e,
+                },
+                None => ServerMessage::Error {
+                    request_id,
+                    error: ProtocolError::new(
+                        ErrorCode::InvalidRequest,
+                        "request already in progress",
+                    ),
+                },
+            };
+            write_line(&stdout, &msg).await;
+            return;
         }
 
         match req.body {
             RequestBody::Create { path, content } => {
                 let guard = self.store.write_guard().await;
-                let result = fs_ops::create(
-                    &self.workspace,
-                    &self.store,
-                    &guard,
-                    &request_id,
-                    &path,
-                    &content,
-                );
-                drop(guard);
-                self.finish(&request_id, result)
-                    .await
-                    .with_stdout(&stdout)
-                    .await;
+                let srv = self.clone();
+                let rid = request_id.clone();
+                let result = run_blocking(move || {
+                    fs_ops::create(&srv.workspace, &srv.store, &guard, &rid, &path, &content)
+                })
+                .await;
+                let msg = self.finish(&request_id, result);
+                write_line(&stdout, &msg).await;
             }
             RequestBody::Edit {
                 path,
                 base_hash,
                 edits,
+                replace_content,
             } => {
                 let guard = self.store.write_guard().await;
-                let result = fs_ops::edit(
-                    &self.workspace,
-                    &self.store,
-                    &guard,
-                    &request_id,
-                    &path,
-                    &base_hash,
-                    &edits,
-                );
-                drop(guard);
-                self.finish(&request_id, result)
-                    .await
-                    .with_stdout(&stdout)
-                    .await;
+                let srv = self.clone();
+                let rid = request_id.clone();
+                let result = run_blocking(move || {
+                    fs_ops::edit(
+                        &srv.workspace,
+                        &srv.store,
+                        &guard,
+                        &rid,
+                        &path,
+                        &base_hash,
+                        &edits,
+                        replace_content.as_deref(),
+                    )
+                })
+                .await;
+                let msg = self.finish(&request_id, result);
+                write_line(&stdout, &msg).await;
             }
             RequestBody::Exec {
                 argv,
@@ -553,24 +432,14 @@ impl Server {
             }
             RequestBody::Delete { path } => {
                 let guard = self.store.write_guard().await;
-                let result =
-                    fs_ops::delete(&self.workspace, &self.store, &guard, &request_id, &path);
-                drop(guard);
-                self.finish(&request_id, result)
-                    .await
-                    .with_stdout(&stdout)
-                    .await;
-            }
-            RequestBody::List { .. }
-            | RequestBody::Wait { .. }
-            | RequestBody::Stat { .. }
-            | RequestBody::Read { .. }
-            | RequestBody::History { .. }
-            | RequestBody::OperationGet { .. }
-            | RequestBody::RequestStatus { .. }
-            | RequestBody::UploadPrepare { .. }
-            | RequestBody::UploadAbort { .. } => {
-                unreachable!("handled before the idempotency claim")
+                let srv = self.clone();
+                let rid = request_id.clone();
+                let result = run_blocking(move || {
+                    fs_ops::delete(&srv.workspace, &srv.store, &guard, &rid, &path)
+                })
+                .await;
+                let msg = self.finish(&request_id, result);
+                write_line(&stdout, &msg).await;
             }
             RequestBody::UploadCommit {
                 transfer_id,
@@ -579,21 +448,23 @@ impl Server {
                 duration_ms,
             } => {
                 let guard = self.store.write_guard().await;
-                let result = transfer::upload_commit(
-                    &self.store,
-                    &guard,
-                    &request_id,
-                    &self.uploads,
-                    &transfer_id,
-                    size,
-                    &sha256,
-                    duration_ms,
-                );
-                drop(guard);
-                self.finish(&request_id, result)
-                    .await
-                    .with_stdout(&stdout)
-                    .await;
+                let srv = self.clone();
+                let rid = request_id.clone();
+                let result = run_blocking(move || {
+                    transfer::upload_commit(
+                        &srv.store,
+                        &guard,
+                        &rid,
+                        &srv.uploads,
+                        &transfer_id,
+                        size,
+                        &sha256,
+                        duration_ms,
+                    )
+                })
+                .await;
+                let msg = self.finish(&request_id, result);
+                write_line(&stdout, &msg).await;
             }
             RequestBody::DownloadRecord {
                 path,
@@ -602,94 +473,135 @@ impl Server {
                 duration_ms,
             } => {
                 let guard = self.store.write_guard().await;
-                let result = transfer::download_record(
-                    &self.workspace,
-                    &self.store,
-                    &guard,
-                    &request_id,
-                    &path,
-                    size,
-                    &sha256,
-                    duration_ms,
-                );
-                drop(guard);
-                self.finish(&request_id, result)
-                    .await
-                    .with_stdout(&stdout)
-                    .await;
+                let srv = self.clone();
+                let rid = request_id.clone();
+                let result = run_blocking(move || {
+                    transfer::download_record(
+                        &srv.workspace,
+                        &srv.store,
+                        &guard,
+                        &rid,
+                        &path,
+                        size,
+                        &sha256,
+                        duration_ms,
+                    )
+                })
+                .await;
+                let msg = self.finish(&request_id, result);
+                write_line(&stdout, &msg).await;
             }
             RequestBody::Gc { keep } => {
                 let guard = self.store.write_guard().await;
-                let result = match keep.or(self.history_limit) {
-                    Some(k) => self.store.prune(k).and_then(|s| {
-                        let in_flight = transfer::in_flight_staging(&self.uploads);
-                        let removed_stale_staging = transfer::sweep_stale_staging_tree(
-                            &self.workspace.root,
-                            &in_flight,
-                            transfer::STALE_STAGING_MAX_AGE,
-                        ) + transfer::sweep_stale_staging_tree(
-                            &self.workspace.scratch_root,
-                            &in_flight,
-                            transfer::STALE_STAGING_MAX_AGE,
-                        );
-                        let scratch =
-                            scratch::enforce(&self.workspace.scratch_root, self.scratch_max_age)
-                                .map_err(|e| {
-                                    remote_workspace_protocol::ProtocolError::new(
-                                        ErrorCode::IoError,
-                                        format!("scratch sweep failed: {e}"),
-                                    )
-                                })?;
-                        Ok(ResultBody::Gc(remote_workspace_protocol::GcResult {
-                            removed_operations: s.removed_operations,
-                            removed_requests: s.removed_requests,
-                            retained_operations: s.retained_operations,
-                            removed_stale_staging,
-                            scratch,
-                        }))
-                    }),
-                    None => Err(remote_workspace_protocol::ProtocolError::new(
-                        ErrorCode::InvalidRequest,
-                        "server has no history limit configured; pass keep explicitly",
-                    )),
-                };
-                drop(guard);
-                self.finish(&request_id, result)
-                    .await
-                    .with_stdout(&stdout)
-                    .await;
+                let srv = self.clone();
+                let result = run_blocking(move || {
+                    let _guard = guard;
+                    srv.gc(keep)
+                })
+                .await;
+                let msg = self.finish(&request_id, result);
+                write_line(&stdout, &msg).await;
+            }
+            RequestBody::ServerInfo { .. }
+            | RequestBody::List { .. }
+            | RequestBody::Wait { .. }
+            | RequestBody::Stat { .. }
+            | RequestBody::Read { .. }
+            | RequestBody::History { .. }
+            | RequestBody::OperationGet { .. }
+            | RequestBody::UploadPrepare { .. }
+            | RequestBody::UploadAbort { .. } => {
+                unreachable!("handled before the idempotency claim")
             }
         }
     }
 
-    fn history(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<ResultBody, remote_workspace_protocol::ProtocolError> {
+    fn server_info(&self) -> Result<ResultBody, ProtocolError> {
+        match std::fs::metadata(&self.workspace.root) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(ProtocolError::new(
+                    ErrorCode::NotADirectory,
+                    format!(
+                        "workspace root is not a directory: {}",
+                        self.workspace.root.display()
+                    ),
+                ))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ProtocolError::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "workspace root not found: {}",
+                        self.workspace.root.display()
+                    ),
+                ))
+            }
+            Err(e) => {
+                return Err(ProtocolError::new(
+                    ErrorCode::IoError,
+                    format!("workspace root check failed: {e}"),
+                ))
+            }
+        }
+        Ok(ResultBody::ServerInfo(ServerInfoResult {
+            software_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            default_profile: self.config.default_profile.clone(),
+            profiles: self.config.profile_names(),
+        }))
+    }
+
+    fn gc(&self, keep: Option<usize>) -> Result<ResultBody, ProtocolError> {
+        let Some(k) = keep.or(self.history_limit) else {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "server has no history limit configured; pass keep explicitly",
+            ));
+        };
+        let stats = self.store.prune(k)?;
+        let in_flight = transfer::in_flight_staging(&self.uploads);
+        let removed_stale_staging = transfer::sweep_stale_staging_tree(
+            &self.workspace.root,
+            &in_flight,
+            transfer::STALE_STAGING_MAX_AGE,
+        ) + transfer::sweep_stale_staging_tree(
+            &self.workspace.scratch_root,
+            &in_flight,
+            transfer::STALE_STAGING_MAX_AGE,
+        );
+        let scratch = scratch::enforce(&self.workspace.scratch_root, self.scratch_max_age)
+            .map_err(|e| {
+                ProtocolError::new(ErrorCode::IoError, format!("scratch sweep failed: {e}"))
+            })?;
+        Ok(ResultBody::Gc(GcResult {
+            removed_operations: stats.removed_operations,
+            retained_operations: stats.retained_operations,
+            removed_stale_staging,
+            scratch,
+        }))
+    }
+
+    fn history(&self, limit: Option<usize>) -> Result<ResultBody, ProtocolError> {
         let limit = limit.unwrap_or(HISTORY_DEFAULT_LIMIT);
         if limit > HISTORY_MAX_LIMIT {
-            return Err(remote_workspace_protocol::ProtocolError::new(
+            return Err(ProtocolError::new(
                 ErrorCode::InvalidRequest,
                 format!("history limit must not exceed {HISTORY_MAX_LIMIT}"),
             ));
         }
         Ok(ResultBody::History {
-            operations: self.store.history(Some(limit)),
+            operations: self.store.history(Some(limit))?,
         })
     }
 
-    fn operation_get(
-        &self,
-        operation_id: &str,
-    ) -> Result<ResultBody, remote_workspace_protocol::ProtocolError> {
-        match self.store.find_record(operation_id) {
-            Some(
-                record @ (remote_workspace_protocol::AnyOperationRecord::Fs(_)
-                | remote_workspace_protocol::AnyOperationRecord::Exec(_)
-                | remote_workspace_protocol::AnyOperationRecord::Transfer(_)),
-            ) => Ok(ResultBody::Operation(OperationDetails { record })),
-            // Prepared/Aborted already filtered by find_record
-            None | Some(_) => Err(remote_workspace_protocol::ProtocolError::new(
+    fn operation_get(&self, operation_id: &str) -> Result<ResultBody, ProtocolError> {
+        match self.store.find_record(operation_id)? {
+            Some(record) if record.is_committed() => {
+                Ok(ResultBody::Operation(OperationDetails { record }))
+            }
+            None | Some(_) => Err(ProtocolError::new(
                 ErrorCode::OperationNotFound,
                 format!("operation not found: {operation_id}"),
             )),
@@ -705,10 +617,6 @@ impl Server {
         timeout_ms: Option<u64>,
         stdout: Arc<tokio::sync::Mutex<W>>,
     ) {
-        // Allocate the operation id up front so that even a rejected exec
-        // (bad profile, empty argv, missing cwd) consumes an id and is
-        // recorded. This keeps ids monotonic and lets operation.get/history
-        // report the attempted command.
         let operation_id = self.store.next_operation_id();
         let ws = self.workspace.clone();
         let config = self.config.clone();
@@ -725,9 +633,6 @@ impl Server {
 
         match outcome {
             Ok(o) => {
-                // disposition reflects what actually happened: Completed if it
-                // ran to an exit code, TimedOut if killed by timeout (but it
-                // DID run, so duration and captured output are meaningful).
                 let disposition = if matches!(
                     o.termination,
                     remote_workspace_protocol::ExecTermination::TimedOut
@@ -745,7 +650,7 @@ impl Server {
                     stderr: o.stderr.clone(),
                 };
                 let record = remote_workspace_protocol::ExecOperationRecord {
-                    operation_id: operation_id.clone(),
+                    operation_id,
                     request_id: request_id.to_string(),
                     argv,
                     cwd,
@@ -771,15 +676,26 @@ impl Server {
                         o.termination,
                         remote_workspace_protocol::ExecTermination::TimedOut
                     ) {
-                        Some(remote_workspace_protocol::ErrorCode::ExecFailed)
+                        Some(ErrorCode::ExecFailed)
                     } else {
                         None
                     },
                     stdout: o.stdout,
                     stderr: o.stderr,
                 };
-                if let Err(e) = self.store.append_exec_record(record) {
-                    let _ = self.store.remember_error(request_id, e.clone());
+                let store = self.store.clone();
+                let appended =
+                    tokio::task::spawn_blocking(move || store.append_exec_record(record))
+                        .await
+                        .map_err(|e| {
+                            ProtocolError::new(
+                                ErrorCode::IoError,
+                                format!("blocking task failed: {e}"),
+                            )
+                        })
+                        .and_then(|r| r);
+                if let Err(e) = appended {
+                    self.store.remember_error(request_id, e.clone());
                     write_line(
                         &stdout,
                         &ServerMessage::Error {
@@ -790,28 +706,14 @@ impl Server {
                     .await;
                     return;
                 }
-                let body = ServerMessage::Result {
+                let msg = ServerMessage::Result {
                     request_id: request_id.to_string(),
                     result: ResultBody::Exec(result),
                 };
-                if let Err(log_err) = self.store.remember_result(request_id, body.clone()) {
-                    write_line(
-                        &stdout,
-                        &ServerMessage::Error {
-                            request_id: request_id.to_string(),
-                            error: log_err,
-                        },
-                    )
-                    .await;
-                    return;
-                }
-                write_line(&stdout, &body).await;
+                self.store.remember_result(request_id, msg.clone());
+                write_line(&stdout, &msg).await;
             }
             Err(e) => {
-                // Rejected: the command never started (bad profile/cwd/argv, or
-                // spawn failure). It consumed an id, so record it with the
-                // Rejected disposition. Logging failures are surfaced, not
-                // swallowed.
                 let record = remote_workspace_protocol::ExecOperationRecord {
                     operation_id,
                     request_id: request_id.to_string(),
@@ -829,9 +731,20 @@ impl Server {
                     stdout: remote_workspace_protocol::ExecOutput::default(),
                     stderr: remote_workspace_protocol::ExecOutput::default(),
                 };
-                let record_err = self.store.append_exec_record(record).err();
-                let remember_err = self.store.remember_error(request_id, e.clone()).err();
-                let report = remember_err.or(record_err).unwrap_or(e);
+                let store = self.store.clone();
+                let record_err =
+                    tokio::task::spawn_blocking(move || store.append_exec_record(record))
+                        .await
+                        .map_err(|join_err| {
+                            ProtocolError::new(
+                                ErrorCode::IoError,
+                                format!("blocking task failed: {join_err}"),
+                            )
+                        })
+                        .and_then(|r| r)
+                        .err();
+                let report = record_err.unwrap_or(e);
+                self.store.remember_error(request_id, report.clone());
                 write_line(
                     &stdout,
                     &ServerMessage::Error {
@@ -844,64 +757,48 @@ impl Server {
         }
     }
 
-    /// Wrap a sync result into a ServerMessage, remember it, and return it for
-    /// writing. If persisting the result to the request log fails, the client
-    /// is told the operation failed (with an IO error), so the server never
-    /// reports success for state it could not durably record.
-    async fn finish(
-        &self,
-        request_id: &str,
-        result: Result<ResultBody, remote_workspace_protocol::ProtocolError>,
-    ) -> FinishResult {
+    fn finish(&self, request_id: &str, result: Result<ResultBody, ProtocolError>) -> ServerMessage {
         match result {
             Ok(body) => {
                 let msg = ServerMessage::Result {
                     request_id: request_id.to_string(),
                     result: body,
                 };
-                match self.store.remember_result(request_id, msg.clone()) {
-                    Ok(()) => FinishResult::Msg(msg),
-                    Err(log_err) => FinishResult::Msg(ServerMessage::Error {
-                        request_id: request_id.to_string(),
-                        error: log_err,
-                    }),
-                }
+                self.store.remember_result(request_id, msg.clone());
+                msg
             }
-            Err(e) => match self.store.remember_error(request_id, e.clone()) {
-                Ok(()) => FinishResult::Msg(ServerMessage::Error {
+            Err(e) => {
+                self.store.remember_error(request_id, e.clone());
+                ServerMessage::Error {
                     request_id: request_id.to_string(),
                     error: e,
-                }),
-                Err(log_err) => FinishResult::Msg(ServerMessage::Error {
-                    request_id: request_id.to_string(),
-                    error: log_err,
-                }),
-            },
+                }
+            }
         }
     }
 }
 
-/// Collect every handler that has finished, so what is left in the set is what
-/// is still running. A panicking handler is collected too (as an `Err`), which
-/// is what keeps the count from drifting up -- and an over-count would mean the
-/// idle timeout never fires and the workspace stays locked forever.
+async fn run_blocking<F>(f: F) -> Result<ResultBody, ProtocolError>
+where
+    F: FnOnce() -> Result<ResultBody, ProtocolError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("blocking task failed: {e}")))?
+}
+
+fn reply_for(request_id: String, result: Result<ResultBody, ProtocolError>) -> ServerMessage {
+    match result {
+        Ok(body) => ServerMessage::Result {
+            request_id,
+            result: body,
+        },
+        Err(error) => ServerMessage::Error { request_id, error },
+    }
+}
+
 fn reap<T: 'static>(handlers: &mut tokio::task::JoinSet<T>) {
     while handlers.try_join_next().is_some() {}
-}
-
-enum FinishResult {
-    Msg(ServerMessage),
-}
-
-impl FinishResult {
-    async fn with_stdout<W: tokio::io::AsyncWrite + Unpin + Send>(
-        self,
-        stdout: &Arc<tokio::sync::Mutex<W>>,
-    ) {
-        match self {
-            FinishResult::Msg(m) => write_line(stdout, &m).await,
-        }
-    }
 }
 
 fn now_ms() -> u64 {
@@ -909,27 +806,6 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .expect("system clock is set before 1970")
-}
-
-fn op_kind_str(body: &RequestBody) -> &str {
-    match body {
-        RequestBody::List { .. } => "list",
-        RequestBody::Stat { .. } => "stat",
-        RequestBody::Read { .. } => "read",
-        RequestBody::Create { .. } => "create",
-        RequestBody::Edit { .. } => "edit",
-        RequestBody::Exec { .. } => "exec",
-        RequestBody::Wait { .. } => "wait",
-        RequestBody::Delete { .. } => "delete",
-        RequestBody::UploadPrepare { .. } => "upload_prepare",
-        RequestBody::UploadCommit { .. } => "upload_commit",
-        RequestBody::UploadAbort { .. } => "upload_abort",
-        RequestBody::DownloadRecord { .. } => "download_record",
-        RequestBody::History { .. } => "history",
-        RequestBody::OperationGet { .. } => "operation_get",
-        RequestBody::RequestStatus { .. } => "request_status",
-        RequestBody::Gc { .. } => "gc",
-    }
 }
 
 async fn write_line<W: tokio::io::AsyncWrite + Unpin + Send>(

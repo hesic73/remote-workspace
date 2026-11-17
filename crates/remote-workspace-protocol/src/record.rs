@@ -91,11 +91,8 @@ pub struct ExecOperationRecord {
     pub stderr: crate::messages::ExecOutput,
 }
 
-/// A "prepared" (write-ahead) marker for an fs mutation, written before the
-/// workspace is touched so startup recovery can detect a crash between the
-/// rename and the commit-log write. This is an internal bookkeeping record;
-/// it is reconciled away once the matching committed record is appended, and
-/// it never appears in `history`/`operation.get` results seen by clients.
+/// Legacy WAL marker from pre-0.8 servers; no longer written, kept so older
+/// `operations.jsonl` files still deserialize cleanly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedRecord {
     pub operation_id: String,
@@ -108,8 +105,8 @@ pub struct PreparedRecord {
     pub timestamp_ms: u64,
 }
 
-/// Union of the record kinds. The `Prepared` and `Aborted` variants are
-/// internal (WAL only) and are stripped before serving `history`/`operation.get`.
+/// Union of the record kinds. `Prepared` and `Aborted` are legacy WAL markers
+/// stripped before serving `history`/`operation_get`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "record_kind", rename_all = "snake_case")]
 pub enum AnyOperationRecord {
@@ -117,15 +114,10 @@ pub enum AnyOperationRecord {
     Exec(ExecOperationRecord),
     Transfer(TransferOperationRecord),
     Prepared(PreparedRecord),
-    /// Marks a prepared record as definitively rolled back. Written durably so
-    /// a future restart does not resurrect the orphaned prepared marker.
     Aborted(AbortedRecord),
 }
 
-/// A durable "rolled back" marker that supersedes a prepared record for the
-/// same operation_id but does not create a change record. It exists solely to
-/// prevent a stale prepared line in the append-only log from being mistaken for
-/// an uncommitted operation on a future restart.
+/// Legacy WAL rollback marker from pre-0.8 servers; see `PreparedRecord`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AbortedRecord {
     pub operation_id: String,

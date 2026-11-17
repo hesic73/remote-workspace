@@ -30,9 +30,40 @@ pub struct EditSpec {
     pub replace_all: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lines: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_lines: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_bytes: Option<u64>,
+}
+
+impl ReadOptions {
+    pub fn into_request_body(self, path: String) -> RequestBody {
+        RequestBody::Read {
+            path,
+            offset: self.offset,
+            limit: self.limit,
+            start_line: self.start_line,
+            max_lines: self.max_lines,
+            tail_lines: self.tail_lines,
+            tail_bytes: self.tail_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RequestBody {
+    ServerInfo {},
     List {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -45,10 +76,18 @@ pub enum RequestBody {
     },
     Read {
         path: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         offset: Option<u64>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_line: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_lines: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tail_lines: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tail_bytes: Option<u64>,
     },
     /// Create a new text file. Fails if the target already exists; existing
     /// files are modified only through `Edit`.
@@ -56,13 +95,15 @@ pub enum RequestBody {
         path: String,
         content: String,
     },
-    /// Apply exact text replacements to an existing text file. `base_hash`
-    /// pins the content the FIRST replacement is stated against; each later one
-    /// is stated against what the ones before it produced. See `EditSpec`.
+    /// Modify an existing text file gated by `base_hash`, either via ordered
+    /// `edits` or whole-file `replace_content` (mutually exclusive).
     Edit {
         path: String,
         base_hash: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         edits: Vec<EditSpec>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replace_content: Option<String>,
     },
     Exec {
         argv: Vec<String>,
@@ -122,13 +163,9 @@ pub enum RequestBody {
     OperationGet {
         operation_id: OperationId,
     },
-    RequestStatus {
-        #[serde(rename = "target_request_id")]
-        target: RequestId,
-    },
-    /// Prune stored history to the `keep` most recent operations and the
-    /// request entries they reference; also sweeps scratch and stale upload
-    /// staging. `None` uses the server's configured history limit.
+    /// Prune stored history to the `keep` most recent operations; also sweeps
+    /// scratch and stale upload staging. `None` uses the server's configured
+    /// history limit.
     Gc {
         #[serde(default)]
         keep: Option<usize>,
@@ -154,6 +191,8 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ResultBody {
+    #[serde(rename = "server_info")]
+    ServerInfo(ServerInfoResult),
     #[serde(rename = "list")]
     List(ListResult),
     #[serde(rename = "stat")]
@@ -161,16 +200,14 @@ pub enum ResultBody {
     #[serde(rename = "read")]
     Read(ReadResult),
     /// Result of any single-file mutation (create, edit, delete). The wire tag
-    /// stays "write" so request logs recorded before the create/edit protocol
-    /// still deserialize.
+    /// stays "write" so legacy logs still deserialize.
     #[serde(rename = "write")]
     Mutation(MutationResult),
     #[serde(rename = "exec")]
     Exec(ExecResult),
     #[serde(rename = "wait")]
     Wait(WaitResult),
-    /// Legacy result from the removed undo operation. No longer produced, kept
-    /// so request logs written by older servers still deserialize.
+    /// Legacy result from the removed undo operation.
     #[serde(rename = "undo")]
     Undo(UndoResult),
     #[serde(rename = "upload_prepare")]
@@ -185,10 +222,19 @@ pub enum ResultBody {
     },
     #[serde(rename = "operation")]
     Operation(OperationDetails),
-    #[serde(rename = "request_status")]
-    RequestStatus(RequestStatusResult),
     #[serde(rename = "gc")]
     Gc(GcResult),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerInfoResult {
+    pub software_version: String,
+    pub protocol_version: u32,
+    pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+    #[serde(default)]
+    pub profiles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,10 +281,22 @@ pub struct FileMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadResult {
     pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: u64,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub trailing_newline: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_lines: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     pub truncated: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<u64>,
 }
 
@@ -342,7 +400,6 @@ pub struct UndoResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcResult {
     pub removed_operations: usize,
-    pub removed_requests: usize,
     pub retained_operations: usize,
     /// Stale upload staging files (interrupted uploads) deleted by this gc.
     #[serde(default)]
@@ -368,22 +425,4 @@ pub struct ScratchUsage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationDetails {
     pub record: crate::record::AnyOperationRecord,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestStatusResult {
-    #[serde(rename = "target_request_id")]
-    pub target: RequestId,
-    pub status: RequestStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<ProtocolError>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RequestStatus {
-    Unknown,
-    InProgress,
-    Done,
-    Error,
 }

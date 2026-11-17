@@ -204,19 +204,16 @@ async fn end_to_end_history_records_each_mutation() {
 }
 
 #[tokio::test]
-async fn end_to_end_status_query() {
+async fn end_to_end_server_info_and_operation_get() {
     let dir = tempfile::tempdir().unwrap();
     let client = make_client(dir.path()).await;
-    // Unknown.
-    let s = client.request_status("never-existed").await.unwrap();
-    assert_eq!(s.status, remote_workspace_protocol::RequestStatus::Unknown);
+    let info = client.server_info().await.unwrap();
+    assert_eq!(
+        info.protocol_version,
+        remote_workspace_protocol::PROTOCOL_VERSION
+    );
 
-    // Execute then query.
     let w = client.create("q.txt", "q").await.unwrap();
-    let s = client.request_status("__noop__").await.unwrap();
-    let _ = s;
-    // We don't know the request_id the client generated internally, but we can
-    // still check operation_get works.
     let d = client.operation_get(&w.operation_id).await.unwrap();
     assert_eq!(d.record.operation_id(), w.operation_id);
 }
@@ -277,6 +274,17 @@ async fn client_exec_returns_closed_when_server_dies() {
     let _ = dir; // suppress unused
 }
 
+fn has_op_shards(state_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(state_dir.join("ops")) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(".jsonl"))
+    })
+}
+
 #[tokio::test]
 async fn end_to_end_gc_prunes_history() {
     let dir = tempfile::tempdir().unwrap();
@@ -290,6 +298,10 @@ async fn end_to_end_gc_prunes_history() {
             .unwrap()
             .new_hash;
     }
+    // Close the writer session so its shard is closed and eligible for compaction.
+    client.close().await;
+
+    let client = make_client(dir.path()).await;
     let g = client.gc(Some(1)).await.unwrap();
     assert_eq!(g.removed_operations, 2);
     assert_eq!(g.retained_operations, 1);
@@ -389,12 +401,7 @@ async fn cli_over_fake_ssh_quotes_paths_with_spaces() {
     // in the workspace.
     let keyed: Vec<_> = std::fs::read_dir(state.join("state")).unwrap().collect();
     assert_eq!(keyed.len(), 1);
-    assert!(keyed[0]
-        .as_ref()
-        .unwrap()
-        .path()
-        .join("operations.jsonl")
-        .exists());
+    assert!(has_op_shards(&keyed[0].as_ref().unwrap().path()));
     assert!(!root.join(".remote-workspace").exists());
 }
 
@@ -435,7 +442,7 @@ async fn cli_state_base_redirects_state_location() {
         .unwrap()
         .to_string_lossy()
         .starts_with(&*root_name));
-    assert!(keyed.join("operations.jsonl").exists());
+    assert!(has_op_shards(&keyed));
     assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
 }
 
@@ -507,4 +514,168 @@ async fn closed_error_stays_bare_when_the_remote_said_nothing() {
     let client = Client::connect(SilentTransport, None).await.unwrap();
     let err = client.stat(".").await.unwrap_err();
     assert_eq!(err.to_string(), "server closed connection");
+}
+
+#[tokio::test]
+async fn concurrent_clients_share_workspace_without_lock_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let c1 = make_client(dir.path()).await;
+    let c2 = make_client(dir.path()).await;
+
+    let (w1, w2) = tokio::join!(
+        c1.create("from_c1.txt", "alpha\n"),
+        c2.create("from_c2.txt", "beta\n"),
+    );
+    let (w1, w2) = (w1.unwrap(), w2.unwrap());
+
+    let (e1, e2, r1, r2, ex1, ex2) = tokio::join!(
+        c1.edit(
+            "from_c1.txt",
+            &w1.new_hash,
+            vec![spec("alpha\n", "ALPHA\n")]
+        ),
+        c2.replace("from_c2.txt", &w2.new_hash, "BETA\n"),
+        c1.read("from_c2.txt", None, None),
+        c2.read("from_c1.txt", None, None),
+        c1.exec(vec!["echo".into(), "s1".into()], None, None, None),
+        c2.exec(vec!["echo".into(), "s2".into()], None, None, None),
+    );
+    e1.unwrap();
+    e2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
+    assert_eq!(
+        ex1.unwrap().termination,
+        ExecTermination::Exited { code: 0 }
+    );
+    assert_eq!(
+        ex2.unwrap().termination,
+        ExecTermination::Exited { code: 0 }
+    );
+
+    // Conflicting concurrent edits on the same base_hash: exactly one wins and
+    // the other fails cleanly with StaleFile.
+    let shared = c1.create("shared.txt", "v0\n").await.unwrap();
+    let (race1, race2) = tokio::join!(
+        c1.replace("shared.txt", &shared.new_hash, "v1-from-c1\n"),
+        c2.replace("shared.txt", &shared.new_hash, "v1-from-c2\n"),
+    );
+    match (race1, race2) {
+        (Ok(_), Err(remote_workspace_client::ClientError::Server(e)))
+        | (Err(remote_workspace_client::ClientError::Server(e)), Ok(_)) => {
+            assert_eq!(e.code, remote_workspace_protocol::ErrorCode::StaleFile);
+        }
+        other => panic!("expected one winner and one StaleFile, got {other:?}"),
+    }
+
+    let ops1 = c1.history(None).await.unwrap();
+    let ops2 = c2.history(None).await.unwrap();
+    assert_eq!(ops1.len(), 8);
+    assert_eq!(ops2.len(), 8);
+}
+
+#[tokio::test]
+async fn cli_workspace_flag_runs_commands_and_paging() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("ws");
+    std::fs::create_dir(&root).unwrap();
+    let state = base.path().join("state");
+    let fleet = base.path().join("workspaces.toml");
+    let srv = server_bin();
+    std::fs::write(
+        &fleet,
+        format!(
+            "[workspaces.dev]\nroot = {:?}\nbin = {:?}\nstate_base = {:?}\n",
+            root.to_string_lossy(),
+            srv.to_string_lossy(),
+            state.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    let cli = env!("CARGO_BIN_EXE_remote-workspace");
+    let run = |args: &[&str]| {
+        std::process::Command::new(cli)
+            .args(["-w", "dev", "--fleet"])
+            .arg(&fleet)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let src = base.path().join("input.txt");
+    std::fs::write(&src, "l1\nl2\nl3\nl4\nl5\n").unwrap();
+    let out = run(&["create", "lines.txt", "--file", src.to_str().unwrap()]);
+    assert!(out.status.success(), "create failed: {out:?}");
+    let created: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let hash = created["new_hash"].as_str().unwrap();
+
+    let ls = run(&["ls", "."]);
+    assert!(ls.status.success(), "ls failed: {ls:?}");
+    assert!(String::from_utf8_lossy(&ls.stdout).contains("lines.txt"));
+
+    let cat_mid = run(&["cat", "lines.txt", "--start-line", "2", "--max-lines", "2"]);
+    assert!(
+        cat_mid.status.success(),
+        "cat line range failed: {cat_mid:?}"
+    );
+    assert_eq!(String::from_utf8_lossy(&cat_mid.stdout), "l2\nl3\n");
+    assert!(
+        String::from_utf8_lossy(&cat_mid.stderr).contains("--start-line 4"),
+        "expected next_line pagination hint: {:?}",
+        String::from_utf8_lossy(&cat_mid.stderr)
+    );
+
+    let cat_tail = run(&["cat", "lines.txt", "--tail-lines", "2"]);
+    assert!(cat_tail.status.success(), "cat tail failed: {cat_tail:?}");
+    assert_eq!(String::from_utf8_lossy(&cat_tail.stdout), "l4\nl5\n");
+
+    let repl = base.path().join("replaced.txt");
+    std::fs::write(&repl, "whole-new-body\n").unwrap();
+    let ed = run(&[
+        "edit",
+        "lines.txt",
+        "--base-hash",
+        hash,
+        "--replace-file",
+        repl.to_str().unwrap(),
+    ]);
+    assert!(ed.status.success(), "edit --replace-file failed: {ed:?}");
+    let cat_after = run(&["cat", "lines.txt"]);
+    assert_eq!(
+        String::from_utf8_lossy(&cat_after.stdout),
+        "whole-new-body\n"
+    );
+
+    let hist = run(&["history"]);
+    assert!(hist.status.success(), "history failed: {hist:?}");
+    let hist_json: serde_json::Value = serde_json::from_slice(&hist.stdout).unwrap();
+    assert_eq!(hist_json.as_array().unwrap().len(), 2);
+
+    let gc = run(&["gc", "--keep", "1"]);
+    assert!(gc.status.success(), "gc failed: {gc:?}");
+    let gc_json: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(gc_json["retained_operations"], 1);
+
+    let bad_ws = std::process::Command::new(cli)
+        .args(["-w", "missing", "--fleet"])
+        .arg(&fleet)
+        .args(["ls", "."])
+        .output()
+        .unwrap();
+    assert!(!bad_ws.status.success());
+    let stderr = String::from_utf8_lossy(&bad_ws.stderr);
+    assert!(
+        stderr.contains("unknown_workspace") && stderr.contains("dev"),
+        "{stderr}"
+    );
+
+    let conflict = std::process::Command::new(cli)
+        .args(["-w", "dev", "--fleet"])
+        .arg(&fleet)
+        .args(["--root", "/tmp", "ls", "."])
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success());
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("--workspace cannot be combined"));
 }

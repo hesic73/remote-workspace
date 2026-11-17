@@ -620,14 +620,21 @@ async fn transfers_appear_in_history_without_leaked_paths() {
         .unwrap()
         .unwrap()
         .path();
-    for log in ["operations.jsonl", "requests.jsonl"] {
-        let text = std::fs::read_to_string(state_dir.join(log)).unwrap();
-        assert!(!text.contains(marker), "{log} leaked file content");
+    let shards: Vec<PathBuf> = std::fs::read_dir(state_dir.join("ops"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .collect();
+    assert!(!shards.is_empty(), "expected at least one op shard");
+    for shard in shards {
+        let text = std::fs::read_to_string(&shard).unwrap();
+        assert!(!text.contains(marker), "{shard:?} leaked file content");
         assert!(
             !text.contains("secret-local-name") && !text.contains("secret-dest-name"),
-            "{log} leaked a local path"
+            "{shard:?} leaked a local path"
         );
-        assert!(!text.contains(".part"), "{log} leaked a staging path");
+        assert!(!text.contains(".part"), "{shard:?} leaked a staging path");
     }
 }
 

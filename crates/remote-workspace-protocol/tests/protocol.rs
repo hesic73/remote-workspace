@@ -24,14 +24,27 @@ fn list_round_trips() {
 }
 
 #[test]
+fn server_info_round_trips() {
+    assert_eq!(PROTOCOL_VERSION, 5);
+    let req = Request {
+        request_id: "r0".into(),
+        body: RequestBody::ServerInfo {},
+    };
+    let line = serde_json::to_string(&req).unwrap();
+    assert_eq!(line, r#"{"request_id":"r0","op":"server_info"}"#);
+    round_trip(&req);
+}
+
+#[test]
 fn read_round_trips() {
     let req = Request {
         request_id: "r2".into(),
-        body: RequestBody::Read {
-            path: "src/main.py".into(),
+        body: ReadOptions {
             offset: Some(0),
             limit: Some(65536),
-        },
+            ..Default::default()
+        }
+        .into_request_body("src/main.py".into()),
     };
     let line = serde_json::to_string(&req).unwrap();
     assert_eq!(
@@ -39,6 +52,35 @@ fn read_round_trips() {
         r#"{"request_id":"r2","op":"read","path":"src/main.py","offset":0,"limit":65536}"#
     );
     round_trip(&req);
+
+    let line_req = Request {
+        request_id: "r2b".into(),
+        body: ReadOptions {
+            start_line: Some(10),
+            max_lines: Some(50),
+            ..Default::default()
+        }
+        .into_request_body("src/main.py".into()),
+    };
+    assert_eq!(
+        serde_json::to_string(&line_req).unwrap(),
+        r#"{"request_id":"r2b","op":"read","path":"src/main.py","start_line":10,"max_lines":50}"#
+    );
+    round_trip(&line_req);
+
+    let tail_req = Request {
+        request_id: "r2c".into(),
+        body: ReadOptions {
+            tail_lines: Some(100),
+            ..Default::default()
+        }
+        .into_request_body("train.log".into()),
+    };
+    assert_eq!(
+        serde_json::to_string(&tail_req).unwrap(),
+        r#"{"request_id":"r2c","op":"read","path":"train.log","tail_lines":100}"#
+    );
+    round_trip(&tail_req);
 }
 
 #[test]
@@ -70,6 +112,7 @@ fn edit_round_trips() {
                 new_text: "new".into(),
                 replace_all: false,
             }],
+            replace_content: None,
         },
     };
     let line = serde_json::to_string(&req).unwrap();
@@ -89,26 +132,44 @@ fn edit_round_trips() {
     }))
     .unwrap();
     match req.body {
-        RequestBody::Edit { edits, .. } => {
+        RequestBody::Edit {
+            edits,
+            replace_content,
+            ..
+        } => {
             assert_eq!(edits.len(), 1);
             assert!(!edits[0].replace_all);
+            assert!(replace_content.is_none());
         }
         _ => panic!("wrong body"),
     }
 }
 
-// The single-replacement shape of protocol 2 must be refused outright, not
-// read as an edit with an empty list: that would report success having changed
-// nothing. This is what the protocol bump gates.
 #[test]
-fn the_protocol_2_edit_shape_no_longer_deserializes() {
+fn edit_replace_content_round_trips() {
+    let req = Request {
+        request_id: "r3r".into(),
+        body: RequestBody::Edit {
+            path: "src/main.py".into(),
+            base_hash: "sha256:abc123".into(),
+            edits: Vec::new(),
+            replace_content: Some("full replacement\n".into()),
+        },
+    };
+    let line = serde_json::to_string(&req).unwrap();
+    assert_eq!(
+        line,
+        r#"{"request_id":"r3r","op":"edit","path":"src/main.py","base_hash":"sha256:abc123","replace_content":"full replacement\n"}"#
+    );
+    round_trip(&req);
+}
+
+#[test]
+fn removed_request_status_op_no_longer_deserializes() {
     let old = json!({
         "request_id": "r",
-        "op": "edit",
-        "path": "p",
-        "base_hash": "sha256:a",
-        "old_text": "x",
-        "new_text": "y",
+        "op": "request_status",
+        "target_request_id": "r0",
     });
     assert!(serde_json::from_value::<Request>(old).is_err());
 }
@@ -153,19 +214,36 @@ fn result_message_serializes() {
     let msg = ServerMessage::Result {
         request_id: "r1".into(),
         result: ResultBody::Read(ReadResult {
-            content: "...".into(),
+            content: "...\n".into(),
+            total_bytes: 10,
+            start_offset: 0,
+            end_offset: 4,
+            trailing_newline: true,
+            start_line: Some(1),
+            end_line: Some(1),
+            total_lines: Some(3),
+            next_line: Some(2),
             hash: Some("sha256:abc123".into()),
-            truncated: false,
-            next_offset: None,
+            truncated: true,
+            next_offset: Some(4),
         }),
     };
     let line = serde_json::to_string(&msg).unwrap();
     let v: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(v["request_id"], "r1");
     assert_eq!(v["type"], "read");
-    assert_eq!(v["content"], "...");
+    assert_eq!(v["content"], "...\n");
+    assert_eq!(v["total_bytes"], 10);
+    assert_eq!(v["start_offset"], 0);
+    assert_eq!(v["end_offset"], 4);
+    assert_eq!(v["trailing_newline"], true);
+    assert_eq!(v["start_line"], 1);
+    assert_eq!(v["end_line"], 1);
+    assert_eq!(v["total_lines"], 3);
+    assert_eq!(v["next_line"], 2);
     assert_eq!(v["hash"], "sha256:abc123");
-    assert_eq!(v["truncated"], false);
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["next_offset"], 4);
 }
 
 #[test]
@@ -249,6 +327,14 @@ fn legacy_records_and_results_still_deserialize() {
     let old_write = r#"{"record_kind":"fs","operation_id":"op-2","request_id":"r","kind":"write","after_hash":"sha256:z","path":"p","timestamp_ms":1}"#;
     assert!(serde_json::from_str::<AnyOperationRecord>(old_write).is_ok());
 
+    let old_prepared = r#"{"record_kind":"prepared","operation_id":"op-7","request_id":"r","kind":"edit","path":"p","expected_after_hash":"sha256:z","timestamp_ms":2}"#;
+    let prep: AnyOperationRecord = serde_json::from_str(old_prepared).unwrap();
+    assert!(!prep.is_committed());
+
+    let old_aborted = r#"{"record_kind":"aborted","operation_id":"op-7","timestamp_ms":3}"#;
+    let ab: AnyOperationRecord = serde_json::from_str(old_aborted).unwrap();
+    assert!(!ab.is_committed());
+
     let old_exec_result = r#"{"request_id":"r","type":"exec","operation_id":"op-3","termination":{"kind":"exited","code":0},"duration_ms":1,"stdout":{"prefix":"","suffix":"","total_bytes":0,"omitted_bytes":0},"stderr":{"prefix":"","suffix":"","total_bytes":0,"omitted_bytes":0}}"#;
     let msg: ServerMessage = serde_json::from_str(old_exec_result).unwrap();
     match msg {
@@ -305,6 +391,13 @@ fn every_result_variant_round_trips_through_server_message() {
     // any other duplicate) breaks serialization. Build each variant and verify
     // it round-trips.
     let cases: Vec<ResultBody> = vec![
+        ResultBody::ServerInfo(ServerInfoResult {
+            software_version: "0.8.0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            platform: "linux-x86_64".into(),
+            default_profile: Some("gpu".into()),
+            profiles: vec!["cpu".into(), "gpu".into()],
+        }),
         ResultBody::List(ListResult {
             entries: vec![],
             next_offset: None,
@@ -320,6 +413,14 @@ fn every_result_variant_round_trips_through_server_message() {
         },
         ResultBody::Read(ReadResult {
             content: "c".into(),
+            total_bytes: 1,
+            start_offset: 0,
+            end_offset: 1,
+            trailing_newline: false,
+            start_line: None,
+            end_line: None,
+            total_lines: None,
+            next_line: None,
             hash: None,
             truncated: false,
             next_offset: None,
@@ -356,10 +457,11 @@ fn every_result_variant_round_trips_through_server_message() {
                 },
             ),
         }),
-        ResultBody::RequestStatus(RequestStatusResult {
-            target: "r".into(),
-            status: RequestStatus::Done,
-            error: None,
+        ResultBody::Gc(GcResult {
+            removed_operations: 2,
+            retained_operations: 5,
+            removed_stale_staging: 0,
+            scratch: ScratchUsage::default(),
         }),
     ];
     for body in cases {

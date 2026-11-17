@@ -1,4 +1,6 @@
-use remote_workspace_protocol::{EditSpec, ErrorCode, OperationKind, ProtocolError, ResultBody};
+use remote_workspace_protocol::{
+    EditSpec, ErrorCode, FsOperationRecord, OperationKind, ProtocolError, ResultBody,
+};
 use remote_workspace_server::fs_ops::{self, MAX_EDITS, MAX_TEXT_BYTES};
 use remote_workspace_server::store::OperationStore;
 use remote_workspace_server::workspace::Workspace;
@@ -50,7 +52,28 @@ async fn edit_many(
     edits: Vec<EditSpec>,
 ) -> Result<ResultBody, ProtocolError> {
     let guard = f.store.write_guard().await;
-    fs_ops::edit(&f.ws, &f.store, &guard, "req-edit", path, base_hash, &edits)
+    fs_ops::edit(
+        &f.ws, &f.store, &guard, "req-edit", path, base_hash, &edits, None,
+    )
+}
+
+async fn replace(
+    f: &Fixture,
+    path: &str,
+    base_hash: &str,
+    content: &str,
+) -> Result<ResultBody, ProtocolError> {
+    let guard = f.store.write_guard().await;
+    fs_ops::edit(
+        &f.ws,
+        &f.store,
+        &guard,
+        "req-replace",
+        path,
+        base_hash,
+        &[],
+        Some(content),
+    )
 }
 
 fn spec(old_text: &str, new_text: &str, replace_all: bool) -> EditSpec {
@@ -130,13 +153,84 @@ async fn edit_replaces_multiline_text_and_supports_deletion() {
         std::fs::read_to_string(f.ws.root.join("f.txt")).unwrap(),
         "fn a() {}\nfn b2() {}\n"
     );
-    // Empty new_text deletes the matched text.
     edit(&f, "f.txt", &hash, "fn b2() {}\n", "", false)
         .await
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(f.ws.root.join("f.txt")).unwrap(),
         "fn a() {}\n"
+    );
+}
+
+#[tokio::test]
+async fn edit_replace_content_atomic_stale_unchanged_and_exclusivity() {
+    let f = fixture();
+    let h1 = new_hash(create(&f, "f.txt", "first\n").await.unwrap());
+
+    // Mutual exclusivity: neither provided or both provided.
+    let guard = f.store.write_guard().await;
+    assert_eq!(
+        code(fs_ops::edit(
+            &f.ws,
+            &f.store,
+            &guard,
+            "r0",
+            "f.txt",
+            &h1,
+            &[],
+            None
+        )),
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        code(fs_ops::edit(
+            &f.ws,
+            &f.store,
+            &guard,
+            "r1",
+            "f.txt",
+            &h1,
+            &[spec("first\n", "second\n", false)],
+            Some("second\n"),
+        )),
+        ErrorCode::InvalidRequest
+    );
+    drop(guard);
+
+    // Unchanged content rejected.
+    let unchanged = replace(&f, "f.txt", &h1, "first\n")
+        .await
+        .expect_err("unchanged replace_content must be refused");
+    assert_eq!(unchanged.code, ErrorCode::InvalidRequest);
+    assert!(unchanged.message.contains("unchanged"));
+
+    // Valid atomic whole-file replace.
+    let h2 = match replace(&f, "f.txt", &h1, "replaced completely\n")
+        .await
+        .unwrap()
+    {
+        ResultBody::Mutation(m) => {
+            assert_eq!(m.old_hash.as_deref(), Some(h1.as_str()));
+            assert_eq!(m.new_hash, hash_of("replaced completely\n"));
+            m.new_hash
+        }
+        other => panic!("expected mutation, got {other:?}"),
+    };
+    assert_eq!(
+        std::fs::read_to_string(f.ws.root.join("f.txt")).unwrap(),
+        "replaced completely\n"
+    );
+
+    // Stale hash rejected with expected + actual hashes.
+    let stale = replace(&f, "f.txt", &h1, "third\n")
+        .await
+        .expect_err("stale base_hash must fail");
+    assert_eq!(stale.code, ErrorCode::StaleFile);
+    assert_eq!(stale.expected_hash.as_deref(), Some(h1.as_str()));
+    assert_eq!(stale.actual_hash.as_deref(), Some(h2.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(f.ws.root.join("f.txt")).unwrap(),
+        "replaced completely\n"
     );
 }
 
@@ -187,16 +281,16 @@ async fn edit_input_validation() {
         code(edit(&f, "f.txt", &hash, &huge, "y", false).await),
         ErrorCode::InvalidRequest
     );
+    assert_eq!(
+        code(replace(&f, "f.txt", &hash, &huge).await),
+        ErrorCode::InvalidRequest
+    );
     let guard = f.store.write_guard().await;
     let r = fs_ops::create(&f.ws, &f.store, &guard, "req-huge", "huge.txt", &huge);
     drop(guard);
     assert_eq!(r.unwrap_err().code, ErrorCode::InvalidRequest);
 }
 
-// ---- several replacements in one edit ----
-
-// The defining property: each replacement sees what the previous ones
-// produced, so a later one may match text an earlier one introduced.
 #[tokio::test]
 async fn edits_apply_in_order_each_to_the_previous_result() {
     let f = fixture();
@@ -208,7 +302,6 @@ async fn edits_apply_in_order_each_to_the_previous_result() {
         vec![
             spec("alpha", "ALPHA", false),
             spec("gamma", "gamma2", false),
-            // Matches only because the first replacement produced it.
             spec("ALPHA", "one", false),
         ],
     )
@@ -220,9 +313,6 @@ async fn edits_apply_in_order_each_to_the_previous_result() {
     );
 }
 
-// A failure anywhere in the list leaves the file byte-for-byte unchanged --
-// including a failure in the last replacement, after earlier ones already
-// "succeeded" against the in-memory content.
 #[tokio::test]
 async fn a_failure_anywhere_applies_none_of_the_edits() {
     let f = fixture();
@@ -230,7 +320,6 @@ async fn a_failure_anywhere_applies_none_of_the_edits() {
     let hash = new_hash(create(&f, "f.txt", original).await.unwrap());
 
     let cases: Vec<(Vec<EditSpec>, ErrorCode)> = vec![
-        // Last one matches nothing.
         (
             vec![
                 spec("a\n", "A\n", false),
@@ -239,7 +328,6 @@ async fn a_failure_anywhere_applies_none_of_the_edits() {
             ],
             ErrorCode::NoMatch,
         ),
-        // Last one is ambiguous in the content the earlier ones produced.
         (
             vec![
                 spec("b\n", "a\n", false),
@@ -248,7 +336,6 @@ async fn a_failure_anywhere_applies_none_of_the_edits() {
             ],
             ErrorCode::AmbiguousMatch,
         ),
-        // Last one is malformed: rejected before the file is even read.
         (
             vec![spec("a\n", "A\n", false), spec("", "x", false)],
             ErrorCode::InvalidRequest,
@@ -264,15 +351,12 @@ async fn a_failure_anywhere_applies_none_of_the_edits() {
     }
 }
 
-// Several replacements are ONE operation: one record, one before/after pair.
-// Splitting them into several would make the list interruptible, which is the
-// property this exists to remove.
 #[tokio::test]
 async fn several_replacements_are_a_single_operation() {
     let f = fixture();
     let created = create(&f, "f.txt", "1\n2\n3\n").await.unwrap();
     let hash = new_hash(created);
-    let before = f.store.history(None).len();
+    let before = f.store.history(None).unwrap().len();
     let result = edit_many(
         &f,
         "f.txt",
@@ -293,14 +377,12 @@ async fn several_replacements_are_a_single_operation() {
         other => panic!("expected mutation, got {other:?}"),
     }
     assert_eq!(
-        f.store.history(None).len() - before,
+        f.store.history(None).unwrap().len() - before,
         1,
         "one edit request must append exactly one operation record"
     );
 }
 
-// Error text names the failing replacement when there is more than one, and
-// stays index-free for a lone one.
 #[tokio::test]
 async fn errors_name_which_replacement_failed() {
     let f = fixture();
@@ -339,8 +421,7 @@ async fn edit_list_bounds() {
     let hash = new_hash(create(&f, "f.txt", "a\n").await.unwrap());
     assert_eq!(
         code(edit_many(&f, "f.txt", &hash, vec![]).await),
-        ErrorCode::InvalidRequest,
-        "an empty list would report success having changed nothing"
+        ErrorCode::InvalidRequest
     );
     let too_many = (0..MAX_EDITS + 1)
         .map(|i| spec(&format!("x{i}"), &format!("y{i}"), false))
@@ -351,14 +432,10 @@ async fn edit_list_bounds() {
     );
 }
 
-// Replacements compound, so a growing one applied repeatedly reaches terabytes
-// long before a check on the final result could reject it. The bound has to be
-// enforced before each allocation, not after the last one.
 #[tokio::test]
 async fn a_compounding_replacement_is_rejected_before_it_allocates() {
     let f = fixture();
     let hash = new_hash(create(&f, "f.txt", "a").await.unwrap());
-    // Each doubles the content; unchecked, 40 of them ask for about a TiB.
     let doubling: Vec<EditSpec> = (0..40).map(|_| spec("a", "aa", true)).collect();
     assert_eq!(
         code(edit_many(&f, "f.txt", &hash, doubling).await),
@@ -366,13 +443,10 @@ async fn a_compounding_replacement_is_rejected_before_it_allocates() {
     );
     assert_eq!(
         std::fs::read_to_string(f.ws.root.join("f.txt")).unwrap(),
-        "a",
-        "a rejected edit must leave the file alone"
+        "a"
     );
 }
 
-// The result bound holds across the list as a whole: each replacement fits on
-// its own, and together they do not.
 #[tokio::test]
 async fn a_result_over_the_cap_is_rejected() {
     let f = fixture();
@@ -396,17 +470,10 @@ async fn a_result_over_the_cap_is_rejected() {
     );
 }
 
-// A file already changed when the edit arrives is caught by base_hash, before
-// any work is done. The narrower case -- a write landing AFTER that check, while
-// the replacement is being built -- is caught under the rename itself and is
-// covered by fs_ops' own `write_tests`, since from out here it cannot be
-// reached: this check fires first.
 #[tokio::test]
 async fn an_edit_against_an_already_changed_file_is_refused() {
     let f = fixture();
     let hash = new_hash(create(&f, "f.txt", "original\n").await.unwrap());
-    // Stand in for the concurrent writer: the content changes after the hash
-    // the edit was stated against was taken.
     std::fs::write(f.ws.root.join("f.txt"), "written by something else\n").unwrap();
 
     let err = edit_many(
@@ -420,276 +487,10 @@ async fn an_edit_against_an_already_changed_file_is_refused() {
     assert_eq!(err.code, ErrorCode::StaleFile);
     assert_eq!(
         std::fs::read_to_string(f.ws.root.join("f.txt")).unwrap(),
-        "written by something else\n",
-        "the concurrent write must survive"
+        "written by something else\n"
     );
 }
 
-// Recovery synthesizes a commit for a marker whose file already holds the
-// intended result -- right for a real crash between rename and commit, and the
-// reason a mutation that was REFUSED after its marker was written must withdraw
-// it. The withdrawal itself is driven through the real code path by fs_ops'
-// `write_tests`, which can reach the branch this test cannot.
-#[tokio::test]
-async fn a_marker_left_by_a_crash_is_recovered_as_a_commit() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_path_buf();
-    let state = root.join("state");
-    std::fs::write(root.join("f.txt"), "v1\n").unwrap();
-
-    let op_id = {
-        let store = OperationStore::new(state.clone()).unwrap();
-        store
-            .prepare_fs_record(
-                "req-1",
-                OperationKind::Edit,
-                "f.txt",
-                Some(hash_of("v1\n")),
-                hash_of("v2\n"),
-            )
-            .unwrap()
-    };
-    // The rename landed; the commit did not.
-    std::fs::write(root.join("f.txt"), "v2\n").unwrap();
-
-    // Markers are reloaded only when a store opens, so recovery runs on a
-    // reopened one, exactly as the next server would.
-    let ws = Workspace::new(root, dir.path().join("scratch")).unwrap();
-    let store = OperationStore::new(state).unwrap();
-    store.recover(&ws).unwrap();
-    assert!(
-        store
-            .history(None)
-            .iter()
-            .any(|r| r.operation_id() == op_id),
-        "a genuine crash between rename and commit must still be recovered"
-    );
-}
-
-// A marker kept because the sync after its rename failed is followed, in the
-// same session, by an edit that starts from the content it installed and moves
-// the file on. Recovery must still see that the first edit landed, though the
-// file no longer holds what it wrote.
-#[tokio::test]
-async fn a_marker_superseded_by_a_later_commit_is_recovered_as_a_commit() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_path_buf();
-    let state = root.join("state");
-    std::fs::write(root.join("f.txt"), "v3\n").unwrap();
-
-    let first = {
-        let store = OperationStore::new(state.clone()).unwrap();
-        let first = store
-            .prepare_fs_record(
-                "req-1",
-                OperationKind::Edit,
-                "f.txt",
-                Some(hash_of("v1\n")),
-                hash_of("v2\n"),
-            )
-            .unwrap();
-        let second = store
-            .prepare_fs_record(
-                "req-2",
-                OperationKind::Edit,
-                "f.txt",
-                Some(hash_of("v2\n")),
-                hash_of("v3\n"),
-            )
-            .unwrap();
-        store
-            .commit_fs_record(
-                &second,
-                "req-2",
-                OperationKind::Edit,
-                "f.txt",
-                Some(hash_of("v2\n")),
-                hash_of("v3\n"),
-            )
-            .unwrap();
-        first
-    };
-
-    let ws = Workspace::new(root, dir.path().join("scratch")).unwrap();
-    let store = OperationStore::new(state).unwrap();
-    store.recover(&ws).unwrap();
-    assert!(
-        store
-            .history(None)
-            .iter()
-            .any(|r| r.operation_id() == first),
-        "an edit that landed was dropped from history"
-    );
-}
-
-// Two edits in a row both keep their markers (each sync failed after its
-// rename). The later marker is the only evidence the earlier one landed, so
-// recovery must resolve it first.
-#[tokio::test]
-async fn a_marker_followed_by_another_marker_is_recovered_as_a_commit() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_path_buf();
-    let state = root.join("state");
-    std::fs::write(root.join("f.txt"), "v3\n").unwrap();
-
-    let (first, second) = {
-        let store = OperationStore::new(state.clone()).unwrap();
-        let first = store
-            .prepare_fs_record(
-                "req-1",
-                OperationKind::Edit,
-                "f.txt",
-                Some(hash_of("v1\n")),
-                hash_of("v2\n"),
-            )
-            .unwrap();
-        let second = store
-            .prepare_fs_record(
-                "req-2",
-                OperationKind::Edit,
-                "f.txt",
-                Some(hash_of("v2\n")),
-                hash_of("v3\n"),
-            )
-            .unwrap();
-        (first, second)
-    };
-
-    let ws = Workspace::new(root, dir.path().join("scratch")).unwrap();
-    let store = OperationStore::new(state).unwrap();
-    store.recover(&ws).unwrap();
-    let history = store.history(None);
-    for op in [&first, &second] {
-        assert!(
-            history.iter().any(|r| r.operation_id() == *op),
-            "an edit that landed was dropped from history"
-        );
-    }
-}
-
-// `gc` rewrites the operation log from the in-memory table, so anything missing
-// there is erased. A prepared marker is not history but pending state -- the
-// only thing that lets the next start work out what became of a mutation whose
-// outcome is unknown -- so no `keep`, zero included, may take it.
-#[tokio::test]
-async fn pruning_never_removes_a_pending_marker() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_path_buf();
-    let state = root.join("state");
-    std::fs::write(root.join("f.txt"), "v1\n").unwrap();
-
-    let pending = {
-        let store = OperationStore::new(state.clone()).unwrap();
-        // Something committed, for pruning to have work to do.
-        let done = store
-            .prepare_fs_record(
-                "req-done",
-                OperationKind::Edit,
-                "old.txt",
-                None,
-                hash_of("x"),
-            )
-            .unwrap();
-        store
-            .commit_fs_record(
-                &done,
-                "req-done",
-                OperationKind::Edit,
-                "old.txt",
-                None,
-                hash_of("x"),
-            )
-            .unwrap();
-        // And a mutation whose outcome is still unknown.
-        let pending = store
-            .prepare_fs_record(
-                "req-pending",
-                OperationKind::Edit,
-                "f.txt",
-                Some(hash_of("v1\n")),
-                hash_of("v2\n"),
-            )
-            .unwrap();
-
-        store.prune(0).unwrap();
-        assert!(
-            store.history(None).is_empty(),
-            "history should have been pruned away"
-        );
-        pending
-    };
-
-    // The rename had landed; only the commit was missing. Recovery can still
-    // tell, because the marker survived the pruning and the reopen.
-    std::fs::write(root.join("f.txt"), "v2\n").unwrap();
-    let ws = Workspace::new(root, dir.path().join("scratch")).unwrap();
-    let reopened = OperationStore::new(state).unwrap();
-    reopened.recover(&ws).unwrap();
-    assert!(
-        reopened
-            .history(None)
-            .iter()
-            .any(|r| r.operation_id() == pending),
-        "gc erased the marker recovery needed"
-    );
-}
-
-// `keep` counts what a caller can go on to read. WAL bookkeeping is not that,
-// so an internal marker must never take a retained slot from an operation the
-// caller asked to keep.
-#[tokio::test]
-async fn pruning_counts_history_not_wal_bookkeeping() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_path_buf();
-    let state = root.join("state");
-
-    {
-        let store = OperationStore::new(state.clone()).unwrap();
-        let done = store
-            .prepare_fs_record("req-done", OperationKind::Edit, "a.txt", None, hash_of("x"))
-            .unwrap();
-        store
-            .commit_fs_record(
-                &done,
-                "req-done",
-                OperationKind::Edit,
-                "a.txt",
-                None,
-                hash_of("x"),
-            )
-            .unwrap();
-        // A mutation that was decided against after its marker was written.
-        let refused = store
-            .prepare_fs_record(
-                "req-refused",
-                OperationKind::Edit,
-                "b.txt",
-                None,
-                hash_of("y"),
-            )
-            .unwrap();
-        store.abort_prepared(&refused).unwrap();
-    }
-
-    // Reopening is where the abort collapses onto the marker it supersedes.
-    let store = OperationStore::new(state).unwrap();
-    let stats = store.prune(1).unwrap();
-    assert_eq!(stats.retained_operations, 1);
-    let history = store.history(None);
-    assert_eq!(
-        history.len(),
-        1,
-        "the one operation worth keeping was pruned in favour of a marker"
-    );
-    assert_eq!(history[0].operation_id(), "op-1");
-}
-
-// Replacements that undo each other are a request for nothing, spelled across
-// several entries -- refused like a single replacement from a value to itself.
-// The WAL is the reason it cannot merely be allowed through: a record whose
-// before and after hashes are equal is one recovery must read as "the rename
-// never happened", so an edit that DID land would vanish from history and its
-// request would be handed back for retry.
 #[tokio::test]
 async fn replacements_that_cancel_out_are_refused() {
     let f = fixture();
@@ -703,18 +504,12 @@ async fn replacements_that_cancel_out_are_refused() {
     .await
     .expect_err("a net-zero edit must be refused");
     assert_eq!(err.code, ErrorCode::InvalidRequest);
-    assert!(
-        err.message.contains("unchanged"),
-        "unhelpful message: {}",
-        err.message
-    );
+    assert!(err.message.contains("unchanged"));
     assert_eq!(
         std::fs::read_to_string(f.ws.root.join("f.txt")).unwrap(),
         "a\n"
     );
 
-    // A list that reaches a different result is still fine, including one that
-    // passes through the original content on the way.
     edit_many(
         &f,
         "f.txt",
@@ -733,108 +528,94 @@ async fn replacements_that_cancel_out_are_refused() {
     );
 }
 
-// Handler tasks append to the logs concurrently -- request-table and exec
-// records go in without the mutation guard -- so the append path has to be safe
-// against itself, not merely against another server process.
 #[tokio::test]
-async fn concurrent_appends_all_survive() {
+async fn concurrent_appends_across_threads_and_sessions_all_survive() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let store = OperationStore::new(state.clone()).unwrap();
+    let store_a = OperationStore::new(state.clone()).unwrap();
+    let store_b = OperationStore::new(state.clone()).unwrap();
 
     let writers: Vec<_> = (0..32)
         .map(|i| {
-            let store = store.clone();
+            let store = if i % 2 == 0 {
+                store_a.clone()
+            } else {
+                store_b.clone()
+            };
             std::thread::spawn(move || {
+                let id = store.next_operation_id();
                 store
-                    .prepare_fs_record(
-                        &format!("req-{i}"),
-                        OperationKind::Edit,
-                        &format!("f{i}.txt"),
-                        None,
-                        hash_of(&format!("v{i}")),
-                    )
-                    .unwrap()
+                    .append_fs_record(FsOperationRecord {
+                        operation_id: id.clone(),
+                        request_id: format!("req-{i}"),
+                        kind: OperationKind::Edit,
+                        path: format!("f{i}.txt"),
+                        before_hash: None,
+                        after_hash: hash_of(&format!("v{i}")),
+                        timestamp_ms: 100 + i as u64,
+                    })
+                    .unwrap();
+                id
             })
         })
         .collect();
     let ids: Vec<String> = writers.into_iter().map(|w| w.join().unwrap()).collect();
 
-    let text = std::fs::read_to_string(state.join("operations.jsonl")).unwrap();
-    assert_eq!(text.lines().count(), ids.len(), "a line was lost");
-    for line in text.lines() {
-        serde_json::from_str::<serde_json::Value>(line)
-            .unwrap_or_else(|e| panic!("line does not parse: {e}: {line}"));
-    }
     let unique: std::collections::HashSet<&String> = ids.iter().collect();
     assert_eq!(unique.len(), ids.len(), "operation ids collided");
 
-    // And the whole thing still loads.
-    drop(store);
-    OperationStore::new(state).expect("log must be loadable");
+    let history = store_a.history(None).unwrap();
+    assert_eq!(history.len(), ids.len());
+
+    drop(store_a);
+    drop(store_b);
+    let reopened = OperationStore::new(state).unwrap();
+    assert_eq!(reopened.history(None).unwrap().len(), ids.len());
 }
 
-// Pruning replaces the logs wholesale, which is an append's opposite number: a
-// record appended while the replacement is in flight would be thrown away after
-// its handler had already been told the operation succeeded. A smoke test, not
-// a proof -- it cannot pin the two threads to the interleaving that matters
-// without a hook in the write path -- so what it guards is that the two are
-// safe to run together at all, and that nothing deadlocks now they share a
-// lock.
 #[tokio::test]
-async fn a_concurrent_gc_does_not_erase_appended_records() {
+async fn a_concurrent_gc_does_not_erase_live_appended_records() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let store = OperationStore::new(state.clone()).unwrap();
 
-    // Enough history that pruning has real work to do.
-    for i in 0..200 {
-        let id = store
-            .prepare_fs_record(
-                &format!("req-old-{i}"),
-                OperationKind::Edit,
-                "old.txt",
-                None,
-                hash_of(&format!("v{i}")),
-            )
-            .unwrap();
-        store
-            .commit_fs_record(
-                &id,
-                &format!("req-old-{i}"),
-                OperationKind::Edit,
-                "old.txt",
-                None,
-                hash_of(&format!("v{i}")),
-            )
-            .unwrap();
+    // Populate a closed shard so prune has real work to do.
+    {
+        let closed = OperationStore::new(state.clone()).unwrap();
+        for i in 0..100 {
+            let id = closed.next_operation_id();
+            closed
+                .append_fs_record(FsOperationRecord {
+                    operation_id: id,
+                    request_id: format!("req-old-{i}"),
+                    kind: OperationKind::Edit,
+                    path: "old.txt".into(),
+                    before_hash: None,
+                    after_hash: hash_of(&format!("v{i}")),
+                    timestamp_ms: i as u64,
+                })
+                .unwrap();
+        }
     }
 
+    let live = OperationStore::new(state.clone()).unwrap();
     let pruner = {
-        let store = store.clone();
+        let store = live.clone();
         std::thread::spawn(move || store.prune(50).unwrap())
     };
     let appender = {
-        let store = store.clone();
+        let store = live.clone();
         std::thread::spawn(move || {
-            let id = store
-                .prepare_fs_record(
-                    "req-new",
-                    OperationKind::Edit,
-                    "new.txt",
-                    None,
-                    hash_of("new"),
-                )
-                .unwrap();
+            let id = store.next_operation_id();
             store
-                .commit_fs_record(
-                    &id,
-                    "req-new",
-                    OperationKind::Edit,
-                    "new.txt",
-                    None,
-                    hash_of("new"),
-                )
+                .append_fs_record(FsOperationRecord {
+                    operation_id: id.clone(),
+                    request_id: "req-new".into(),
+                    kind: OperationKind::Edit,
+                    path: "new.txt".into(),
+                    before_hash: None,
+                    after_hash: hash_of("new"),
+                    timestamp_ms: 10_000,
+                })
                 .unwrap();
             id
         })
@@ -842,64 +623,35 @@ async fn a_concurrent_gc_does_not_erase_appended_records() {
     pruner.join().unwrap();
     let appended = appender.join().unwrap();
 
-    // In whichever order they happened to run, a record reported as committed
-    // must be in the log the next server reads.
-    drop(store);
+    drop(live);
     let reopened = OperationStore::new(state).unwrap();
     assert!(
         reopened
             .history(None)
+            .unwrap()
             .iter()
             .any(|r| r.operation_id() == appended),
-        "gc replaced the log under a record it had already accepted"
+        "gc erased a record appended to a live shard"
     );
 }
 
-// Two callers racing on one request_id: exactly one may claim it, and only one
-// InProgress line may reach the log. A losing claimant that wrote its own line
-// would have it land after the winner's terminal one, and that is the line a
-// restart reads -- reviving a finished request as unfinished and letting it
-// execute a second time.
 #[tokio::test]
-async fn racing_claims_write_one_request_line() {
+async fn racing_in_session_claims_allow_single_winner() {
     let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("state");
-    let store = OperationStore::new(state.clone()).unwrap();
+    let store = OperationStore::new(dir.path().join("state")).unwrap();
 
     let claimants: Vec<_> = (0..16)
         .map(|_| {
             let store = store.clone();
-            std::thread::spawn(move || store.claim_request("same-id", "edit").unwrap())
+            std::thread::spawn(move || store.claim_request("same-id").is_none())
         })
         .collect();
-    let outcomes: Vec<_> = claimants.into_iter().map(|c| c.join().unwrap()).collect();
-    assert_eq!(
-        outcomes.iter().filter(|o| o.is_none()).count(),
-        1,
-        "exactly one caller may win the claim"
-    );
-
-    store
-        .remember_error(
-            "same-id",
-            remote_workspace_protocol::ProtocolError::new(ErrorCode::NoMatch, "no match"),
-        )
-        .unwrap();
-
-    // The terminal line has to be the last word on this request.
-    let text = std::fs::read_to_string(state.join("requests.jsonl")).unwrap();
-    assert_eq!(
-        text.lines().filter(|l| l.contains("inprogress")).count(),
-        1,
-        "a losing claimant wrote an InProgress line: {text}"
-    );
-    drop(store);
-    let reopened = OperationStore::new(state).unwrap();
-    let status = reopened.status_for_request("same-id");
-    assert_eq!(
-        status.status,
-        remote_workspace_protocol::RequestStatus::Error
-    );
+    let wins = claimants
+        .into_iter()
+        .map(|c| c.join().unwrap())
+        .filter(|&won| won)
+        .count();
+    assert_eq!(wins, 1, "exactly one caller may win the claim");
 }
 
 #[cfg(unix)]
@@ -915,8 +667,6 @@ fn stat_hash(f: &Fixture, path: &str) -> Option<String> {
     }
 }
 
-// Paths resolve through symlinks, so deleting a link used to remove the file it
-// points to and leave the link dangling.
 #[tokio::test]
 #[cfg(unix)]
 async fn deleting_a_symlink_is_refused_and_leaves_its_target() {
@@ -933,12 +683,9 @@ async fn deleting_a_symlink_is_refused_and_leaves_its_target() {
         .unwrap()
         .file_type()
         .is_symlink());
-    // The target itself is still deletable by its own name.
     delete(&f, "real.txt").await.unwrap();
 }
 
-// Opening a FIFO blocks until a writer appears, and `edit` did that while
-// holding the mutation guard, stalling every later mutation.
 #[tokio::test]
 #[cfg(unix)]
 async fn non_regular_files_are_refused_before_they_are_opened() {
@@ -947,7 +694,11 @@ async fn non_regular_files_are_refused_before_they_are_opened() {
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
 
     assert_eq!(
-        code(fs_ops::read(&f.ws, "pipe", None, None)),
+        code(fs_ops::read(
+            &f.ws,
+            "pipe",
+            remote_workspace_protocol::ReadOptions::default()
+        )),
         ErrorCode::NotAFile
     );
     assert_eq!(

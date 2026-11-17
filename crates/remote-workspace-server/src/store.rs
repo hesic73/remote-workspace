@@ -1,18 +1,21 @@
-use std::collections::HashMap;
-use std::io::Write;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use remote_workspace_protocol::{
-    AbortedRecord, AnyOperationRecord, ErrorCode, ExecOperationRecord, FsOperationRecord,
-    OperationKind, PreparedRecord, ProtocolError, RequestStatus, RequestStatusResult,
-    ServerMessage,
+    AnyOperationRecord, ErrorCode, ExecOperationRecord, FsOperationRecord, ProtocolError,
+    ServerMessage, TransferOperationRecord,
 };
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-/// Result of a request, stored so that reconnects can query status and
-/// replayed request_ids are not executed twice.
+/// Lock past any realistic shard EOF so Windows mandatory byte-range locking
+/// never blocks concurrent readers scanning bytes `0..len`.
+const SHARD_LOCK_OFFSET: u64 = 1 << 32;
+const MAX_CACHED_REQUESTS: usize = 1024;
+
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum StoredResult {
@@ -20,820 +23,218 @@ pub enum StoredResult {
     Error(ProtocolError),
 }
 
-#[derive(Clone)]
-pub struct RequestEntry {
-    pub status: RequestStatus,
-    pub result: Option<StoredResult>,
-    pub op: Option<String>,
+#[derive(Default)]
+struct RequestCache {
+    entries: HashMap<String, Option<StoredResult>>,
+    finished_order: VecDeque<String>,
 }
 
-/// One action taken by startup recovery (for logging/observability).
-#[derive(Debug, Clone)]
-pub enum RecoveryAction {
-    /// Prepared marker dropped: the rename never took effect (file == before).
-    Dropped { operation_id: String },
-    /// Commit synthesized: rename completed but commit-log write had not.
-    Synthesized { operation_id: String },
-    /// Recovery conflict: file state matches neither before nor expected-after.
-    Conflict {
-        operation_id: String,
-        reason: String,
-    },
-    /// A request stuck InProgress (crash mid-request) was cleared so it can be retried.
-    ClearedStuck { request_id: String },
-    /// A stuck InProgress request that must not be retried -- an exec, or one
-    /// whose type the log does not record -- was permanently marked Error.
-    StuckExecMarkedError { request_id: String },
+struct OpenShard {
+    path: PathBuf,
+    file: std::fs::File,
 }
 
-enum RecoveryOutcome {
-    NoOp,
-    Committed,
-    Conflict(String),
+impl Drop for OpenShard {
+    fn drop(&mut self) {
+        crate::locking::unlock(&self.file, SHARD_LOCK_OFFSET);
+    }
 }
 
-/// On-disk line in requests.jsonl.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct RequestLogLine {
-    request_id: String,
-    status: RequestStatus,
-    /// For terminal statuses, the serialized ServerMessage (Done) or error.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result_done: Option<ServerMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result_error: Option<ProtocolError>,
-    /// The original request kind ("exec", "write", ...). Used at recovery to
-    /// decide whether a stuck InProgress request is retryable (fs, read-only)
-    /// or must be permanently marked Error (exec is never auto-retried).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    op: Option<String>,
+struct OpIdState {
+    last_ts_ms: u64,
+    seq: u16,
 }
 
-/// Operation store: durable logs of every operation (fs, exec, transfer) and
-/// the request idempotency table. A mutation appends more than one line -- a
-/// prepared marker before it, then the committed record or an aborted marker --
-/// which the loader reconciles by operation id. All state lives in `log_dir`:
-///
-///   operations.jsonl   AnyOperationRecord per operation, WAL markers included
-///   requests.jsonl     one line per request lifecycle
-///   op-counter         id high-water mark, so pruned ids are never reused
-///   lock               single-writer flock
-///   server.jsonl       server lifecycle, for diagnosing a stale holder
-///   scratch/           agent-visible runtime artifacts
-///   scratch-swept      marker rate-limiting the scratch sweep to once a day
-///
-/// The async `write_lock` serializes mutating handlers, so their in-memory
-/// tables and workspace effects do not interleave. It does NOT cover the logs:
-/// request-table entries and exec records are appended without it, so handler
-/// tasks reach the files concurrently. That is what `log_append` is for, and
-/// why `prune` -- which replaces the files wholesale -- takes it too.
+static OP_ID_STATE: Mutex<OpIdState> = Mutex::new(OpIdState {
+    last_ts_ms: 0,
+    seq: 0,
+});
+
 #[derive(Clone)]
 pub struct OperationStore {
     log_dir: PathBuf,
-    operations_path: PathBuf,
-    requests_path: PathBuf,
-    next_id: Arc<Mutex<u64>>,
-    records: Arc<Mutex<Vec<AnyOperationRecord>>>,
-    requests: Arc<Mutex<HashMap<String, RequestEntry>>>,
+    shard: Arc<Mutex<Option<OpenShard>>>,
+    requests: Arc<Mutex<RequestCache>>,
     write_lock: Arc<AsyncMutex<()>>,
-    /// Serializes physical appends to both logs -- see the struct doc.
-    log_append: Arc<Mutex<()>>,
-    /// Set when a partial line could not be rolled back. Nothing may be
-    /// appended after a fragment, so this stops trying -- see `append_line`.
-    log_torn: Arc<std::sync::atomic::AtomicBool>,
-    /// Exclusive flock on `<log_dir>/lock`, held for the store's lifetime so a
-    /// second server on the same state directory fails fast instead of
-    /// corrupting the shared logs (interleaved appends, colliding op ids).
-    /// The kernel releases it automatically when the process dies.
-    _dir_lock: Arc<std::fs::File>,
+    log_torn: Arc<AtomicBool>,
 }
 
 pub struct PruneStats {
     pub removed_operations: usize,
-    pub removed_requests: usize,
     pub retained_operations: usize,
 }
 
 impl OperationStore {
     pub fn new(log_dir: PathBuf) -> Result<Self, ProtocolError> {
         std::fs::create_dir_all(&log_dir).map_err(io_to_protocol)?;
-        // Grace period covers reconnects racing a predecessor that is still
-        // shutting down after its stdin EOF.
-        let dir_lock = acquire_dir_lock(&log_dir, std::time::Duration::from_secs(5))?;
-        // Before-content blobs existed only to serve `undo`. With that
-        // operation gone nothing can ever read them again, so a state
-        // directory written by an older server hands its blobs back as disk.
-        let legacy_blobs = log_dir.join("blobs");
-        if legacy_blobs.is_dir() {
-            match std::fs::remove_dir_all(&legacy_blobs) {
-                Ok(()) => tracing::info!("removed legacy undo blobs"),
-                Err(e) => tracing::warn!(error = %e, "could not remove legacy undo blobs"),
-            }
-        }
-        let operations_path = log_dir.join("operations.jsonl");
-        let requests_path = log_dir.join("requests.jsonl");
-
-        let mut max_id = 0u64;
-        // Pruning may empty the operation log; the counter file preserves the
-        // high-water mark so pruned operation ids are never reallocated (a
-        // stale id held by a client must fail, not resolve to a new operation).
-        let counter_path = log_dir.join("op-counter");
-        match std::fs::read_to_string(&counter_path) {
-            Ok(s) => {
-                let n = s.trim().parse::<u64>().map_err(|e| {
-                    ProtocolError::new(
-                        ErrorCode::IoError,
-                        format!("corrupt op-counter file {counter_path:?}: {e}"),
-                    )
-                })?;
-                max_id = max_id.max(n);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_to_protocol(e)),
-        }
-        // Read every appended record. A committed record supersedes an earlier
-        // prepared marker for the same id; a prepared marker with NO matching
-        // commit is left in the map for `recover()` to resolve against the
-        // actual workspace state (it cannot be resolved here, before the
-        // Workspace is available).
-        let mut by_id: std::collections::BTreeMap<String, AnyOperationRecord> =
-            std::collections::BTreeMap::new();
-        let ops_lines = read_lines(&operations_path).map_err(io_to_protocol)?;
-        let mut ops_needs_truncate = false;
-        for (idx, line) in ops_lines.iter().enumerate() {
-            let rec: AnyOperationRecord = match parse_log_line_strict(line, &operations_path, idx)?
-            {
-                ParseResult::Parsed(r) => r,
-                ParseResult::SkippedCrashTruncated => {
-                    ops_needs_truncate = true;
-                    continue;
-                }
-                ParseResult::SkippedBlank => continue,
-            };
-            if let Some(n) = rec.operation_id().strip_prefix("op-") {
-                if let Ok(parsed) = n.parse::<u64>() {
-                    max_id = max_id.max(parsed);
-                }
-            }
-            // A Prepared marker is provisional; a later committed record for
-            // the same id overwrites it. Otherwise it stays for recovery.
-            by_id.insert(rec.operation_id().to_string(), rec);
-        }
-        // Repair the log file: crash-truncated partial records need physical
-        // removal; valid records without a trailing newline (crash between
-        // write and newline) need the missing \n appended.
-        if ops_needs_truncate {
-            truncate_trailing_garbage(&ops_lines, &operations_path)?;
-        } else {
-            append_missing_newline(&ops_lines, &operations_path)?;
-        }
-        // Aborted markers have done their work by the time the log is read:
-        // they exist only to stop the load from resurrecting the prepared line
-        // they supersede, which is exactly what collapsing by id above just
-        // did. Keeping them would give WAL bookkeeping a place in the table
-        // `prune` treats as history, where an internal marker could take a
-        // retained slot from an operation a caller asked to keep.
-        let mut records: Vec<AnyOperationRecord> = by_id
-            .into_values()
-            .filter(|r| !matches!(r, AnyOperationRecord::Aborted(_)))
-            .collect();
-        records.sort_by_key(|r| r.timestamp_ms());
-
-        let mut requests = HashMap::new();
-        let req_lines = read_lines(&requests_path).map_err(io_to_protocol)?;
-        let mut req_needs_truncate = false;
-        for (idx, line) in req_lines.iter().enumerate() {
-            let entry: RequestLogLine = match parse_log_line_strict(line, &requests_path, idx)? {
-                ParseResult::Parsed(e) => e,
-                ParseResult::SkippedCrashTruncated => {
-                    req_needs_truncate = true;
-                    continue;
-                }
-                ParseResult::SkippedBlank => continue,
-            };
-            let result = match (&entry.result_done, &entry.result_error) {
-                (Some(m), None) => Some(StoredResult::Done(m.clone())),
-                (None, Some(e)) => Some(StoredResult::Error(e.clone())),
-                _ => None,
-            };
-            requests.insert(
-                entry.request_id.clone(),
-                RequestEntry {
-                    status: entry.status,
-                    result,
-                    op: entry.op,
-                },
-            );
-        }
-        if req_needs_truncate {
-            truncate_trailing_garbage(&req_lines, &requests_path)?;
-        } else {
-            append_missing_newline(&req_lines, &requests_path)?;
-        }
-
         Ok(Self {
             log_dir,
-            operations_path,
-            requests_path,
-            next_id: Arc::new(Mutex::new(max_id)),
-            records: Arc::new(Mutex::new(records)),
-            requests: Arc::new(Mutex::new(requests)),
+            shard: Arc::new(Mutex::new(None)),
+            requests: Arc::new(Mutex::new(RequestCache::default())),
             write_lock: Arc::new(AsyncMutex::new(())),
-            log_append: Arc::new(Mutex::new(())),
-            log_torn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            _dir_lock: Arc::new(dir_lock),
+            log_torn: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    pub async fn write_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.write_lock.lock().await
+    pub fn state_dir(&self) -> &Path {
+        &self.log_dir
+    }
+
+    pub async fn write_guard(&self) -> OwnedMutexGuard<()> {
+        self.write_lock.clone().lock_owned().await
     }
 
     pub fn next_operation_id(&self) -> String {
-        let mut g = self.next_id.lock();
-        *g += 1;
-        format!("op-{}", *g)
-    }
-
-    /// Resolve WAL prepared markers against the actual workspace state, and
-    /// clear stuck InProgress requests. Must be called once at startup, after
-    /// the Workspace exists, before serving traffic.
-    ///
-    /// For each prepared-without-commit operation:
-    ///   - a later committed operation on the same path started from
-    ///     expected_after_hash: the rename completed, as below.
-    ///   - current file hash == before_hash (or file absent and before None):
-    ///     the rename never took effect; drop the prepared marker.
-    ///   - current file hash == expected_after_hash: the rename completed but
-    ///     the commit log write did not; synthesize the committed FsOperationRecord
-    ///     and mark the owning request Done with a reconstructed result.
-    ///   - any other value: recovery conflict; the file was changed by something
-    ///     we cannot account for. Drop the prepared marker and mark the owning
-    ///     request Error with a STALE_FILE error so it surfaces.
-    ///
-    /// Returns the list of recovery actions taken, for logging.
-    pub fn recover(
-        &self,
-        ws: &crate::workspace::Workspace,
-    ) -> Result<Vec<RecoveryAction>, ProtocolError> {
-        let mut actions = Vec::new();
-        let prepareds: Vec<remote_workspace_protocol::PreparedRecord> = {
-            let g = self.records.lock();
-            g.iter()
-                .filter_map(|r| match r {
-                    AnyOperationRecord::Prepared(p) => Some(p.clone()),
-                    _ => None,
-                })
-                .collect()
-        };
-
-        // Newest first: a later marker resolved as committed becomes the
-        // record `continued_from` needs to recognize an earlier one as landed.
-        for p in prepareds.iter().rev() {
-            let abs = match ws.resolve(&p.path) {
-                Ok(abs) => abs,
-                Err(_) => {
-                    // Path no longer resolvable; treat as conflict.
-                    self.resolve_prepared_as_conflict(p)?;
-                    actions.push(RecoveryAction::Conflict {
-                        operation_id: p.operation_id.clone(),
-                        reason: "path no longer resolvable".into(),
-                    });
-                    continue;
-                }
-            };
-            let current = crate::hash::hash_file(&abs)?;
-            let outcome = match (&p.before_hash, &current) {
-                // The file has moved on since, through this server: the
-                // mutation landed and only its commit was lost.
-                _ if self.continued_from(p) => RecoveryOutcome::Committed,
-                (Some(b), Some(c)) if b == c => RecoveryOutcome::NoOp,
-                (None, None) => RecoveryOutcome::NoOp,
-                // "sha256:" sentinel means the file should NOT exist after the
-                // mutation (it was deleted).
-                (_, None) if p.expected_after_hash == FILE_DELETED_SENTINEL => {
-                    RecoveryOutcome::Committed
-                }
-                (_, Some(c)) if c == &p.expected_after_hash => RecoveryOutcome::Committed,
-                (Some(_b), None) => RecoveryOutcome::Conflict(
-                    "file expected to exist after mutation but is absent".into(),
-                ),
-                (_, _) => RecoveryOutcome::Conflict(format!(
-                    "file hash {current:?} matches neither before nor expected-after"
-                )),
-            };
-            match outcome {
-                RecoveryOutcome::NoOp => {
-                    self.abort_prepared(&p.operation_id)?;
-                    actions.push(RecoveryAction::Dropped {
-                        operation_id: p.operation_id.clone(),
-                    });
-                }
-                RecoveryOutcome::Committed => {
-                    self.synthesize_commit(p)?;
-                    actions.push(RecoveryAction::Synthesized {
-                        operation_id: p.operation_id.clone(),
-                    });
-                }
-                RecoveryOutcome::Conflict(reason) => {
-                    self.resolve_prepared_as_conflict_with(p, &reason)?;
-                    actions.push(RecoveryAction::Conflict {
-                        operation_id: p.operation_id.clone(),
-                        reason,
-                    });
-                }
-            }
-        }
-
-        // Resolve stuck InProgress requests (crash mid-request).
-        // A stuck request may already have a committed operation record on disk
-        // (the crash happened after the commit but before the terminal result
-        // was written). In that case, reconstruct the result from the committed
-        // record rather than re-executing.
-        let stuck: Vec<(String, Option<String>)> = {
-            let g = self.requests.lock();
-            g.iter()
-                .filter_map(|(k, v)| {
-                    if v.status == RequestStatus::InProgress && v.result.is_none() {
-                        Some((k.clone(), v.op.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-        for (rid, op) in stuck {
-            // Before applying the default policy, check whether a committed
-            // operation record for this request_id already exists on disk.
-            if let Some(committed) = self.find_committed_by_request_id(&rid) {
-                let msg = self.reconstruct_result(&committed);
-                self.remember_result(&rid, msg)?;
-                actions.push(RecoveryAction::Synthesized {
-                    operation_id: committed.operation_id().to_string(),
-                });
-                continue;
-            }
-
-            if op.as_deref() == Some("exec") {
-                let err = ProtocolError::new(
-                    ErrorCode::ExecFailed,
-                    "exec in progress at time of crash; retry with a new request_id",
-                );
-                self.remember_error(&rid, err)?;
-                actions.push(RecoveryAction::StuckExecMarkedError { request_id: rid });
-            } else if op.is_none() {
-                // Old log records without an `op` field: we cannot determine
-                // the request type. The safe default is to mark them as Error
-                // so they are never re-executed silently.
-                let err = ProtocolError::new(
-                    ErrorCode::InvalidRequest,
-                    "request was in progress at time of crash and request type is unknown; retry with a new request_id",
-                );
-                self.remember_error(&rid, err)?;
-                actions.push(RecoveryAction::StuckExecMarkedError { request_id: rid });
+        let now = now_ms();
+        let (ts, seq) = {
+            let mut g = OP_ID_STATE.lock();
+            if now > g.last_ts_ms {
+                g.last_ts_ms = now;
+                g.seq = 0;
+                (now, 0)
+            } else if g.seq < u16::MAX {
+                g.seq += 1;
+                (g.last_ts_ms, g.seq)
             } else {
-                // Read-only or fs-without-prepared: the mutation never completed
-                // its bookkeeping, so forget the request so it can be retried.
-                self.requests.lock().remove(&rid);
-                actions.push(RecoveryAction::ClearedStuck { request_id: rid });
+                g.last_ts_ms += 1;
+                g.seq = 0;
+                (g.last_ts_ms, 0)
+            }
+        };
+        let ts_low = ts & 0xFFFF_FFFF_FFFF;
+        let pid_low = std::process::id() & 0xFF_FFFF;
+        format!("op-{ts_low:012x}-{pid_low:06x}-{seq:04x}")
+    }
+
+    /// Claim `request_id` within this session. Returns `None` if the caller won
+    /// ownership, `Some(None)` if already in progress, or `Some(Some(res))` to
+    /// replay a finished request.
+    pub fn claim_request(&self, request_id: &str) -> Option<Option<StoredResult>> {
+        let mut cache = self.requests.lock();
+        if let Some(existing) = cache.entries.get(request_id) {
+            return Some(existing.clone());
+        }
+        cache.entries.insert(request_id.to_string(), None);
+        None
+    }
+
+    pub fn remember_result(&self, request_id: &str, msg: ServerMessage) {
+        self.finish_request(request_id, StoredResult::Done(msg));
+    }
+
+    pub fn remember_error(&self, request_id: &str, err: ProtocolError) {
+        self.finish_request(request_id, StoredResult::Error(err));
+    }
+
+    fn finish_request(&self, request_id: &str, result: StoredResult) {
+        let mut cache = self.requests.lock();
+        cache.entries.insert(request_id.to_string(), Some(result));
+        cache.finished_order.push_back(request_id.to_string());
+        while cache.finished_order.len() > MAX_CACHED_REQUESTS {
+            if let Some(old_id) = cache.finished_order.pop_front() {
+                if matches!(cache.entries.get(&old_id), Some(Some(_))) {
+                    cache.entries.remove(&old_id);
+                }
             }
         }
-
-        Ok(actions)
     }
 
-    /// Supersede a prepared marker with a durable aborted one, for a mutation
-    /// that was decided against after the marker was written. Without it,
-    /// recovery would judge the marker against whatever the file holds later
-    /// and could synthesize a commit for a mutation that never happened.
-    ///
-    /// Callers return this error in place of the one that made them withdraw:
-    /// a log that cannot be written is the more serious fault, and reporting
-    /// the refusal instead would claim the withdrawal was recorded when it was
-    /// not.
-    pub fn abort_prepared(&self, operation_id: &str) -> Result<(), ProtocolError> {
-        // Durable first. The log is what recovery reads, so dropping the marker
-        // from memory before the aborted record is on disk would leave a
-        // failed append looking withdrawn to this process while the next server
-        // still finds the prepared line.
-        self.append_record_tracked(
-            AnyOperationRecord::Aborted(AbortedRecord {
-                operation_id: operation_id.to_string(),
-                timestamp_ms: now_ms(),
-            }),
-            |g| {
-                g.retain(|r| {
-                    !(r.operation_id() == operation_id
-                        && matches!(r, AnyOperationRecord::Prepared(_)))
-                })
-            },
-        )
-    }
-
-    /// Append a real committed FsOperationRecord for a prepared op whose
-    /// workspace effect was confirmed, and mark its request Done.
-    /// Whether a committed operation logged after `p`, on the same path,
-    /// started from the state `p` was to leave. A marker outlives its server
-    /// only when the install happened but its sync failed (or on a crash,
-    /// which recovery resolves before anything can follow it), so this is the
-    /// evidence that `p` landed, which the file itself no longer shows.
-    fn continued_from(&self, p: &remote_workspace_protocol::PreparedRecord) -> bool {
-        let g = self.records.lock();
-        let Some(at) = g.iter().position(|r| r.operation_id() == p.operation_id) else {
-            return false;
-        };
-        g[at + 1..].iter().any(|r| match r {
-            AnyOperationRecord::Fs(later) if later.path == p.path => match &later.before_hash {
-                Some(before) => *before == p.expected_after_hash,
-                None => p.expected_after_hash == FILE_DELETED_SENTINEL,
-            },
-            _ => false,
-        })
-    }
-
-    fn synthesize_commit(
-        &self,
-        p: &remote_workspace_protocol::PreparedRecord,
-    ) -> Result<(), ProtocolError> {
-        let record = FsOperationRecord {
-            operation_id: p.operation_id.clone(),
-            request_id: p.request_id.clone(),
-            kind: p.kind,
-            path: p.path.clone(),
-            before_hash: p.before_hash.clone(),
-            after_hash: p.expected_after_hash.clone(),
-            timestamp_ms: now_ms(),
-        };
-        let any = AnyOperationRecord::Fs(record.clone());
-        let op_id = p.operation_id.clone();
-        self.append_record_tracked(any.clone(), move |g| {
-            match g.iter_mut().find(|r| r.operation_id() == op_id) {
-                Some(slot) => *slot = any,
-                None => g.push(any),
-            }
-        })?;
-        // Reconstruct the terminal result so replay/status work after restart.
-        let msg = self.reconstruct_result(&AnyOperationRecord::Fs(record));
-        self.remember_result(&p.request_id, msg)?;
-        Ok(())
-    }
-
-    fn resolve_prepared_as_conflict(
-        &self,
-        p: &remote_workspace_protocol::PreparedRecord,
-    ) -> Result<(), ProtocolError> {
-        self.resolve_prepared_as_conflict_with(p, "recovery conflict")
-    }
-
-    fn resolve_prepared_as_conflict_with(
-        &self,
-        p: &remote_workspace_protocol::PreparedRecord,
-        reason: &str,
-    ) -> Result<(), ProtocolError> {
-        self.abort_prepared(&p.operation_id)?;
-        let err = ProtocolError::new(
-            ErrorCode::StaleFile,
-            format!(
-                "startup recovery could not reconcile operation {}: {reason}",
-                p.operation_id
-            ),
-        );
-        self.remember_error(&p.request_id, err)?;
-        Ok(())
-    }
-
-    /// Atomically claim a request. Returns the existing entry if the request
-    /// has been seen before, or `None` if the caller has won ownership. The
-    /// in-memory map is updated ONLY after the durable write succeeds, so a
-    /// failed persist never leaves a phantom InProgress entry. The `op` string
-    /// enables startup recovery to distinguish exec (must not be retried) from
-    /// fs/read-only requests.
-    pub fn claim_request(
-        &self,
-        request_id: &str,
-        op: &str,
-    ) -> Result<Option<RequestEntry>, ProtocolError> {
-        // Known already: no need to serialize with anything.
-        if let Some(entry) = self.requests.lock().get(request_id).cloned() {
-            return Ok(Some(entry));
-        }
-        // Otherwise decide and record under one lock. Deciding first and
-        // appending after would let two callers racing on one request_id both
-        // write an InProgress line -- and the loser's, landing after the
-        // winner's terminal one, is the line a restart would read, undoing a
-        // result that had already been reported and making the request
-        // executable a second time.
-        let _appends = self.log_append.lock();
-        if let Some(entry) = self.requests.lock().get(request_id).cloned() {
-            return Ok(Some(entry));
-        }
-        // Persist FIRST; only update memory on success.
-        self.append_request_line(RequestLogLine {
-            request_id: request_id.to_string(),
-            status: RequestStatus::InProgress,
-            result_done: None,
-            result_error: None,
-            op: Some(op.to_string()),
-        })?;
-        self.requests.lock().insert(
-            request_id.to_string(),
-            RequestEntry {
-                status: RequestStatus::InProgress,
-                result: None,
-                op: Some(op.to_string()),
-            },
-        );
-        Ok(None)
-    }
-
-    pub fn remember_result(
-        &self,
-        request_id: &str,
-        msg: ServerMessage,
-    ) -> Result<(), ProtocolError> {
-        self.append_request_tracked(
-            RequestLogLine {
-                request_id: request_id.to_string(),
-                status: RequestStatus::Done,
-                result_done: Some(msg.clone()),
-                result_error: None,
-                op: None,
-            },
-            |g| {
-                g.insert(
-                    request_id.to_string(),
-                    RequestEntry {
-                        status: RequestStatus::Done,
-                        result: Some(StoredResult::Done(msg)),
-                        op: None,
-                    },
-                );
-            },
-        )
-    }
-
-    pub fn remember_error(
-        &self,
-        request_id: &str,
-        err: ProtocolError,
-    ) -> Result<(), ProtocolError> {
-        self.append_request_tracked(
-            RequestLogLine {
-                request_id: request_id.to_string(),
-                status: RequestStatus::Error,
-                result_done: None,
-                result_error: Some(err.clone()),
-                op: None,
-            },
-            |g| {
-                g.insert(
-                    request_id.to_string(),
-                    RequestEntry {
-                        status: RequestStatus::Error,
-                        result: Some(StoredResult::Error(err)),
-                        op: None,
-                    },
-                );
-            },
-        )
-    }
-
-    pub fn lookup_request(&self, request_id: &str) -> Option<RequestEntry> {
-        self.requests.lock().get(request_id).cloned()
-    }
-
-    // ---- fs operation records (WAL: prepare then commit) ----
-
-    /// Write a "prepared" marker line for an fs mutation BEFORE touching the
-    /// workspace, so a crash between the rename and the commit log can be
-    /// detected on startup. The prepared record stores everything recovery
-    /// needs: the kind, the resolved path, the before hash (None = creation)
-    /// and the expected after hash. Returns the operation id to use for this
-    /// mutation.
-    pub fn prepare_fs_record(
-        &self,
-        request_id: &str,
-        kind: OperationKind,
-        path: &str,
-        before_hash: Option<String>,
-        expected_after_hash: String,
-    ) -> Result<String, ProtocolError> {
-        let op_id = self.next_operation_id();
-        let prepared = PreparedRecord {
-            operation_id: op_id.clone(),
-            request_id: request_id.to_string(),
-            kind,
-            path: path.to_string(),
-            before_hash,
-            expected_after_hash,
-            timestamp_ms: now_ms(),
-        };
-        let appends = self.log_append.lock();
-        match self.append_record_locked(AnyOperationRecord::Prepared(prepared.clone())) {
-            Ok(()) => {}
-            Err(AppendFailure::Unsynced(e)) => {
-                // The line is in the log even though the sync meant to make it
-                // durable failed, and the caller is about to abandon the
-                // mutation. Supersede it, or a later start could read it as
-                // work that was under way and credit this request with whatever
-                // the file holds by then. Best effort by necessity: on a disk
-                // that just refused a sync there is nothing better left to try,
-                // and the error being returned already says so.
-                let _ = self.append_record_locked(AnyOperationRecord::Aborted(AbortedRecord {
-                    operation_id: op_id,
-                    timestamp_ms: now_ms(),
-                }));
-                return Err(e);
-            }
-            Err(AppendFailure::Incomplete(e)) => {
-                // Nothing may follow a possibly-partial line -- see append_line.
-                return Err(e);
-            }
-        }
-        // Also into the in-memory table, which is what `prune` rewrites the log
-        // from: a marker missing there is erased by any `gc` that runs before
-        // the next start, taking with it the only record that a mutation was
-        // under way. `history` filters WAL markers out, so this stays invisible
-        // to callers, and `prune` never removes one however small its `keep`.
-        self.records
-            .lock()
-            .push(AnyOperationRecord::Prepared(prepared));
-        drop(appends);
-        Ok(op_id)
-    }
-
-    /// Commit an fs mutation by appending the final FsOperationRecord. Because
-    /// operations.jsonl is append-only, the committed record follows the
-    /// prepared one; on load the committed record supersedes the prepared
-    /// marker.
-    pub fn commit_fs_record(
-        &self,
-        operation_id: &str,
-        request_id: &str,
-        kind: OperationKind,
-        path: &str,
-        before_hash: Option<String>,
-        after_hash: String,
-    ) -> Result<FsOperationRecord, ProtocolError> {
-        let record = FsOperationRecord {
-            operation_id: operation_id.to_string(),
-            request_id: request_id.to_string(),
-            kind,
-            path: path.to_string(),
-            before_hash,
-            after_hash,
-            timestamp_ms: now_ms(),
-        };
-        let tracked = record.clone();
-        self.append_record_tracked(AnyOperationRecord::Fs(record.clone()), move |g| {
-            // The commit supersedes this operation's prepared marker.
-            match g
-                .iter_mut()
-                .find(|r| r.operation_id() == tracked.operation_id)
-            {
-                Some(existing) => *existing = AnyOperationRecord::Fs(tracked),
-                None => g.push(AnyOperationRecord::Fs(tracked)),
-            }
-        })?;
-        Ok(record)
+    pub fn append_fs_record(&self, record: FsOperationRecord) -> Result<(), ProtocolError> {
+        self.append_record(AnyOperationRecord::Fs(record))
     }
 
     pub fn append_exec_record(&self, record: ExecOperationRecord) -> Result<(), ProtocolError> {
-        self.append_record_tracked(AnyOperationRecord::Exec(record.clone()), |g| {
-            g.push(AnyOperationRecord::Exec(record))
-        })
+        self.append_record(AnyOperationRecord::Exec(record))
     }
 
     pub fn append_transfer_record(
         &self,
-        record: remote_workspace_protocol::TransferOperationRecord,
+        record: TransferOperationRecord,
     ) -> Result<(), ProtocolError> {
-        self.append_record_tracked(AnyOperationRecord::Transfer(record.clone()), |g| {
-            g.push(AnyOperationRecord::Transfer(record))
-        })
+        self.append_record(AnyOperationRecord::Transfer(record))
     }
 
-    pub fn find_record(&self, operation_id: &str) -> Option<AnyOperationRecord> {
-        self.records
-            .lock()
-            .iter()
-            .find(|r| r.operation_id() == operation_id && r.is_committed())
-            .cloned()
-    }
+    pub fn append_record(&self, record: AnyOperationRecord) -> Result<(), ProtocolError> {
+        let mut buf = serde_json::to_vec(&record).map_err(|e| {
+            ProtocolError::new(
+                ErrorCode::IoError,
+                format!("failed to serialize operation record: {e}"),
+            )
+        })?;
+        buf.push(b'\n');
 
-    /// Find the first committed record (Fs, Exec or Transfer) whose `request_id`
-    /// matches. Used during recovery to detect that a stuck InProgress request
-    /// actually completed its operation — only the terminal result line was
-    /// lost in the crash.
-    pub fn find_committed_by_request_id(&self, request_id: &str) -> Option<AnyOperationRecord> {
-        self.records
-            .lock()
-            .iter()
-            .find(|r| {
-                if !r.is_committed() {
-                    return false;
-                }
-                match r {
-                    AnyOperationRecord::Fs(f) => f.request_id == request_id,
-                    AnyOperationRecord::Exec(e) => e.request_id == request_id,
-                    AnyOperationRecord::Transfer(t) => t.request_id == request_id,
-                    _ => false,
-                }
-            })
-            .cloned()
-    }
-
-    /// Reconstruct a ServerMessage::Result from a committed operation record,
-    /// so a stuck InProgress request's terminal result can be restored from
-    /// the already-durable operation log.
-    pub fn reconstruct_result(&self, record: &AnyOperationRecord) -> ServerMessage {
-        match record {
-            AnyOperationRecord::Fs(fs) => {
-                let body = match fs.kind {
-                    OperationKind::Create
-                    | OperationKind::Edit
-                    | OperationKind::Write
-                    | OperationKind::Patch
-                    | OperationKind::Delete
-                    // A legacy undo record replays as the mutation it was.
-                    | OperationKind::Undo => remote_workspace_protocol::ResultBody::Mutation(
-                        remote_workspace_protocol::MutationResult {
-                            operation_id: fs.operation_id.clone(),
-                            old_hash: fs.before_hash.clone(),
-                            new_hash: fs.after_hash.clone(),
-                        },
-                    ),
-                };
-                ServerMessage::Result {
-                    request_id: fs.request_id.clone(),
-                    result: body,
-                }
-            }
-            AnyOperationRecord::Exec(e) => {
-                // Rejected execs must reconstruct as Error, not Exit, so a
-                // replayed request returns the same wire-level type as the
-                // original invocation (idempotency). TimedOut and Completed
-                // return Exit (the command did run and produced an exit code).
-                match e.disposition {
-                    remote_workspace_protocol::ExecDisposition::Rejected => {
-                        let err = ProtocolError::new(
-                            e.error_code.unwrap_or(ErrorCode::ExecFailed),
-                            e.error.clone().unwrap_or_else(|| {
-                                "exec was rejected at time of crash; retry with a new request_id"
-                                    .into()
-                            }),
-                        );
-                        ServerMessage::Error {
-                            request_id: e.request_id.clone(),
-                            error: err,
-                        }
-                    }
-                    remote_workspace_protocol::ExecDisposition::Completed
-                    | remote_workspace_protocol::ExecDisposition::TimedOut => match e.termination {
-                        Some(termination) => ServerMessage::Result {
-                            request_id: e.request_id.clone(),
-                            result: remote_workspace_protocol::ResultBody::Exec(
-                                remote_workspace_protocol::ExecResult {
-                                    operation_id: e.operation_id.clone(),
-                                    termination,
-                                    duration_ms: e.duration_ms,
-                                    drain_timed_out: e.drain_timed_out,
-                                    stdout: e.stdout.clone(),
-                                    stderr: e.stderr.clone(),
-                                },
-                            ),
-                        },
-                        None => ServerMessage::Error {
-                            request_id: e.request_id.clone(),
-                            error: ProtocolError::new(
-                                ErrorCode::IoError,
-                                "corrupt exec record: completed operation has no termination",
-                            ),
-                        },
-                    },
-                }
-            }
-            AnyOperationRecord::Transfer(t) => ServerMessage::Result {
-                request_id: t.request_id.clone(),
-                result: remote_workspace_protocol::ResultBody::Transfer(
-                    remote_workspace_protocol::TransferResult {
-                        operation_id: t.operation_id.clone(),
-                        direction: t.direction,
-                        path: t.path.clone(),
-                        size: t.size,
-                        sha256: t.sha256.clone(),
-                        duration_ms: t.duration_ms,
-                    },
-                ),
-            },
-            _ => unreachable!("only committed records are passed"),
+        let mut guard = self.shard.lock();
+        if self.log_torn.load(Ordering::SeqCst) {
+            return Err(ProtocolError::new(
+                ErrorCode::IoError,
+                "refusing to append to op log: an earlier partial line could not be undone; \
+                 restart the server to open a fresh shard",
+            ));
         }
+        let shard = match guard.as_mut() {
+            Some(s) => s,
+            None => {
+                let opened = open_session_shard(&self.log_dir.join("ops"))?;
+                guard.insert(opened)
+            }
+        };
+        let len_before = shard
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("seek op shard: {e}")))?;
+        if let Err(e) = shard.file.write_all(&buf).and_then(|()| shard.file.flush()) {
+            if let Err(t) = shard
+                .file
+                .set_len(len_before)
+                .and_then(|()| shard.file.seek(SeekFrom::Start(len_before)).map(|_| ()))
+            {
+                self.log_torn.store(true, Ordering::SeqCst);
+                return Err(ProtocolError::new(
+                    ErrorCode::IoError,
+                    format!("write op shard: {e}; rollback failed ({t}), refusing further appends"),
+                ));
+            }
+            return Err(ProtocolError::new(
+                ErrorCode::IoError,
+                format!("write op shard: {e}"),
+            ));
+        }
+        Ok(())
     }
 
-    pub fn history(&self, limit: Option<usize>) -> Vec<AnyOperationRecord> {
-        let g = self.records.lock();
-        let mut committed: Vec<AnyOperationRecord> =
-            g.iter().filter(|r| r.is_committed()).cloned().collect();
+    pub fn shard_count_exceeds(&self, threshold: usize) -> bool {
+        let entries = match std::fs::read_dir(self.log_dir.join("ops")) {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        let mut count = 0usize;
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".jsonl"))
+            {
+                count += 1;
+                if count > threshold {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn find_record(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<AnyOperationRecord>, ProtocolError> {
+        let records = self.collect_all_committed()?;
+        Ok(records
+            .into_iter()
+            .find(|r| r.operation_id() == operation_id))
+    }
+
+    pub fn history(&self, limit: Option<usize>) -> Result<Vec<AnyOperationRecord>, ProtocolError> {
+        let mut committed = self.collect_all_committed()?;
         if let Some(n) = limit {
             if committed.len() > n {
                 let start = committed.len() - n;
@@ -850,365 +251,288 @@ impl OperationStore {
                 exec.stderr.omitted_bytes = exec.stderr.total_bytes;
             }
         }
-        committed
+        Ok(committed)
     }
 
-    pub fn status_for_request(&self, request_id: &str) -> RequestStatusResult {
-        match self.lookup_request(request_id) {
-            None => RequestStatusResult {
-                target: request_id.to_string(),
-                status: RequestStatus::Unknown,
-                error: None,
-            },
-            Some(entry) => RequestStatusResult {
-                target: request_id.to_string(),
-                status: entry.status,
-                error: match entry.result {
-                    Some(StoredResult::Error(e)) => Some(e),
-                    _ => None,
-                },
-            },
-        }
-    }
+    fn collect_all_committed(&self) -> Result<Vec<AnyOperationRecord>, ProtocolError> {
+        let mut by_id: BTreeMap<String, AnyOperationRecord> = BTreeMap::new();
+        let legacy_ops = self.log_dir.join("operations.jsonl");
+        read_committed_into(&legacy_ops, &mut by_id)?;
 
-    /// Drop all but the `keep` most recent operation records, and drop request
-    /// entries no longer referenced by a retained record (in-flight entries are
-    /// always kept). Both JSONL files and the id counter are replaced atomically.
-    /// `log_append` is taken here to exclude concurrent appends. The `gc` path
-    /// also holds the write guard; the startup call runs before serving.
-    ///
-    /// Dropping a request entry shrinks the idempotency window: replaying a
-    /// pruned request_id re-executes instead of returning the stored result.
-    pub fn prune(&self, keep: usize) -> Result<PruneStats, ProtocolError> {
-        // Replacing a log is an append's opposite number and has to exclude
-        // them the same way: a handler that appends between the snapshot below
-        // and the rename would have its record replaced away, having already
-        // been told the operation succeeded. `append_line` takes no other lock
-        // while it holds this one, so taking it first here cannot cycle.
-        let _appends = self.log_append.lock();
-        let mut records = self.records.lock();
-        let mut requests = self.requests.lock();
-        // A prepared marker is pending state, not history: it is the only thing
-        // that lets the next start work out what became of a mutation whose
-        // outcome is still unknown -- a rename that landed but could not be
-        // made durable, say. So `keep` counts history only, and no value of it,
-        // zero included, prunes a marker away.
-        let prunable = records.iter().filter(|r| !is_pending(r)).count();
-        let mut to_remove = prunable.saturating_sub(keep);
-        let before_records = records.len();
-        records.retain(|r| {
-            if to_remove > 0 && !is_pending(r) {
-                to_remove -= 1;
-                false
-            } else {
-                true
-            }
-        });
-        let removed_operations = before_records - records.len();
-        let retained_ids: std::collections::HashSet<&str> =
-            records.iter().filter_map(record_request_id).collect();
-        let before_requests = requests.len();
-        requests.retain(|id, e| {
-            e.status == RequestStatus::InProgress || retained_ids.contains(id.as_str())
-        });
-        let removed_requests = before_requests - requests.len();
-        // Persist the id high-water mark first: once records leave the log,
-        // it is the only thing preventing operation-id reuse after a restart.
-        let counter = *self.next_id.lock();
-        let counter_path = self.log_dir.join("op-counter");
-        // Written whole or not at all: this file is the only thing keeping a
-        // pruned operation id from being handed out again, and `std::fs::write`
-        // truncates first -- a write that then failed part-way would leave a
-        // smaller number that the loader has no way to recognise as damaged
-        // once the operations it came from have been pruned away.
-        write_atomically(&counter_path, format!("{counter}\n").as_bytes())?;
-        rewrite_jsonl(&self.operations_path, records.iter())?;
-        let request_lines: Vec<RequestLogLine> = requests
-            .iter()
-            .map(|(id, e)| {
-                let (result_done, result_error) = match &e.result {
-                    Some(StoredResult::Done(m)) => (Some(m.clone()), None),
-                    Some(StoredResult::Error(err)) => (None, Some(err.clone())),
-                    None => (None, None),
-                };
-                RequestLogLine {
-                    request_id: id.clone(),
-                    status: e.status,
-                    result_done,
-                    result_error,
-                    op: e.op.clone(),
+        let ops_dir = self.log_dir.join("ops");
+        match std::fs::read_dir(&ops_dir) {
+            Ok(entries) => {
+                let mut paths = Vec::new();
+                for entry in entries {
+                    let entry = entry.map_err(io_to_protocol)?;
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".jsonl"))
+                    {
+                        paths.push(entry.path());
+                    }
                 }
-            })
-            .collect();
-        rewrite_jsonl(&self.requests_path, request_lines.iter())?;
+                paths.sort();
+                for path in &paths {
+                    read_committed_into(path, &mut by_id)?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_to_protocol(e)),
+        }
+
+        Ok(sort_records(by_id.into_values()))
+    }
+
+    /// Compact closed shards + legacy `operations.jsonl` down to at most one
+    /// closed shard retaining `keep` newest committed operations across live +
+    /// closed shards. Performs zero writes when already compact.
+    pub fn prune(&self, keep: usize) -> Result<PruneStats, ProtocolError> {
+        cleanup_legacy_artifacts(&self.log_dir);
+
+        let own_shard_path = self.shard.lock().as_ref().map(|s| s.path.clone());
+        let mut live_by_id: BTreeMap<String, AnyOperationRecord> = BTreeMap::new();
+        let mut closed_by_id: BTreeMap<String, AnyOperationRecord> = BTreeMap::new();
+        let mut closed_shards: Vec<(PathBuf, std::fs::File)> = Vec::new();
+
+        let ops_dir = self.log_dir.join("ops");
+        match std::fs::read_dir(&ops_dir) {
+            Ok(entries) => {
+                let mut paths = Vec::new();
+                for entry in entries {
+                    let entry = entry.map_err(io_to_protocol)?;
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".jsonl"))
+                    {
+                        paths.push(entry.path());
+                    }
+                }
+                paths.sort();
+                for path in paths {
+                    if own_shard_path.as_ref() == Some(&path) {
+                        read_committed_into(&path, &mut live_by_id)?;
+                        continue;
+                    }
+                    let f = match std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&path)
+                    {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(io_to_protocol(e)),
+                    };
+                    let closed = crate::locking::try_lock_exclusive(&f, SHARD_LOCK_OFFSET)
+                        .map_err(io_to_protocol)?;
+                    if closed {
+                        if !is_still_linked(&f, &path) {
+                            continue;
+                        }
+                        read_committed_into(&path, &mut closed_by_id)?;
+                        closed_shards.push((path, f));
+                    } else {
+                        read_committed_into(&path, &mut live_by_id)?;
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_to_protocol(e)),
+        }
+
+        let legacy_ops = self.log_dir.join("operations.jsonl");
+        let has_legacy_ops = legacy_ops.exists();
+        if has_legacy_ops {
+            read_committed_into(&legacy_ops, &mut closed_by_id)?;
+        }
+
+        for live_id in live_by_id.keys() {
+            closed_by_id.remove(live_id);
+        }
+        let live_count = live_by_id.len();
+        let closed_records = sort_records(closed_by_id.into_values());
+        let closed_keep = keep.saturating_sub(live_count);
+        let removed_operations = closed_records.len().saturating_sub(closed_keep);
+        let retained_closed = &closed_records[removed_operations..];
+        let retained_operations = live_count + retained_closed.len();
+
+        let already_compact = !has_legacy_ops
+            && removed_operations == 0
+            && (closed_shards.is_empty()
+                || (closed_shards.len() == 1 && !retained_closed.is_empty()));
+        if already_compact {
+            return Ok(PruneStats {
+                removed_operations: 0,
+                retained_operations,
+            });
+        }
+
+        if !retained_closed.is_empty() {
+            std::fs::create_dir_all(&ops_dir).map_err(io_to_protocol)?;
+            write_compacted_shard(&ops_dir, retained_closed)?;
+        }
+
+        if has_legacy_ops {
+            match std::fs::remove_file(&legacy_ops) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_to_protocol(e)),
+            }
+        }
+        for (old_path, lock_file) in closed_shards {
+            #[cfg(windows)]
+            {
+                crate::locking::unlock(&lock_file, SHARD_LOCK_OFFSET);
+                drop(lock_file);
+            }
+            match std::fs::remove_file(&old_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_to_protocol(e)),
+            }
+            #[cfg(not(windows))]
+            {
+                crate::locking::unlock(&lock_file, SHARD_LOCK_OFFSET);
+                drop(lock_file);
+            }
+        }
+
         Ok(PruneStats {
             removed_operations,
-            removed_requests,
-            // History only, matching what `keep` counts and what a
-            // caller can actually go on to read.
-            retained_operations: records.iter().filter(|r| !is_pending(r)).count(),
+            retained_operations,
         })
     }
+}
 
-    fn append_request_line(&self, line: RequestLogLine) -> Result<(), ProtocolError> {
-        let serialized = serde_json::to_string(&line).map_err(|e| {
-            ProtocolError::new(
-                ErrorCode::IoError,
-                format!("failed to serialize request log: {e}"),
-            )
-        })?;
-        self.append_line(&self.requests_path, &serialized, "request log")
-            .map_err(|f| match f {
-                AppendFailure::Incomplete(e) | AppendFailure::Unsynced(e) => e,
-            })
+fn cleanup_legacy_artifacts(state_dir: &Path) {
+    let blobs = state_dir.join("blobs");
+    if blobs.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_dir_all(&blobs);
     }
-
-    /// The request-log counterpart of `append_record_tracked`.
-    fn append_request_tracked(
-        &self,
-        line: RequestLogLine,
-        apply: impl FnOnce(&mut HashMap<String, RequestEntry>),
-    ) -> Result<(), ProtocolError> {
-        let _appends = self.log_append.lock();
-        self.append_request_line(line)?;
-        apply(&mut self.requests.lock());
-        Ok(())
-    }
-
-    /// Append a record and make the matching change to the in-memory table
-    /// without letting go in between.
-    ///
-    /// `prune` rewrites the file from that table, so the two must never be seen
-    /// apart: a record already durable while the table has yet to hear about it
-    /// is exactly the snapshot a concurrent prune would write back, dropping an
-    /// operation its handler has already been told committed.
-    fn append_record_tracked(
-        &self,
-        record: AnyOperationRecord,
-        apply: impl FnOnce(&mut Vec<AnyOperationRecord>),
-    ) -> Result<(), ProtocolError> {
-        let _appends = self.log_append.lock();
-        self.append_record_locked(record).map_err(|f| match f {
-            AppendFailure::Incomplete(e) | AppendFailure::Unsynced(e) => e,
-        })?;
-        apply(&mut self.records.lock());
-        Ok(())
-    }
-
-    /// The append itself, for callers already holding `log_append`.
-    fn append_record_locked(&self, record: AnyOperationRecord) -> Result<(), AppendFailure> {
-        let serialized = serde_json::to_string(&record).map_err(|e| {
-            AppendFailure::Incomplete(ProtocolError::new(
-                ErrorCode::IoError,
-                format!("failed to serialize operation record: {e}"),
-            ))
-        })?;
-        self.append_line(&self.operations_path, &serialized, "op log")
-    }
-
-    /// Append one line to a JSONL log, undoing a write that cannot be
-    /// completed.
-    ///
-    /// The roll-back is the point. These logs are append-only and their loader
-    /// repairs a tail with no newline -- a crash between the write and the
-    /// newline -- by discarding or completing it. What it cannot repair is a
-    /// fragment that a LATER append has welded onto and terminated: that is a
-    /// newline-terminated line which does not parse, and the loader must treat
-    /// it as a corrupted authoritative log and refuse. A server that stays up
-    /// after a partial write (a volume that filled and was then freed, say)
-    /// would produce exactly that.
-    ///
-    /// So a partial write is truncated away. The caller holds `log_append`,
-    /// which is what makes the length taken beforehand still the end of the
-    /// file -- handler tasks append concurrently, and the state flock only
-    /// excludes other processes.
-    /// If even the truncation fails the fragment is there to stay, and this
-    /// store stops appending rather than weld onto it; the next start repairs
-    /// the unterminated tail.
-    fn append_line(
-        &self,
-        path: &std::path::Path,
-        serialized: &str,
-        what: &str,
-    ) -> Result<(), AppendFailure> {
-        let incomplete =
-            |msg: String| AppendFailure::Incomplete(ProtocolError::new(ErrorCode::IoError, msg));
-        if self.log_torn.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(incomplete(format!(
-                "refusing to append to {what}: an earlier partial line could not be undone, \
-                 and appending after it would leave a log the next start cannot read; \
-                 restart the server to repair it"
-            )));
+    for name in [
+        "requests.jsonl",
+        "op-counter",
+        "lock",
+        "pending_uploads.json",
+    ] {
+        let path = state_dir.join(name);
+        if path.symlink_metadata().is_ok() {
+            let _ = std::fs::remove_file(&path);
         }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|e| incomplete(format!("open {what}: {e}")))?;
-        let len_before = f
-            .metadata()
-            .map_err(|e| incomplete(format!("stat {what}: {e}")))?
-            .len();
-        if let Err(e) = writeln!(f, "{serialized}") {
-            if let Err(t) = f.set_len(len_before) {
-                self.log_torn
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                return Err(incomplete(format!(
-                    "write {what}: {e}; the partial line could not be undone ({t}), so this \
-                     server will not append again -- restart to repair"
-                )));
-            }
-            return Err(incomplete(format!("write {what}: {e}")));
-        }
-        f.sync_all().map_err(|e| {
-            AppendFailure::Unsynced(ProtocolError::new(
-                ErrorCode::IoError,
-                format!("fsync {what}: {e}"),
-            ))
-        })?;
-        Ok(())
     }
 }
 
-/// How far a failed append got, which decides whether anything may be appended
-/// after it. See `append_line`.
-enum AppendFailure {
-    /// The record may be a partial line. Nothing more may be appended.
-    Incomplete(ProtocolError),
-    /// The line is whole on disk; only its durability is unconfirmed.
-    Unsynced(ProtocolError),
+fn sort_records(iter: impl IntoIterator<Item = AnyOperationRecord>) -> Vec<AnyOperationRecord> {
+    let mut records: Vec<AnyOperationRecord> = iter.into_iter().collect();
+    records.sort_by(|a, b| {
+        a.timestamp_ms()
+            .cmp(&b.timestamp_ms())
+            .then_with(|| a.operation_id().cmp(b.operation_id()))
+    });
+    records
 }
 
-/// True for records that describe a mutation still in flight rather than one
-/// that happened. They are reconciled by recovery and must outlive pruning.
-fn is_pending(r: &AnyOperationRecord) -> bool {
-    matches!(r, AnyOperationRecord::Prepared(_))
+fn new_shard_filename() -> String {
+    let ts_low = now_ms() & 0xFFFF_FFFF_FFFF;
+    let pid_low = std::process::id() & 0xFF_FFFF;
+    let rand = rand_u16();
+    format!("{ts_low:012x}-{pid_low:06x}-{rand:04x}.jsonl")
 }
 
-/// Sentinel value used as `expected_after_hash` when the mutation results in a
-/// deleted file. Recovery treats `current == None` as matching this sentinel.
-pub(crate) const FILE_DELETED_SENTINEL: &str = "sha256:";
+fn rand_u16() -> u16 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
 
-fn record_request_id(r: &AnyOperationRecord) -> Option<&str> {
-    match r {
-        AnyOperationRecord::Fs(r) => Some(&r.request_id),
-        AnyOperationRecord::Exec(r) => Some(&r.request_id),
-        AnyOperationRecord::Transfer(r) => Some(&r.request_id),
-        AnyOperationRecord::Prepared(r) => Some(&r.request_id),
-        AnyOperationRecord::Aborted(_) => None,
-    }
+    static SEQ: AtomicU16 = AtomicU16::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut h = RandomState::new().build_hasher();
+    h.write_u16(n);
+    h.finish() as u16
 }
 
-/// Take an exclusive advisory lock on `<log_dir>/lock`, retrying until
-/// `grace` elapses. Held for the process lifetime; the kernel drops it on
-/// exit, so a crash never leaves a stale lock.
-fn acquire_dir_lock(
-    log_dir: &std::path::Path,
-    grace: std::time::Duration,
-) -> Result<std::fs::File, ProtocolError> {
-    let path = log_dir.join("lock");
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(io_to_protocol)?;
-    let deadline = std::time::Instant::now() + grace;
-    loop {
-        if crate::locking::try_lock_exclusive(&f, 1 << 32).map_err(io_to_protocol)? {
-            // Record our pid so a conflicting starter can name the holder --
-            // e.g. a zombie server on a half-dead ssh session.
-            f.set_len(0).map_err(io_to_protocol)?;
-            writeln!(&f, "{}", std::process::id()).map_err(io_to_protocol)?;
-            f.sync_all().map_err(io_to_protocol)?;
-            return Ok(f);
+fn open_session_shard(ops_dir: &Path) -> Result<OpenShard, ProtocolError> {
+    std::fs::create_dir_all(ops_dir).map_err(io_to_protocol)?;
+    for _ in 0..32 {
+        let path = ops_dir.join(new_shard_filename());
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(io_to_protocol(e)),
+        };
+        if !crate::locking::try_lock_exclusive(&file, SHARD_LOCK_OFFSET).map_err(io_to_protocol)? {
+            continue;
         }
-        if std::time::Instant::now() >= deadline {
-            let holder_pid = std::fs::read_to_string(&path)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            // Recorded from the refused side: the holder writes nothing when it
-            // is stuck, so this is what shows a workspace being knocked on
-            // while something older still owns it.
-            crate::session_log::SessionLog::new(log_dir).record(
-                "lock_denied",
-                serde_json::json!({ "holder_pid": holder_pid }),
-            );
-            let holder = holder_pid
-                .map(|pid| format!(" (held by pid {pid})"))
-                .unwrap_or_default();
-            return Err(ProtocolError::new(
-                ErrorCode::IoError,
-                format!(
-                    "state directory {log_dir:?} is locked by another remote-workspace-server{holder}; \
-                     one server serves a workspace root at a time, so another agent session is \
-                     already using this workspace -- use a different root or wait for it to exit"
-                ),
-            ));
+        if !is_still_linked(&file, &path) {
+            continue;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        return Ok(OpenShard { path, file });
     }
+    Err(ProtocolError::new(
+        ErrorCode::IoError,
+        format!("could not create unique operation shard in {ops_dir:?}"),
+    ))
 }
 
-/// Replace a file's contents whole: write a temp file beside it, sync, rename.
-/// A caller that cannot tolerate a half-written file uses this instead of
-/// `std::fs::write`, which truncates before it writes.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), ProtocolError> {
-    let dir = path.parent().ok_or_else(|| {
-        ProtocolError::new(ErrorCode::IoError, format!("no parent dir for {path:?}"))
-    })?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(io_to_protocol)?;
-    tmp.write_all(bytes).map_err(io_to_protocol)?;
-    tmp.as_file().sync_all().map_err(io_to_protocol)?;
-    tmp.persist(path)
-        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("persist {path:?}: {e}")))?;
-    crate::fsync::fsync_file_or_dir(path).map_err(io_to_protocol)?;
-    Ok(())
+#[cfg(unix)]
+fn is_still_linked(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    matches!(
+        (file.metadata(), std::fs::metadata(path)),
+        (Ok(a), Ok(b)) if a.dev() == b.dev() && a.ino() == b.ino()
+    )
 }
 
-fn rewrite_jsonl<T: serde::Serialize>(
-    path: &std::path::Path,
-    items: impl Iterator<Item = T>,
-) -> Result<(), ProtocolError> {
-    let dir = path.parent().ok_or_else(|| {
-        ProtocolError::new(ErrorCode::IoError, format!("no parent dir for {path:?}"))
-    })?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(io_to_protocol)?;
-    for item in items {
-        let line = serde_json::to_string(&item)
+#[cfg(windows)]
+fn is_still_linked(_file: &std::fs::File, path: &Path) -> bool {
+    path.is_file()
+}
+
+fn write_compacted_shard(
+    ops_dir: &Path,
+    records: &[AnyOperationRecord],
+) -> Result<PathBuf, ProtocolError> {
+    let mut tmp = tempfile::NamedTempFile::new_in(ops_dir).map_err(io_to_protocol)?;
+    for item in records {
+        let line = serde_json::to_string(item)
             .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("serialize: {e}")))?;
         writeln!(tmp, "{line}").map_err(io_to_protocol)?;
     }
-    tmp.as_file().sync_all().map_err(io_to_protocol)?;
-    tmp.persist(path)
-        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("persist {path:?}: {e}")))?;
-    crate::fsync::fsync_file_or_dir(path).map_err(io_to_protocol)?;
-    Ok(())
+    tmp.as_file().sync_data().map_err(io_to_protocol)?;
+    for _ in 0..32 {
+        let dest = ops_dir.join(new_shard_filename());
+        match tmp.persist_noclobber(&dest) {
+            Ok(_) => return Ok(dest),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                tmp = e.file;
+            }
+            Err(e) => {
+                return Err(ProtocolError::new(
+                    ErrorCode::IoError,
+                    format!("persist compacted shard {dest:?}: {}", e.error),
+                ))
+            }
+        }
+    }
+    Err(ProtocolError::new(
+        ErrorCode::IoError,
+        format!("could not persist unique compacted shard in {ops_dir:?}"),
+    ))
 }
 
-/// A single logical line plus the byte offset in the file at which its content
-/// (excluding the terminating newline) begins, and whether the file content
-/// ended with a newline after this line. The trailing-newline flag lets the
-/// loader distinguish a crash-truncated last record (no newline) from a
-/// genuinely corrupted complete record (newline present but invalid JSON).
 struct LineEntry {
-    /// Valid UTF-8 text content. Empty string if the raw bytes are not valid
-    /// UTF-8 (handled by the caller as a crash-truncated trailing line).
     text: String,
-    /// Byte offset of the START of this line's content within the file.
-    start_offset: usize,
-    /// True if this line is terminated by a \n byte.
     has_newline: bool,
-    /// True if the raw bytes of this line are valid UTF-8. An invalid trailing
-    /// line (no newline, invalid UTF-8) is treated as crash-truncated.
     utf8_ok: bool,
-    /// Byte length of this line's raw content, excluding the \n terminator
-    /// (if present). Used to compute the byte range to remove when truncating.
-    raw_len: usize,
 }
 
-fn read_lines(path: &PathBuf) -> std::io::Result<Vec<LineEntry>> {
+fn read_lines(path: &Path) -> std::io::Result<Vec<LineEntry>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1220,26 +544,20 @@ fn read_lines(path: &PathBuf) -> std::io::Result<Vec<LineEntry>> {
         match bytes[start..].iter().position(|&b| b == b'\n') {
             Some(i) => {
                 let nl = start + i;
-                let raw = &bytes[start..nl];
-                let (text, utf8_ok) = bytes_to_text(raw);
+                let (text, utf8_ok) = bytes_to_text(&bytes[start..nl]);
                 out.push(LineEntry {
                     text,
-                    start_offset: start,
                     has_newline: true,
                     utf8_ok,
-                    raw_len: raw.len(),
                 });
                 start = nl + 1;
             }
             None => {
-                let raw = &bytes[start..];
-                let (text, utf8_ok) = bytes_to_text(raw);
+                let (text, utf8_ok) = bytes_to_text(&bytes[start..]);
                 out.push(LineEntry {
                     text,
-                    start_offset: start,
                     has_newline: false,
                     utf8_ok,
-                    raw_len: raw.len(),
                 });
                 break;
             }
@@ -1255,18 +573,6 @@ fn bytes_to_text(bytes: &[u8]) -> (String, bool) {
     }
 }
 
-/// The byte offset just past the last newline-terminated line. Used for
-/// truncation.
-fn valid_content_end_offset(entries: &[LineEntry]) -> usize {
-    entries
-        .iter()
-        .filter(|e| e.has_newline)
-        .map(|e| e.start_offset + e.raw_len + 1)
-        .max()
-        .unwrap_or(0)
-}
-
-/// What a log line turned out to be.
 #[allow(clippy::large_enum_variant)]
 enum ParseResult<T> {
     Parsed(T),
@@ -1274,34 +580,19 @@ enum ParseResult<T> {
     SkippedBlank,
 }
 
-/// Parse one JSONL line.
-///
-/// A corrupted line in the MIDDLE of the file is a data-integrity problem, not
-/// something to skip: doing so would lose authoritative operation records,
-/// allow operation-id reuse, or break request idempotency. Startup fails with
-/// the path and 1-based line number instead. A trailing line WITHOUT a newline
-/// is the other case entirely -- a crash between the write and the newline --
-/// and is reported for the caller to truncate away.
 fn parse_log_line_strict<T: serde::de::DeserializeOwned>(
     entry: &LineEntry,
-    path: &std::path::Path,
+    path: &Path,
     idx: usize,
 ) -> Result<ParseResult<T>, ProtocolError> {
-    // Invalid UTF-8: if this is the last line (no newline) it's a
-    // crash-truncated partial codepoint; otherwise it's a corrupted file.
     if !entry.utf8_ok {
         if !entry.has_newline {
-            tracing::warn!(
-                file = %path.display(),
-                line = idx + 1,
-                "dropping trailing line with invalid UTF-8 (crash mid-codepoint)"
-            );
             return Ok(ParseResult::SkippedCrashTruncated);
         }
         return Err(ProtocolError::new(
             ErrorCode::IoError,
             format!(
-                "corrupted log {:?}: line {} is not valid UTF-8; refusing to start",
+                "corrupted log {:?}: line {} is not valid UTF-8",
                 path.display(),
                 idx + 1
             ),
@@ -1309,8 +600,6 @@ fn parse_log_line_strict<T: serde::de::DeserializeOwned>(
     }
     let trimmed = entry.text.trim();
     if trimmed.is_empty() {
-        // A trailing blank with no newline is just an empty tail end.
-        // A blank WITH a newline in the middle is malformed JSONL.
         if !entry.has_newline {
             return Ok(ParseResult::SkippedBlank);
         }
@@ -1326,21 +615,13 @@ fn parse_log_line_strict<T: serde::de::DeserializeOwned>(
     match serde_json::from_str::<T>(trimmed) {
         Ok(v) => Ok(ParseResult::Parsed(v)),
         Err(e) => {
-            // No newline + parse failure → crash truncated.
             if !entry.has_newline {
-                tracing::warn!(
-                    file = %path.display(),
-                    line = idx + 1,
-                    error = %e,
-                    "dropping crash-truncated trailing log line (no newline + invalid JSON)"
-                );
                 return Ok(ParseResult::SkippedCrashTruncated);
             }
             Err(ProtocolError::new(
                 ErrorCode::IoError,
                 format!(
-                    "corrupted log {:?}: line {} is not valid JSON ({e}); \
-                     refusing to start with a damaged authoritative record",
+                    "corrupted log {:?}: line {} is not valid JSON ({e})",
                     path.display(),
                     idx + 1
                 ),
@@ -1349,57 +630,20 @@ fn parse_log_line_strict<T: serde::de::DeserializeOwned>(
     }
 }
 
-/// If the log file's last line lacks a terminating newline (a crash-truncated
-/// partial record), physically truncate the file back to the end of the last
-/// valid newline-terminated line and fsync. Without this, the next append
-/// concatenates onto the partial JSON and permanently poisons the log, turning
-/// a recoverable crash into an unrecoverable one.
-fn truncate_trailing_garbage(
-    entries: &[LineEntry],
-    path: &std::path::Path,
+fn read_committed_into(
+    path: &Path,
+    by_id: &mut BTreeMap<String, AnyOperationRecord>,
 ) -> Result<(), ProtocolError> {
-    let valid_end = valid_content_end_offset(entries);
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(io_to_protocol)?;
-    f.set_len(valid_end as u64).map_err(io_to_protocol)?;
-    f.sync_all().map_err(io_to_protocol)?;
-    if let Some(parent) = path.parent() {
-        crate::fsync::fsync_dir(parent).map_err(io_to_protocol)?;
+    let lines = read_lines(path).map_err(io_to_protocol)?;
+    for (idx, line) in lines.iter().enumerate() {
+        let rec: AnyOperationRecord = match parse_log_line_strict(line, path, idx)? {
+            ParseResult::Parsed(r) => r,
+            ParseResult::SkippedCrashTruncated | ParseResult::SkippedBlank => continue,
+        };
+        if rec.is_committed() {
+            by_id.insert(rec.operation_id().to_string(), rec);
+        }
     }
-    tracing::info!(
-        file = %path.display(),
-        truncated_to_bytes = valid_end,
-        "truncated crash-truncated trailing record from log"
-    );
-    Ok(())
-}
-
-fn append_missing_newline(
-    entries: &[LineEntry],
-    path: &std::path::Path,
-) -> Result<(), ProtocolError> {
-    let last = match entries.last() {
-        Some(l) => l,
-        None => return Ok(()),
-    };
-    if last.has_newline || last.text.trim().is_empty() || !last.utf8_ok {
-        return Ok(());
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(io_to_protocol)?;
-    std::io::Write::write_all(&mut f, b"\n").map_err(io_to_protocol)?;
-    f.sync_all().map_err(io_to_protocol)?;
-    if let Some(parent) = path.parent() {
-        crate::fsync::fsync_dir(parent).map_err(io_to_protocol)?;
-    }
-    tracing::info!(
-        file = %path.display(),
-        "appended missing trailing newline to last valid record"
-    );
     Ok(())
 }
 
@@ -1415,31 +659,95 @@ fn io_to_protocol(e: std::io::Error) -> ProtocolError {
 }
 
 #[cfg(test)]
-mod lock_tests {
-    use super::acquire_dir_lock;
-    use std::time::Duration;
+mod tests {
+    use super::*;
+    use remote_workspace_protocol::OperationKind;
 
-    #[test]
-    fn second_lock_on_same_dir_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let held = acquire_dir_lock(dir.path(), Duration::ZERO).unwrap();
-        let err = acquire_dir_lock(dir.path(), Duration::ZERO).unwrap_err();
-        assert!(err.message.contains("locked"), "unexpected: {err}");
-        drop(held);
-        acquire_dir_lock(dir.path(), Duration::ZERO).unwrap();
+    fn sample_fs(op_id: &str, ts_ms: u64) -> FsOperationRecord {
+        FsOperationRecord {
+            operation_id: op_id.to_string(),
+            request_id: format!("req-{op_id}"),
+            kind: OperationKind::Create,
+            path: "a.txt".into(),
+            before_hash: None,
+            after_hash: format!("sha256:{}", "11".repeat(32)),
+            timestamp_ms: ts_ms,
+        }
     }
 
     #[test]
-    fn grace_period_waits_for_release() {
+    fn startup_touches_no_shards_or_lock_files() {
         let dir = tempfile::tempdir().unwrap();
-        let held = acquire_dir_lock(dir.path(), Duration::ZERO).unwrap();
-        let path = dir.path().to_path_buf();
-        let t = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            drop(held);
-        });
-        // Must succeed once the holder releases, well within the grace period.
-        acquire_dir_lock(&path, Duration::from_secs(5)).unwrap();
-        t.join().unwrap();
+        let state = dir.path().join("state");
+        let _store = OperationStore::new(state.clone()).unwrap();
+        assert!(state.is_dir());
+        assert!(!state.join("ops").exists());
+        assert!(!state.join("lock").exists());
+        assert!(!state.join("requests.jsonl").exists());
+        assert!(!state.join("op-counter").exists());
+    }
+
+    #[test]
+    fn operation_ids_are_monotonic_and_unique_within_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let s1 = OperationStore::new(dir.path().join("s1")).unwrap();
+        let s2 = OperationStore::new(dir.path().join("s2")).unwrap();
+        let mut prev = String::new();
+        for i in 0..200 {
+            let id = if i % 2 == 0 {
+                s1.next_operation_id()
+            } else {
+                s2.next_operation_id()
+            };
+            assert!(id.starts_with("op-"));
+            assert_eq!(id.len(), 3 + 12 + 1 + 6 + 1 + 4, "bad id shape: {id}");
+            assert!(id > prev, "{id} was not strictly greater than {prev}");
+            prev = id;
+        }
+    }
+
+    #[test]
+    fn two_stores_share_state_dir_and_prune_spares_live_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let closed_a = OperationStore::new(state.clone()).unwrap();
+        let closed_b = OperationStore::new(state.clone()).unwrap();
+        let live = OperationStore::new(state.clone()).unwrap();
+
+        let id1 = closed_a.next_operation_id();
+        closed_a.append_fs_record(sample_fs(&id1, 10)).unwrap();
+        drop(closed_a);
+
+        let id2 = closed_b.next_operation_id();
+        closed_b.append_fs_record(sample_fs(&id2, 20)).unwrap();
+        drop(closed_b);
+
+        let id3 = live.next_operation_id();
+        live.append_fs_record(sample_fs(&id3, 30)).unwrap();
+
+        let pruner = OperationStore::new(state.clone()).unwrap();
+        let stats = pruner.prune(2).unwrap();
+        assert_eq!(stats.removed_operations, 1);
+        assert_eq!(stats.retained_operations, 2);
+
+        let history = live.history(None).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].operation_id(), id2);
+        assert_eq!(history[1].operation_id(), id3);
+
+        // Now closed shards are already compacted to 1 file with 0 removals:
+        // a second prune must be a zero-write no-op (mtime/name unchanged).
+        let shards_before: Vec<PathBuf> = std::fs::read_dir(state.join("ops"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        let stats2 = pruner.prune(2).unwrap();
+        assert_eq!(stats2.removed_operations, 0);
+        assert_eq!(stats2.retained_operations, 2);
+        let shards_after: Vec<PathBuf> = std::fs::read_dir(state.join("ops"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(shards_before, shards_after);
     }
 }

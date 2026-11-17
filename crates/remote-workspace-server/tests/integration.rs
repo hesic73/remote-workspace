@@ -191,6 +191,24 @@ fn req(id: &str, body: RequestBody) -> Request {
     }
 }
 
+fn read_body(path: &str, offset: Option<u64>, limit: Option<u64>) -> RequestBody {
+    ReadOptions {
+        offset,
+        limit,
+        ..Default::default()
+    }
+    .into_request_body(path.into())
+}
+
+fn edit_body(path: &str, base_hash: String, edits: Vec<EditSpec>) -> RequestBody {
+    RequestBody::Edit {
+        path: path.into(),
+        base_hash,
+        edits,
+        replace_content: None,
+    }
+}
+
 #[cfg(unix)]
 fn platform_script(unix_script: &str, _windows_script: &str) -> Vec<String> {
     vec!["sh".into(), "-c".into(), unix_script.into()]
@@ -272,14 +290,7 @@ async fn create_then_read_roundtrip() {
         other => panic!("unexpected: {other:?}"),
     }
 
-    h.send(&req(
-        "r2",
-        RequestBody::Read {
-            path: "hello.txt".into(),
-            offset: None,
-            limit: None,
-        },
-    ));
+    h.send(&req("r2", read_body("hello.txt", None, None)));
     let m = h.recv().await;
     match m {
         ServerMessage::Result {
@@ -287,6 +298,10 @@ async fn create_then_read_roundtrip() {
             ..
         } => {
             assert_eq!(r.content, "hello world\n");
+            assert_eq!(r.total_bytes, 12);
+            assert_eq!(r.start_offset, 0);
+            assert_eq!(r.end_offset, 12);
+            assert!(r.trailing_newline);
             assert_eq!(r.hash.as_deref(), Some(hash_of("hello world\n").as_str()));
             assert!(!r.truncated);
         }
@@ -415,30 +430,30 @@ async fn stale_hash_rejected() {
     // Edit with correct base_hash should succeed.
     h.send(&req(
         "w2",
-        RequestBody::Edit {
-            path: "f.txt".into(),
-            base_hash: hash.clone(),
-            edits: vec![EditSpec {
+        edit_body(
+            "f.txt",
+            hash.clone(),
+            vec![EditSpec {
                 old_text: "v1".into(),
                 new_text: "v2".into(),
                 replace_all: false,
             }],
-        },
+        ),
     ));
     let _ = h.recv().await;
 
     // Now edit with the stale v1 base_hash should be rejected.
     h.send(&req(
         "w3",
-        RequestBody::Edit {
-            path: "f.txt".into(),
-            base_hash: hash,
-            edits: vec![EditSpec {
+        edit_body(
+            "f.txt",
+            hash,
+            vec![EditSpec {
                 old_text: "v2".into(),
                 new_text: "v3".into(),
                 replace_all: false,
             }],
-        },
+        ),
     ));
     let m = h.recv().await;
     match m {
@@ -486,15 +501,15 @@ async fn edit_atomic_all_or_nothing() {
     // Valid edit.
     h.send(&req(
         "pa",
-        RequestBody::Edit {
-            path: "p.txt".into(),
-            base_hash: hash.clone(),
-            edits: vec![EditSpec {
+        edit_body(
+            "p.txt",
+            hash.clone(),
+            vec![EditSpec {
                 old_text: "b".into(),
                 new_text: "BEE".into(),
                 replace_all: false,
             }],
-        },
+        ),
     ));
     let _ = h.recv().await;
     assert_eq!(
@@ -507,15 +522,15 @@ async fn edit_atomic_all_or_nothing() {
     let current_hash = hash_of(&before);
     h.send(&req(
         "pb",
-        RequestBody::Edit {
-            path: "p.txt".into(),
-            base_hash: current_hash,
-            edits: vec![EditSpec {
+        edit_body(
+            "p.txt",
+            current_hash,
+            vec![EditSpec {
                 old_text: "not-present".into(),
                 new_text: "X".into(),
                 replace_all: false,
             }],
-        },
+        ),
     ));
     let m = h.recv().await;
     assert!(matches!(
@@ -544,14 +559,7 @@ async fn edit_atomic_all_or_nothing() {
 #[tokio::test]
 async fn path_boundary_rejects_escape() {
     let mut h = harness().await;
-    h.send(&req(
-        "r",
-        RequestBody::Read {
-            path: "../etc/passwd".into(),
-            offset: None,
-            limit: None,
-        },
-    ));
+    h.send(&req("r", read_body("../etc/passwd", None, None)));
     let m = h.recv().await;
     assert!(matches!(
         m,
@@ -688,14 +696,7 @@ async fn scratch_is_shared_by_exec_and_file_tools() {
         "scratch writer failed: {exec_msgs:?}"
     );
 
-    h.send(&req(
-        "r",
-        RequestBody::Read {
-            path: "@scratch/job.log".into(),
-            offset: None,
-            limit: None,
-        },
-    ));
+    h.send(&req("r", read_body("@scratch/job.log", None, None)));
     let read_msg = h.recv().await;
     assert!(
         matches!(
@@ -770,55 +771,6 @@ async fn idempotent_replay_returns_same_result() {
 }
 
 #[tokio::test]
-async fn request_status_unknown_and_done() {
-    let mut h = harness().await;
-    // Unknown request.
-    h.send(&req(
-        "s0",
-        RequestBody::RequestStatus {
-            target: "never".into(),
-        },
-    ));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::RequestStatus(r),
-            ..
-        } => {
-            assert_eq!(r.status, RequestStatus::Unknown);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    // Execute a request, then query its status.
-    h.send(&req(
-        "real",
-        RequestBody::Create {
-            path: "q.txt".into(),
-            content: "q".into(),
-        },
-    ));
-    let _ = h.recv().await;
-    h.send(&req(
-        "s1",
-        RequestBody::RequestStatus {
-            target: "real".into(),
-        },
-    ));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::RequestStatus(r),
-            ..
-        } => {
-            assert_eq!(r.target, "real");
-            assert_eq!(r.status, RequestStatus::Done);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[tokio::test]
 async fn history_and_operation_get() {
     let mut h = harness().await;
     h.send(&req(
@@ -837,15 +789,15 @@ async fn history_and_operation_get() {
     };
     h.send(&req(
         "w2",
-        RequestBody::Edit {
-            path: "h.txt".into(),
-            base_hash: hash_of("1"),
-            edits: vec![EditSpec {
+        edit_body(
+            "h.txt",
+            hash_of("1"),
+            vec![EditSpec {
                 old_text: "1".into(),
                 new_text: "2".into(),
                 replace_all: false,
             }],
-        },
+        ),
     ));
     let op2 = match h.recv().await {
         ServerMessage::Result {
@@ -919,7 +871,7 @@ setup = 'export GREETING=hi'
 }
 
 #[tokio::test]
-async fn profile_unknown_rejected() {
+async fn profile_unknown_rejected_with_available_profiles() {
     let mut h = harness().await;
     h.send(&req(
         "e",
@@ -931,16 +883,17 @@ async fn profile_unknown_rejected() {
         },
     ));
     let m = h.recv().await;
-    assert!(matches!(
-        m,
-        ServerMessage::Error {
-            error: ProtocolError {
-                code: ErrorCode::InvalidRequest,
-                ..
-            },
-            ..
+    match m {
+        ServerMessage::Error { error, .. } => {
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert!(
+                error.message.contains("no profiles are configured"),
+                "unexpected message: {}",
+                error.message
+            );
         }
-    ));
+        other => panic!("unexpected: {other:?}"),
+    }
 }
 
 // symlinked ancestor + nonexistent leaf (the critical escape).
@@ -977,117 +930,6 @@ async fn symlinked_ancestor_nonexistent_leaf_blocked() {
         .unwrap_or(true));
 }
 
-// idempotency survives restart.
-#[tokio::test]
-async fn replay_after_restart_returns_stored_result() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    std::fs::create_dir_all(&log_dir).unwrap();
-
-    // First session: do a write with request_id "stable".
-    {
-        let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        h.send(&req(
-            "stable",
-            RequestBody::Create {
-                path: "f.txt".into(),
-                content: "v1".into(),
-            },
-        ));
-        let _ = h.recv().await;
-        h.shutdown().await;
-    }
-    // The workspace + log dir live on disk under root; shutdown released the
-    // state-directory lock so a second server can take it.
-
-    // Second session over the SAME log dir: replay "stable".
-    {
-        let mut h = harness_at_with(root.path(), log_dir, None).await;
-        h.send(&req(
-            "stable",
-            RequestBody::Create {
-                path: "f.txt".into(),
-                content: "v2".into(), // different content; must be ignored
-            },
-        ));
-        let m = h.recv().await;
-        match m {
-            ServerMessage::Result {
-                result: ResultBody::Mutation(w),
-                ..
-            } => {
-                // The replayed result must reflect the ORIGINAL create (v1), and
-                // no new operation id should have been allocated.
-                assert_eq!(w.new_hash, hash_of("v1"));
-            }
-            other => panic!("replay should return stored result, got {other:?}"),
-        }
-        // File content must still be v1.
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("f.txt")).unwrap(),
-            "v1"
-        );
-        // History (which reconciles the WAL) must report exactly ONE operation:
-        // the replay did not execute and did not append a committed record.
-        h.send(&req("hist", RequestBody::History { limit: None }));
-        let m = h.recv().await;
-        match m {
-            ServerMessage::Result {
-                result: ResultBody::History { operations },
-                ..
-            } => {
-                assert_eq!(
-                    operations.len(),
-                    1,
-                    "replay must not create a second record"
-                );
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-}
-
-// request.status recovers prior status after restart.
-#[tokio::test]
-async fn request_status_survives_restart() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    std::fs::create_dir_all(&log_dir).unwrap();
-
-    {
-        let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        h.send(&req(
-            "real",
-            RequestBody::Create {
-                path: "q.txt".into(),
-                content: "q".into(),
-            },
-        ));
-        let _ = h.recv().await;
-        h.shutdown().await;
-    }
-    {
-        let mut h = harness_at_with(root.path(), log_dir, None).await;
-        h.send(&req(
-            "s",
-            RequestBody::RequestStatus {
-                target: "real".into(),
-            },
-        ));
-        let m = h.recv().await;
-        match m {
-            ServerMessage::Result {
-                result: ResultBody::RequestStatus(r),
-                ..
-            } => {
-                assert_eq!(r.target, "real");
-                assert_eq!(r.status, RequestStatus::Done);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-}
-
 // concurrent duplicate request ids execute once.
 #[tokio::test]
 async fn concurrent_duplicate_request_runs_once() {
@@ -1103,11 +945,30 @@ async fn concurrent_duplicate_request_runs_once() {
     h.send(&req("same", body));
     let m1 = h.recv().await;
     let m2 = h.recv().await;
-    // Both responses must be identical, and only one operation recorded.
-    assert_eq!(
-        serde_json::to_string(&m1).unwrap(),
-        serde_json::to_string(&m2).unwrap(),
-    );
+    // If the first completed before the second claimed, both replay the same
+    // result; if genuinely concurrent in flight, the second is refused with
+    // InvalidRequest ("request already in progress"). Either way it runs once.
+    let results = [&m1, &m2]
+        .iter()
+        .filter(|m| matches!(m, ServerMessage::Result { .. }))
+        .count();
+    assert!(results >= 1, "at least one must succeed: {m1:?} / {m2:?}");
+    if results == 2 {
+        assert_eq!(
+            serde_json::to_string(&m1).unwrap(),
+            serde_json::to_string(&m2).unwrap(),
+        );
+    } else {
+        let err = [&m1, &m2]
+            .into_iter()
+            .find_map(|m| match m {
+                ServerMessage::Error { error, .. } => Some(error),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+        assert!(err.message.contains("in progress"), "unexpected: {err}");
+    }
     h.send(&req("hist", RequestBody::History { limit: None }));
     let m = h.recv().await;
     match m {
@@ -1251,15 +1112,15 @@ async fn edit_preserves_executable_bit() {
 
     h.send(&req(
         "w",
-        RequestBody::Edit {
-            path: "run.sh".into(),
-            base_hash: hash_of("#!/bin/sh\necho hi\n"),
-            edits: vec![EditSpec {
+        edit_body(
+            "run.sh",
+            hash_of("#!/bin/sh\necho hi\n"),
+            vec![EditSpec {
                 old_text: "echo hi".into(),
                 new_text: "echo bye".into(),
                 replace_all: false,
             }],
-        },
+        ),
     ));
     let m = h.recv().await;
     assert!(
@@ -1291,14 +1152,7 @@ async fn read_hash_consistent_with_base_hash() {
     ));
     let _ = h.recv().await;
 
-    h.send(&req(
-        "r",
-        RequestBody::Read {
-            path: "c.txt".into(),
-            offset: None,
-            limit: None,
-        },
-    ));
+    h.send(&req("r", read_body("c.txt", None, None)));
     let hash = match h.recv().await {
         ServerMessage::Result {
             result: ResultBody::Read(r),
@@ -1311,15 +1165,15 @@ async fn read_hash_consistent_with_base_hash() {
     // (i.e. read and mutation agree on the hash).
     h.send(&req(
         "w2",
-        RequestBody::Edit {
-            path: "c.txt".into(),
-            base_hash: hash,
-            edits: vec![EditSpec {
+        edit_body(
+            "c.txt",
+            hash,
+            vec![EditSpec {
                 old_text: "alpha".into(),
                 new_text: "beta".into(),
                 replace_all: false,
             }],
-        },
+        ),
     ));
     let m = h.recv().await;
     assert!(
@@ -1333,14 +1187,7 @@ async fn read_hash_consistent_with_base_hash() {
 async fn read_rejects_non_utf8() {
     let mut h = harness().await;
     std::fs::write(h.root_path.join("bin.dat"), [0xFF, 0xFE, 0x00, 0x01]).unwrap();
-    h.send(&req(
-        "r",
-        RequestBody::Read {
-            path: "bin.dat".into(),
-            offset: None,
-            limit: None,
-        },
-    ));
+    h.send(&req("r", read_body("bin.dat", None, None)));
     let m = h.recv().await;
     assert!(matches!(
         m,
@@ -1368,14 +1215,7 @@ async fn binary_safe_hash_for_multibyte_utf8() {
         },
     ));
     let _ = h.recv().await;
-    h.send(&req(
-        "r",
-        RequestBody::Read {
-            path: "u.txt".into(),
-            offset: None,
-            limit: None,
-        },
-    ));
+    h.send(&req("r", read_body("u.txt", None, None)));
     let r = match h.recv().await {
         ServerMessage::Result {
             result: ResultBody::Read(r),
@@ -1387,205 +1227,19 @@ async fn binary_safe_hash_for_multibyte_utf8() {
     assert_eq!(r.hash.unwrap(), hash_of(content));
 }
 
-// the crash window — prepared written, file already renamed (so its
-// hash == expected_after), but commit and result never written. After restart,
-// recovery must synthesize the commit so the change is recorded and the
-// request reports Done (not "in progress").
-#[tokio::test]
-async fn recovery_synthesizes_commit_when_rename_done() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    let req_path = log_dir.join("requests.jsonl");
-    std::fs::create_dir_all(&log_dir).unwrap();
-
-    let before = "old\n";
-    let after = "new\n";
-    let before_hash = hash_of(before);
-    let after_hash = hash_of(after);
-
-    // Pre-existing "before" file (the workspace state prior to the mutation).
-    std::fs::write(root.path().join("f.txt"), before).unwrap();
-    // The rename already happened: file now holds the after-content.
-    std::fs::write(root.path().join("f.txt"), after).unwrap();
-
-    // Hand-write ONLY the prepared marker (crash before commit).
-    let prepared = serde_json::json!({
-        "record_kind": "prepared",
-        "operation_id": "op-7",
-        "request_id": "crashed-req",
-        "kind": "edit",
-        "path": "f.txt",
-        "before_hash": before_hash,
-        "expected_after_hash": after_hash,
-        "timestamp_ms": 1,
-    });
-    std::fs::write(&ops_path, format!("{prepared}\n")).unwrap();
-    // And the in-progress request marker (claim had succeeded before crash).
-    let in_progress = serde_json::json!({
-        "request_id": "crashed-req",
-        "status": "inprogress",
-        "op": "edit",
-    });
-    std::fs::write(&req_path, format!("{in_progress}\n")).unwrap();
-
-    // Restart: recovery runs in Server::new.
-    let mut h = harness_at_with(root.path(), log_dir, None).await;
-
-    // The change must now be recorded in history (synthesized commit).
-    h.send(&req("hist", RequestBody::History { limit: None }));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::History { operations },
-            ..
-        } => {
-            assert_eq!(operations.len(), 1, "synthesized commit must appear");
-            match &operations[0] {
-                AnyOperationRecord::Fs(fs) => {
-                    assert_eq!(fs.operation_id, "op-7");
-                    assert_eq!(fs.before_hash.as_deref(), Some(before_hash.as_str()));
-                    assert_eq!(fs.after_hash, after_hash);
-                }
-                other => panic!("expected fs record, got {other:?}"),
-            }
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    // Replaying the same request id must return Done (not "in progress"),
-    // with the synthesized result.
-    h.send(&req(
-        "crashed-req",
-        RequestBody::Edit {
-            path: "f.txt".into(),
-            base_hash: after_hash.clone(),
-            edits: vec![EditSpec {
-                old_text: "new".into(),
-                new_text: "DIFFERENT".into(),
-                replace_all: false,
-            }],
-        },
-    ));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::Mutation(w),
-            ..
-        } => {
-            assert_eq!(w.operation_id, "op-7");
-            assert_eq!(
-                w.new_hash, after_hash,
-                "replay must return synthesized result"
-            );
-        }
-        other => panic!("replay should return synthesized Done, got {other:?}"),
-    }
-}
-
-// when the rename did NOT take effect (file still == before), recovery must
-// drop the orphaned prepared marker and make the request retryable, so the
-// change is neither lost nor stuck.
-#[tokio::test]
-async fn recovery_drops_when_rename_not_done() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    let req_path = log_dir.join("requests.jsonl");
-    std::fs::create_dir_all(&log_dir).unwrap();
-
-    let before = "old\n";
-    let after = "new\n";
-    let before_hash = hash_of(before);
-    let after_hash = hash_of(after);
-
-    // File is still in the BEFORE state (rename never happened).
-    std::fs::write(root.path().join("f.txt"), before).unwrap();
-
-    let prepared = serde_json::json!({
-        "record_kind": "prepared",
-        "operation_id": "op-7",
-        "request_id": "crashed-req",
-        "kind": "edit",
-        "path": "f.txt",
-        "before_hash": before_hash,
-        "expected_after_hash": after_hash,
-        "timestamp_ms": 1,
-    });
-    std::fs::write(&ops_path, format!("{prepared}\n")).unwrap();
-    std::fs::write(
-        &req_path,
-        format!(
-            "{}\n",
-            serde_json::json!({"request_id": "crashed-req", "status": "inprogress", "op": "edit"})
-        ),
-    )
-    .unwrap();
-
-    let mut h = harness_at_with(root.path(), log_dir, None).await;
-
-    // History must be empty (orphan dropped, no phantom operation).
-    h.send(&req("hist", RequestBody::History { limit: None }));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::History { operations },
-            ..
-        } => assert!(
-            operations.is_empty(),
-            "orphan must be dropped: {operations:?}"
-        ),
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    // The stuck request must now be retryable (status Unknown), so replaying it
-    // executes the edit for real.
-    h.send(&req(
-        "crashed-req",
-        RequestBody::Edit {
-            path: "f.txt".into(),
-            base_hash: before_hash.clone(),
-            edits: vec![EditSpec {
-                old_text: "old".into(),
-                new_text: "new".into(),
-                replace_all: false,
-            }],
-        },
-    ));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::Mutation(w),
-            ..
-        } => {
-            assert_eq!(w.new_hash, after_hash);
-            assert_ne!(w.operation_id, "op-7", "retry must allocate a new op id");
-        }
-        other => panic!("retry must succeed, got {other:?}"),
-    }
-}
-
-// when the request log is unwritable, the server must surface the error to
-// the client rather than silently reporting success with no durable state.
 #[tokio::test]
 #[cfg(unix)]
-async fn read_only_request_log_surfaces_error() {
+async fn read_only_ops_dir_surfaces_error() {
     use std::os::unix::fs::PermissionsExt;
-    // Permissions do not stop root, so the log would stay writable.
     if unsafe { libc::geteuid() } == 0 {
         eprintln!("skipped: running as root");
         return;
     }
     let root = tempfile::tempdir().unwrap();
     let log_dir = root.path().join(".remote-workspace");
-    std::fs::create_dir_all(&log_dir).unwrap();
-    // Seed requests.jsonl so the file exists, then make it read-only so appends fail.
-    std::fs::write(log_dir.join("requests.jsonl"), "").unwrap();
-    std::fs::set_permissions(
-        log_dir.join("requests.jsonl"),
-        std::fs::Permissions::from_mode(0o444),
-    )
-    .unwrap();
+    let ops_dir = log_dir.join("ops");
+    std::fs::create_dir_all(&ops_dir).unwrap();
+    std::fs::set_permissions(&ops_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
     let mut h = harness_at_with(root.path(), log_dir, None).await;
     h.send(&req(
@@ -1596,23 +1250,15 @@ async fn read_only_request_log_surfaces_error() {
         },
     ));
     let m = h.recv().await;
-    // Must be an error (logging failed), NOT a silent success.
     assert!(
         matches!(m, ServerMessage::Error { .. }),
-        "expected error when request log is unwritable, got {m:?}"
+        "expected error when ops dir is unwritable, got {m:?}"
     );
-    // Restore perms so the tempdir cleans up.
-    std::fs::set_permissions(
-        root.path().join(".remote-workspace/requests.jsonl"),
-        std::fs::Permissions::from_mode(0o644),
-    )
-    .ok();
+    std::fs::set_permissions(&ops_dir, std::fs::Permissions::from_mode(0o755)).ok();
 }
 
-// a normal create durably appends BOTH a prepared marker and a committed
-// fs record (the WAL), and history reconciles them to a single entry.
 #[tokio::test]
-async fn create_appends_prepared_then_committed() {
+async fn create_appends_single_committed_record_to_session_shard() {
     let root = tempfile::tempdir().unwrap();
     let mut h = harness_at(root.path()).await;
     h.send(&req(
@@ -1623,25 +1269,20 @@ async fn create_appends_prepared_then_committed() {
         },
     ));
     let _ = h.recv().await;
-    let ops_path = root.path().join(".remote-workspace/operations.jsonl");
-    let raw = std::fs::read_to_string(&ops_path).unwrap();
+
+    let ops_dir = root.path().join(".remote-workspace/ops");
+    let shards: Vec<_> = std::fs::read_dir(&ops_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(shards.len(), 1);
+    let raw = std::fs::read_to_string(&shards[0]).unwrap();
     let lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
-    // Exactly two durable lines: prepared then committed.
-    assert_eq!(lines.len(), 2, "expected prepared+committed, got: {raw}");
-    assert!(
-        lines[0].contains("\"record_kind\":\"prepared\""),
-        "first line should be prepared: {}",
-        lines[0]
-    );
-    assert!(
-        lines[1].contains("\"record_kind\":\"fs\""),
-        "second line should be committed fs: {}",
-        lines[1]
-    );
-    // And history exposes exactly ONE (reconciled) operation.
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("\"record_kind\":\"fs\""));
+
     h.send(&req("hist", RequestBody::History { limit: None }));
-    let m = h.recv().await;
-    match m {
+    match h.recv().await {
         ServerMessage::Result {
             result: ResultBody::History { operations },
             ..
@@ -1650,343 +1291,38 @@ async fn create_appends_prepared_then_committed() {
     }
 }
 
-// Regression: zombie prepared record does not resurrect after drop+retry+restart.
 #[tokio::test]
-async fn aborted_marker_prevents_zombie_prepared() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    std::fs::create_dir_all(&log_dir).unwrap();
-    let before_hash = hash_of("before");
-    let after_hash = hash_of("after");
-
-    // 1) Hand-write ONLY a prepared marker (file is still "before").
-    std::fs::write(root.path().join("f.txt"), "before").unwrap();
-    let prepared = serde_json::json!({
-        "record_kind": "prepared",
-        "operation_id": "op-7",
-        "request_id": "zombie-req",
-        "kind": "edit",
-        "path": "f.txt",
-        "before_hash": before_hash,
-        "expected_after_hash": after_hash,
-        "timestamp_ms": 1,
-    });
-    std::fs::write(&ops_path, format!("{prepared}\n")).unwrap();
-    std::fs::write(
-        log_dir.join("requests.jsonl"),
-        format!(
-            "{}\n",
-            serde_json::json!({"request_id":"zombie-req","status":"inprogress","op":"edit"})
-        ),
-    )
-    .unwrap();
-
-    // 2) First restart: recovery drops op-7 (file == before) and writes Aborted.
-    {
-        let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        // Retry with a NEW request id so we don't replay cleanup.
-        h.send(&req(
-            "new-req",
-            RequestBody::Edit {
-                path: "f.txt".into(),
-                base_hash: before_hash,
-                edits: vec![EditSpec {
-                    old_text: "before".into(),
-                    new_text: "after".into(),
-                    replace_all: false,
-                }],
-            },
-        ));
-        let _ = h.recv().await;
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("f.txt")).unwrap(),
-            "after"
-        );
-        h.shutdown().await;
-    }
-
-    // 3) Second restart: the Aborted marker must supersede the prepared
-    // marker, so op-7 does NOT reappear in history even though the file now
-    // happens to match the expected after_hash (after a legitimate retry).
-    {
-        let mut h = harness_at_with(root.path(), log_dir, None).await;
-        h.send(&req("hist", RequestBody::History { limit: None }));
-        let m = h.recv().await;
-        match m {
-            ServerMessage::Result {
-                result: ResultBody::History { operations },
-                ..
-            } => {
-                // Must be exactly ONE record: the successful retry (op-8 or
-                // similar). op-7 must not have been resurrected.
-                assert_eq!(
-                    operations.len(),
-                    1,
-                    "zombie op-7 had been aborted and must not reappear"
-                );
-                match &operations[0] {
-                    AnyOperationRecord::Fs(fs) => {
-                        assert_ne!(fs.operation_id, "op-7", "op-7 must not resurrect");
-                    }
-                    _ => panic!("expected fs record"),
-                }
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-}
-
-// Regression: exec must not auto-retry when replayed after disconnection.
-#[tokio::test]
-async fn exec_replay_after_disconnect_rejected() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    std::fs::create_dir_all(&log_dir).unwrap();
-    let marker = root.path().join("marker");
-
-    // First: run the exec normally and wait for it, so the side effect is real.
-    {
-        let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        h.send(&req(
-            "exec-1",
-            RequestBody::Exec {
-                argv: platform_script(
-                    "echo x >> marker",
-                    "Add-Content -LiteralPath 'marker' -Value 'x'",
-                ),
-                cwd: None,
-                profile: None,
-                timeout_ms: Some(10000),
-            },
-        ));
-        let _ = h.recv_all_for("exec-1").await;
-        h.shutdown().await;
-    }
-    assert!(
-        std::fs::read_to_string(&marker)
-            .unwrap_or_default()
-            .contains("x"),
-        "first exec must have written to marker"
-    );
-
-    // Now simulate a crash AFTER the exec side effects but BEFORE the server
-    // recorded the terminal result: rewrite the request log to make "exec-1"
-    // look stuck InProgress without a result, so recovery treats it as
-    // an interrupted exec. Also wipe the exec record so the operation log
-    // has nothing for this id.
-    let req_path = log_dir.join("requests.jsonl");
-    let fake_stuck = serde_json::json!({
-        "request_id": "exec-1",
-        "status": "inprogress",
-        "op": "exec",
-    });
-    std::fs::write(&req_path, format!("{fake_stuck}\n")).unwrap();
-    let ops_path = log_dir.join("operations.jsonl");
-    std::fs::write(&ops_path, "").unwrap();
-
-    // Restart: replay "exec-1" must be PERMANENTLY rejected.
-    {
-        let mut h = harness_at_with(root.path(), log_dir, None).await;
-        h.send(&req(
-            "exec-1",
-            RequestBody::Exec {
-                argv: platform_script(
-                    "echo y >> marker",
-                    "Add-Content -LiteralPath 'marker' -Value 'y'",
-                ),
-                cwd: None,
-                profile: None,
-                timeout_ms: Some(10000),
-            },
-        ));
-        let m = h.recv_all_for("exec-1").await;
-        let is_error = m
-            .iter()
-            .any(|msg| matches!(msg, ServerMessage::Error { .. }));
-        assert!(is_error, "exec replay must be rejected, got {m:?}");
-    }
-
-    // Marker must still only have "x" — the replay did NOT execute.
-    let content = std::fs::read_to_string(&marker).unwrap_or_default();
-    assert!(
-        content.contains("x") && !content.contains("y"),
-        "replayed exec must not execute again: {content:?}"
-    );
-}
-
-// Regression: when the committed operation record is on disk but the terminal
-// result was lost in the crash, recovery must reconstruct the result from the
-// committed record rather than clearing the request and allowing replay.
-#[tokio::test]
-async fn recovery_reconstructs_result_from_committed_record() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    let req_path = log_dir.join("requests.jsonl");
-    std::fs::create_dir_all(&log_dir).unwrap();
-
-    let after_hash = hash_of("after");
-
-    // Simulate: a create ran to completion (prepared → rename → committed),
-    // but the terminal result was never written to requests.jsonl.
-    // File is already "after".
-    std::fs::write(root.path().join("f.txt"), "after").unwrap();
-
-    let committed = serde_json::json!({
-        "record_kind": "fs",
-        "operation_id": "op-7",
-        "request_id": "committed-no-result",
-        "kind": "create",
-        "path": "f.txt",
-        "before_hash": null,
-        "after_hash": after_hash,
-        "timestamp_ms": 1,
-    });
-    std::fs::write(&ops_path, format!("{committed}\n")).unwrap();
-
-    // Request is still InProgress — result never written.
-    std::fs::write(
-        &req_path,
-        format!(
-            "{}\n",
-            serde_json::json!({
-                "request_id": "committed-no-result",
-                "status": "inprogress",
-                "op": "create",
-            })
-        ),
-    )
-    .unwrap();
-
-    // Restart: recovery must see the committed op-7 for "committed-no-result",
-    // reconstruct the result, and mark the request Done.
-    let mut h = harness_at_with(root.path(), log_dir, None).await;
-
-    // Replaying the same request_id must return the stored (reconstructed)
-    // result, NOT re-execute.
-    h.send(&req(
-        "committed-no-result",
-        RequestBody::Create {
-            path: "f.txt".into(),
-            content: "should-not-run".into(),
-        },
-    ));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::Mutation(w),
-            ..
-        } => {
-            assert_eq!(w.operation_id, "op-7");
-            assert_eq!(w.new_hash, after_hash, "must return original result");
-        }
-        other => panic!("replay must return reconstructed Done, got {other:?}"),
-    }
-
-    // History must have exactly ONE record, not two (no duplicate execution).
-    h.send(&req("hist", RequestBody::History { limit: None }));
-    let m = h.recv().await;
-    match m {
-        ServerMessage::Result {
-            result: ResultBody::History { operations },
-            ..
-        } => {
-            assert_eq!(operations.len(), 1, "no duplicate operation must exist");
-            assert_eq!(operations[0].operation_id(), "op-7");
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    // File must still be "after", not "should-not-run".
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("f.txt")).unwrap(),
-        "after"
-    );
-}
-
-// Regression: a rejected exec committed on disk must reconstruct as Error
-// (not Exit) so a replayed request_id returns the same wire-level type.
-#[tokio::test]
-async fn rejected_exec_replay_returns_error_not_exit() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    let req_path = log_dir.join("requests.jsonl");
-    std::fs::create_dir_all(&log_dir).unwrap();
-
-    // Hand-write a rejected exec record (it ran, was rejected, consumed op-4).
-    let rejected = serde_json::json!({
-        "record_kind": "exec",
-        "operation_id": "op-4",
-        "request_id": "bad-exec",
-        "argv": ["true"],
-        "disposition": "rejected",
-        "duration_ms": 0,
-        "timestamp_ms": 1,
-        "error": "unknown profile: nope",
-        "error_code": "INVALID_REQUEST",
-        "stdout": {"prefix": "", "suffix": "", "total_bytes": 0, "omitted_bytes": 0},
-        "stderr": {"prefix": "", "suffix": "", "total_bytes": 0, "omitted_bytes": 0},
-    });
-    std::fs::write(&ops_path, format!("{rejected}\n")).unwrap();
-    // Request is still InProgress (terminal result was lost in the crash).
-    std::fs::write(
-        &req_path,
-        format!(
-            "{}\n",
-            serde_json::json!({
-                "request_id": "bad-exec",
-                "status": "inprogress",
-                "op": "exec",
-            })
-        ),
-    )
-    .unwrap();
-
-    let mut h = harness_at_with(root.path(), log_dir, None).await;
-
-    // Replay: must reconstruct as Error, matching the original invocation's
-    // wire-level type. NOT a successful Exit.
-    h.send(&req(
-        "bad-exec",
-        RequestBody::Exec {
-            argv: vec!["true".into()],
-            cwd: None,
-            profile: Some("nope".into()),
-            timeout_ms: Some(10000),
-        },
-    ));
-    let m = h.recv_all_for("bad-exec").await;
-    let is_error = m
+async fn rejected_exec_replay_in_session_returns_error_not_exit() {
+    let mut h = harness().await;
+    let body = RequestBody::Exec {
+        argv: vec!["true".into()],
+        cwd: None,
+        profile: Some("nope".into()),
+        timeout_ms: Some(10000),
+    };
+    h.send(&req("bad-exec", body.clone()));
+    let first = h.recv_all_for("bad-exec").await;
+    assert!(first
         .iter()
-        .any(|msg| matches!(msg, ServerMessage::Error { .. }));
-    let is_exit = m.iter().any(|msg| {
-        matches!(
-            msg,
-            ServerMessage::Result {
-                result: ResultBody::Exec(_),
-                ..
-            }
-        )
-    });
-    assert!(
-        is_error,
-        "rejected exec replay must return Error, got {m:?}"
-    );
-    assert!(
-        !is_exit,
-        "rejected exec replay must NOT return Exit (would violate idempotency)"
-    );
+        .any(|m| matches!(m, ServerMessage::Error { .. })));
+
+    h.send(&req("bad-exec", body));
+    let replay = h.recv_all_for("bad-exec").await;
+    assert!(replay
+        .iter()
+        .any(|m| matches!(m, ServerMessage::Error { .. })));
+    assert!(!replay.iter().any(|m| matches!(
+        m,
+        ServerMessage::Result {
+            result: ResultBody::Exec(_),
+            ..
+        }
+    )));
 }
 
-// Regression: UTF-8 pagination must always make progress when limit > 0 and
-// data remains, even when the first codepoint is multi-byte.
 #[tokio::test]
 async fn utf8_pagination_always_makes_progress() {
     let mut h = harness().await;
-    // "é" is 2 bytes; a 1-byte limit from offset 0 must NOT return an empty
-    // page (which would loop forever if the caller advances by returned bytes).
     h.send(&req(
         "w",
         RequestBody::Create {
@@ -1996,24 +1332,13 @@ async fn utf8_pagination_always_makes_progress() {
     ));
     let _ = h.recv().await;
 
-    h.send(&req(
-        "r1",
-        RequestBody::Read {
-            path: "u.txt".into(),
-            offset: Some(0),
-            limit: Some(1),
-        },
-    ));
+    h.send(&req("r1", read_body("u.txt", Some(0), Some(1))));
     let m = h.recv().await;
     match m {
         ServerMessage::Result {
             result: ResultBody::Read(r),
             ..
         } => {
-            assert!(
-                !r.content.is_empty(),
-                "page must contain at least one codepoint, got empty"
-            );
             assert_eq!(r.content, "é");
         }
         other => panic!("unexpected: {other:?}"),
@@ -2102,15 +1427,12 @@ async fn cross_chunk_utf8_stdout_reassembled() {
     );
 }
 
-// Regression: a corrupted MIDDLE line in operations.jsonl must fail startup,
-// not be silently skipped (which would lose records / enable id reuse).
 #[tokio::test]
-async fn corrupted_middle_log_line_fails_startup() {
+async fn corrupted_middle_log_line_surfaces_io_error_on_history() {
     let root = tempfile::tempdir().unwrap();
     let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    std::fs::create_dir_all(&log_dir).unwrap();
-    // Two valid records with a garbage line between them.
+    let ops_dir = log_dir.join("ops");
+    std::fs::create_dir_all(&ops_dir).unwrap();
     let valid1 = serde_json::json!({
         "record_kind": "fs",
         "operation_id": "op-1",
@@ -2129,79 +1451,35 @@ async fn corrupted_middle_log_line_fails_startup() {
         "after_hash": "sha256:y",
         "timestamp_ms": 2,
     });
-    std::fs::write(&ops_path, format!("{valid1}\nNOT JSON\n{valid2}\n")).unwrap();
-    std::fs::write(log_dir.join("requests.jsonl"), "").unwrap();
-
-    // Server::new must surface an error, not silently start with a partial log.
-    let result = remote_workspace_server::Server::new(remote_workspace_server::ServerOptions {
-        root: root.path().to_path_buf(),
-        state_dir: log_dir,
-        config_path: None,
-        history_limit: None,
-        scratch_max_age: None,
-        idle_timeout: None,
-    });
-    assert!(
-        result.is_err(),
-        "startup must fail on a corrupted middle log line, got {result:?}"
-    );
-    let msg = format!("{}", result.unwrap_err());
-    assert!(
-        msg.contains("corrupted") || msg.contains("not valid JSON"),
-        "error should mention corruption: {msg}"
-    );
-}
-
-// Regression: a corrupted TRAILING line (crash mid-write) is tolerated.
-#[tokio::test]
-async fn corrupted_trailing_log_line_tolerated() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    std::fs::create_dir_all(&log_dir).unwrap();
-    let valid = serde_json::json!({
-        "record_kind": "fs",
-        "operation_id": "op-1",
-        "request_id": "r1",
-        "kind": "create",
-        "path": "a.txt",
-        "after_hash": "sha256:x",
-        "timestamp_ms": 1,
-    });
-    // A truncated trailing record (crash mid-write).
     std::fs::write(
-        &ops_path,
-        format!("{valid}\n{{\"record_kind\":\"fs\",\"operation_id\":\"op-2\",\"req"),
+        ops_dir.join("000000000001-000001-0001.jsonl"),
+        format!("{valid1}\nNOT JSON\n{valid2}\n"),
     )
     .unwrap();
-    std::fs::write(log_dir.join("requests.jsonl"), "").unwrap();
 
-    let server = remote_workspace_server::Server::new(remote_workspace_server::ServerOptions {
-        root: root.path().to_path_buf(),
-        state_dir: log_dir,
-        config_path: None,
-        history_limit: None,
-        scratch_max_age: None,
-        idle_timeout: None,
-    });
-    assert!(
-        server.is_ok(),
-        "trailing truncated line should be tolerated"
-    );
+    // Startup does zero JSONL reads; reading history surfaces the corruption.
+    let mut h = harness_at_with(root.path(), log_dir, None).await;
+    h.send(&req("hist", RequestBody::History { limit: None }));
+    match h.recv().await {
+        ServerMessage::Error { error, .. } => {
+            assert_eq!(error.code, ErrorCode::IoError);
+            assert!(
+                error.message.contains("corrupted") || error.message.contains("not valid JSON"),
+                "unexpected error: {}",
+                error.message
+            );
+        }
+        other => panic!("expected IoError on corrupted middle line, got {other:?}"),
+    }
 }
 
-// Regression: a crash-truncated trailing log line is physically removed on
-// startup. Subsequent writes append cleanly, and the log remains valid across
-// restarts — the truncation must not be a one-time pass but a durable fix.
 #[tokio::test]
-async fn truncated_log_fixed_then_append_then_restart() {
+async fn crash_truncated_and_mid_utf8_trailing_shard_lines_tolerated() {
     let root = tempfile::tempdir().unwrap();
     let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    let req_path = log_dir.join("requests.jsonl");
-    std::fs::create_dir_all(&log_dir).unwrap();
+    let ops_dir = log_dir.join("ops");
+    std::fs::create_dir_all(&ops_dir).unwrap();
 
-    // Write a valid op-1 and a crash-truncated op-2 (NO trailing newline).
     let valid1 = serde_json::json!({
         "record_kind": "fs",
         "operation_id": "op-1",
@@ -2211,50 +1489,30 @@ async fn truncated_log_fixed_then_append_then_restart() {
         "after_hash": "sha256:x",
         "timestamp_ms": 1,
     });
-    // Truncated: no closing brace, no newline.
     std::fs::write(
-        &ops_path,
+        ops_dir.join("000000000001-000001-0001.jsonl"),
         format!("{valid1}\n{{\"record_kind\":\"fs\",\"operation_id\":\"op-2\",\"re"),
     )
     .unwrap();
-    std::fs::write(&req_path, "").unwrap();
 
-    // First startup: must succeed (truncation tolerated).
-    {
-        let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        // Do a normal write — this appends to the log. If the truncated bytes
-        // were still in the file, the append would concatenate onto them.
-        h.send(&req(
-            "new",
-            RequestBody::Create {
-                path: "f.txt".into(),
-                content: "hi".into(),
-            },
-        ));
-        let _ = h.recv().await;
-        h.shutdown().await;
-    }
+    let valid2 = r#"{"record_kind":"fs","operation_id":"op-3","request_id":"r3","kind":"create","path":"b.txt","after_hash":"sha256:y","timestamp_ms":2}"#;
+    let mut raw = valid2.as_bytes().to_vec();
+    raw.push(b'\n');
+    raw.extend_from_slice(&[0xE6]);
+    std::fs::write(ops_dir.join("000000000002-000001-0002.jsonl"), &raw).unwrap();
 
-    // Second startup: must succeed again. If the previous append was poisoned
-    // by concatenating onto the truncated bytes, startup fails here.
-    {
-        let mut h = harness_at_with(root.path(), log_dir, None).await;
-        h.send(&req("hist", RequestBody::History { limit: None }));
-        let m = h.recv().await;
-        match m {
-            ServerMessage::Result {
-                result: ResultBody::History { operations },
-                ..
-            } => {
-                // Must see op-1 plus the new write (at least 2 records).
-                assert!(
-                    operations.len() >= 2,
-                    "log must be writable and readable after trunc + append, got {} records",
-                    operations.len()
-                );
-            }
-            other => panic!("unexpected: {other:?}"),
+    let mut h = harness_at_with(root.path(), log_dir, None).await;
+    h.send(&req("hist", RequestBody::History { limit: None }));
+    match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::History { operations },
+            ..
+        } => {
+            assert_eq!(operations.len(), 2);
+            assert_eq!(operations[0].operation_id(), "op-1");
+            assert_eq!(operations[1].operation_id(), "op-3");
         }
+        other => panic!("unexpected: {other:?}"),
     }
 }
 
@@ -2332,218 +1590,10 @@ async fn invalid_utf8_byte_emitted_as_replacement() {
     );
 }
 
-// Regression: a complete, valid JSON record without a trailing newline
-// (crash between write(record) and write(\n)) must be PRESERVED, not deleted.
-// The server should append the missing newline and keep the record intact.
 #[tokio::test]
-async fn valid_record_without_trailing_newline_survives_restart() {
+async fn legacy_operations_jsonl_and_prepared_markers_merge_and_compact_on_gc() {
     let root = tempfile::tempdir().unwrap();
     let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    let req_path = log_dir.join("requests.jsonl");
-    std::fs::create_dir_all(&log_dir).unwrap();
-
-    // A complete, well-formed JSON record but WITHOUT the trailing \n.
-    let valid = serde_json::json!({
-        "record_kind": "fs",
-        "operation_id": "op-7",
-        "request_id": "r7",
-        "kind": "create",
-        "path": "x.txt",
-        "after_hash": "sha256:abc",
-        "timestamp_ms": 1,
-    });
-    let line = serde_json::to_string(&valid).unwrap();
-    // NO trailing newline: simulate a crash between the write of the JSON
-    // and the write of the newline.
-    std::fs::write(&ops_path, &line).unwrap();
-    std::fs::write(&req_path, "").unwrap();
-
-    // First startup: must see op-7 in history.
-    {
-        let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        h.send(&req("hist", RequestBody::History { limit: None }));
-        let m = h.recv().await;
-        match m {
-            ServerMessage::Result {
-                result: ResultBody::History { operations },
-                ..
-            } => {
-                assert_eq!(
-                    operations.len(),
-                    1,
-                    "valid record without newline must be preserved"
-                );
-                assert_eq!(operations[0].operation_id(), "op-7");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        h.shutdown().await;
-    }
-
-    // The file must now have a trailing newline appended (the repair step).
-    let after = std::fs::read_to_string(&ops_path).unwrap();
-    assert!(after.ends_with('\n'), "repair must add trailing newline");
-
-    // Second startup: history must still see op-7 (no truncation).
-    {
-        let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        h.send(&req("hist", RequestBody::History { limit: None }));
-        let m = h.recv().await;
-        match m {
-            ServerMessage::Result {
-                result: ResultBody::History { operations },
-                ..
-            } => {
-                assert_eq!(operations.len(), 1, "op-7 must survive second restart");
-                assert_eq!(operations[0].operation_id(), "op-7");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        h.shutdown().await;
-    }
-
-    // And a new write must cleanly append (not concatenate).
-    {
-        let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        h.send(&req(
-            "w",
-            RequestBody::Create {
-                path: "y.txt".into(),
-                content: "z".into(),
-            },
-        ));
-        let _ = h.recv().await;
-        h.shutdown().await;
-    }
-    // Third restart: must still work.
-    {
-        let _h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        // If we got here without error, the log is clean.
-    }
-}
-
-#[tokio::test]
-async fn crash_truncated_partial_record_still_removed() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    let req_path = log_dir.join("requests.jsonl");
-    std::fs::create_dir_all(&log_dir).unwrap();
-
-    let valid1 = serde_json::json!({
-        "record_kind": "fs",
-        "operation_id": "op-1",
-        "request_id": "r1",
-        "kind": "create",
-        "path": "a.txt",
-        "after_hash": "sha256:x",
-        "timestamp_ms": 1,
-    });
-    // Clearly truncated: partial, invalid JSON, no newline.
-    std::fs::write(
-        &ops_path,
-        format!("{valid1}\n{{\"record_kind\":\"fs\",\"operation_id\":\"op-2\",\"re"),
-    )
-    .unwrap();
-    std::fs::write(&req_path, "").unwrap();
-
-    {
-        let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        // Do a create. If truncation did NOT happen, this append would poison the log.
-        h.send(&req(
-            "w",
-            RequestBody::Create {
-                path: "f.txt".into(),
-                content: "hi".into(),
-            },
-        ));
-        let _ = h.recv().await;
-        h.shutdown().await;
-    }
-    // Restart must succeed, and history must contain exactly 2 records:
-    // op-1 (from the original log) and the new write. The truncated op-2
-    // must not have survived as a phantom record.
-    {
-        let mut h = harness_at_with(root.path(), log_dir, None).await;
-        h.send(&req("hist", RequestBody::History { limit: None }));
-        let m = h.recv().await;
-        match m {
-            ServerMessage::Result {
-                result: ResultBody::History { operations },
-                ..
-            } => {
-                assert_eq!(operations.len(), 2, "must be exactly op-1 + new write");
-                // The first must be op-1 (from the original log).
-                assert_eq!(operations[0].operation_id(), "op-1");
-                // The second is the freshly written record (which may reuse
-                // op-2, since the truncated line never consumed that id).
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-}
-
-// Regression: a crash that truncates the log file mid-codepoint of a multi-byte
-// UTF-8 character must be recoverable. The raw bytes should be treated as a
-// crash-truncated trailing record and physically removed, not crash the parser.
-#[tokio::test]
-async fn crash_mid_utf8_codepoint_tail_recovered() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    std::fs::create_dir_all(&log_dir).unwrap();
-
-    let valid1 = r#"{"record_kind":"fs","operation_id":"op-1","request_id":"r1","kind":"create","path":"a.txt","after_hash":"sha256:x","timestamp_ms":1}"#;
-    let mut raw = valid1.as_bytes().to_vec();
-    raw.push(b'\n');
-    raw.extend_from_slice(&[0xE6]); // partial byte of multi-byte character
-    std::fs::write(&ops_path, &raw).unwrap();
-    std::fs::write(log_dir.join("requests.jsonl"), "").unwrap();
-
-    // Server::new must NOT panic or error — the trailing byte is treated as
-    // crash-truncated and the file is repaired to valid JSONL.
-    let server = remote_workspace_server::Server::new(remote_workspace_server::ServerOptions {
-        root: root.path().to_path_buf(),
-        state_dir: log_dir.clone(),
-        config_path: None,
-        history_limit: None,
-        scratch_max_age: None,
-        idle_timeout: None,
-    });
-    assert!(
-        server.is_ok(),
-        "server must start despite mid-UTF8 crash tail: {:?}",
-        server.err()
-    );
-
-    // The file must now be clean UTF-8 and end with a newline.
-    let after = std::fs::read_to_string(&ops_path).unwrap();
-    assert!(
-        after.ends_with('\n'),
-        "repaired file must end with newline, got: {after:?}"
-    );
-    assert!(
-        after.contains("op-1"),
-        "op-1 must still be present in the log"
-    );
-    // The trailing 0xE6 must be gone.
-    let bytes = std::fs::read(&ops_path).unwrap();
-    assert!(
-        !bytes.contains(&0xE6),
-        "truncated 0xE6 byte must have been removed"
-    );
-}
-
-// A committed record following a prepared one for the same operation_id
-// collapses to a single entry, so the three-line log below reconciles to two
-// operations: op-1 and the committed op-2.
-#[tokio::test]
-async fn prepared_and_committed_same_id_reconcile_to_one() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    let ops_path = log_dir.join("operations.jsonl");
-    let req_path = log_dir.join("requests.jsonl");
     std::fs::create_dir_all(&log_dir).unwrap();
 
     let op1 = r#"{"record_kind":"fs","operation_id":"op-1","request_id":"r1","kind":"create","path":"a.txt","after_hash":"sha256:x","timestamp_ms":1}"#;
@@ -2565,120 +1615,78 @@ async fn prepared_and_committed_same_id_reconcile_to_one() {
         "after_hash": "sha256:8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
         "timestamp_ms": 3,
     });
-    std::fs::write(&ops_path, format!("{op1}\n{prepared}\n{committed}\n")).unwrap();
-    std::fs::write(&req_path, "").unwrap();
+    let aborted = serde_json::json!({
+        "record_kind": "aborted",
+        "operation_id": "op-99",
+        "timestamp_ms": 4,
+    });
+    // Include no trailing newline on the last line to verify legacy tail tolerance.
+    std::fs::write(
+        log_dir.join("operations.jsonl"),
+        format!("{op1}\n{prepared}\n{committed}\n{aborted}"),
+    )
+    .unwrap();
 
-    let mut h = harness_at_with(root.path(), log_dir, None).await;
+    let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
+    h.send(&req(
+        "new-w",
+        RequestBody::Create {
+            path: "b.txt".into(),
+            content: "hello".into(),
+        },
+    ));
+    let new_op = match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::Mutation(m),
+            ..
+        } => m.operation_id,
+        other => panic!("unexpected: {other:?}"),
+    };
+
     h.send(&req("hist", RequestBody::History { limit: None }));
-    let m = h.recv().await;
-    match m {
+    match h.recv().await {
         ServerMessage::Result {
             result: ResultBody::History { operations },
             ..
         } => {
-            assert_eq!(
-                operations.len(),
-                2,
-                "must reconcile to 2 records (op-1 and committed op-2)"
-            );
+            assert_eq!(operations.len(), 3);
             assert_eq!(operations[0].operation_id(), "op-1");
             assert_eq!(operations[1].operation_id(), "op-2");
+            assert_eq!(operations[2].operation_id(), new_op);
         }
         other => panic!("unexpected: {other:?}"),
     }
-}
 
-// Gc drops old operations and stale request entries, and pruned ids are never
-// resolvable again.
-#[tokio::test]
-async fn gc_prunes_operations_and_requests() {
-    let root = tempfile::tempdir().unwrap();
-    let log_dir = root.path().join(".remote-workspace");
-    std::fs::create_dir_all(&log_dir).unwrap();
-    {
-        let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        h.send(&req(
-            "w0",
-            RequestBody::Create {
-                path: "f.txt".into(),
-                content: "v1".into(),
-            },
-        ));
-        let _ = h.recv().await;
-        for (rid, old_c, new_c) in [("w1", "v1", "v2"), ("w2", "v2", "v3")] {
-            h.send(&req(
-                rid,
-                RequestBody::Edit {
-                    path: "f.txt".into(),
-                    base_hash: hash_of(old_c),
-                    edits: vec![EditSpec {
-                        old_text: old_c.into(),
-                        new_text: new_c.into(),
-                        replace_all: false,
-                    }],
-                },
-            ));
-            let _ = h.recv().await;
+    // Gc compacts legacy operations.jsonl into ops/ while keeping h's live shard untouched.
+    h.send(&req("gc", RequestBody::Gc { keep: Some(2) }));
+    match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::Gc(g),
+            ..
+        } => {
+            assert_eq!(g.removed_operations, 1);
+            assert_eq!(g.retained_operations, 2);
         }
-        h.send(&req("gc", RequestBody::Gc { keep: Some(1) }));
-        match h.recv().await {
-            ServerMessage::Result {
-                result: ResultBody::Gc(g),
-                ..
-            } => {
-                assert_eq!(g.removed_operations, 2);
-                assert_eq!(g.retained_operations, 1);
-                assert_eq!(g.removed_requests, 2, "w0 and w1 must be dropped");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        // A pruned operation is gone for good, not resolvable to a new one.
-        h.send(&req(
-            "op2",
-            RequestBody::OperationGet {
-                operation_id: "op-2".into(),
-            },
-        ));
-        match h.recv().await {
-            ServerMessage::Error { error, .. } => {
-                assert_eq!(error.code, ErrorCode::OperationNotFound)
-            }
-            other => panic!("pruned op must not resolve: {other:?}"),
-        }
-        h.shutdown().await;
+        other => panic!("unexpected: {other:?}"),
     }
-    // Restart: pruned state loads, and ids continue past the pruned range
-    // (no reuse of op-1/op-2 even though they left the log).
-    {
-        let mut h = harness_at_with(root.path(), log_dir, None).await;
-        h.send(&req(
-            "w-after",
-            RequestBody::Edit {
-                path: "f.txt".into(),
-                base_hash: hash_of("v3"),
-                edits: vec![EditSpec {
-                    old_text: "v3".into(),
-                    new_text: "v4".into(),
-                    replace_all: false,
-                }],
-            },
-        ));
-        match h.recv().await {
-            ServerMessage::Result {
-                result: ResultBody::Mutation(w),
-                ..
-            } => assert_eq!(w.operation_id, "op-4"),
-            other => panic!("unexpected: {other:?}"),
-        }
+    assert!(!log_dir.join("operations.jsonl").exists());
+
+    h.send(&req(
+        "gone",
+        RequestBody::OperationGet {
+            operation_id: "op-1".into(),
+        },
+    ));
+    match h.recv().await {
+        ServerMessage::Error { error, .. } => assert_eq!(error.code, ErrorCode::OperationNotFound),
+        other => panic!("pruned op-1 must be gone: {other:?}"),
     }
 }
 
-// Startup prune honors ServerOptions::history_limit.
 #[tokio::test]
-async fn startup_prune_respects_history_limit() {
+async fn gc_uses_configured_history_limit_without_startup_prune() {
     let root = tempfile::tempdir().unwrap();
     let log_dir = root.path().join(".remote-workspace");
-    std::fs::create_dir_all(&log_dir).unwrap();
     {
         let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
         h.send(&req(
@@ -2692,20 +1700,22 @@ async fn startup_prune_respects_history_limit() {
         for (rid, old_c, new_c) in [("w1", "v0", "v1"), ("w2", "v1", "v2")] {
             h.send(&req(
                 rid,
-                RequestBody::Edit {
-                    path: "f.txt".into(),
-                    base_hash: hash_of(old_c),
-                    edits: vec![EditSpec {
+                edit_body(
+                    "f.txt",
+                    hash_of(old_c),
+                    vec![EditSpec {
                         old_text: old_c.into(),
                         new_text: new_c.into(),
                         replace_all: false,
                     }],
-                },
+                ),
             ));
             let _ = h.recv().await;
         }
         h.shutdown().await;
     }
+
+    // Startup with <= 64 shards does 0 history I/O (all 3 remain until gc).
     let server = Server::new(ServerOptions {
         root: root.path().to_path_buf(),
         state_dir: log_dir,
@@ -2715,9 +1725,30 @@ async fn startup_prune_respects_history_limit() {
         idle_timeout: None,
     })
     .unwrap();
-    let ops = server.store.history(None);
-    assert_eq!(ops.len(), 1, "startup prune must keep only the newest op");
-    assert_eq!(ops[0].operation_id(), "op-3");
+    assert_eq!(server.store.history(None).unwrap().len(), 3);
+
+    let (mut cw, sr) = tokio::io::duplex(1 << 16);
+    let (sw, cr) = tokio::io::duplex(1 << 16);
+    let task = tokio::spawn(server.run(sr, sw));
+    let mut line = serde_json::to_string(&req("gc", RequestBody::Gc { keep: None })).unwrap();
+    line.push('\n');
+    cw.write_all(line.as_bytes()).await.unwrap();
+    drop(cw);
+
+    let mut reader = BufReader::new(cr).lines();
+    let reply: ServerMessage =
+        serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
+    match reply {
+        ServerMessage::Result {
+            result: ResultBody::Gc(g),
+            ..
+        } => {
+            assert_eq!(g.removed_operations, 2);
+            assert_eq!(g.retained_operations, 1);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    task.await.unwrap().unwrap();
 }
 
 // Gc with no explicit keep and no server-side limit is an explicit error.
@@ -2750,17 +1781,18 @@ async fn delete_roundtrip_and_errors() {
             path: "d.txt".into(),
         },
     ));
-    match h.recv().await {
+    let del_op = match h.recv().await {
         ServerMessage::Result {
             result: ResultBody::Mutation(w),
             ..
         } => {
-            assert_eq!(w.operation_id, "op-2");
+            assert!(w.operation_id.starts_with("op-"));
             assert_eq!(w.old_hash, Some(hash_of("keep me")));
             assert_eq!(w.new_hash, "sha256:");
+            w.operation_id
         }
         other => panic!("unexpected: {other:?}"),
-    }
+    };
     assert!(!h.root_path.join("d.txt").exists());
 
     // Deleting a directory is IsADirectory, not NotFound.
@@ -2796,7 +1828,7 @@ async fn delete_roundtrip_and_errors() {
         } => {
             let has_delete = operations.iter().any(|r| {
                 matches!(r, AnyOperationRecord::Fs(f)
-                    if f.operation_id == "op-2" && matches!(f.kind, OperationKind::Delete))
+                    if f.operation_id == del_op && matches!(f.kind, OperationKind::Delete))
             });
             assert!(has_delete, "delete must appear in history: {operations:?}");
         }
@@ -3032,17 +2064,18 @@ async fn server_startup_rejects_config_with_unknown_fields() {
     }
 }
 
-// A state directory written before undo was removed must still load: its log
-// carries `kind: "undo"` records, and its blobs directory is dead weight the
-// server reclaims on first start.
 #[tokio::test]
-async fn legacy_undo_state_still_loads_and_sheds_its_blobs() {
+async fn legacy_undo_state_still_loads_and_gc_reclaims_legacy_files() {
     let root = tempfile::tempdir().unwrap();
     let log_dir = root.path().join(".remote-workspace");
     let blobs_dir = log_dir.join("blobs");
     std::fs::create_dir_all(&blobs_dir).unwrap();
     std::fs::write(root.path().join("f.txt"), "restored\n").unwrap();
     std::fs::write(blobs_dir.join("op-1.before"), "restored\n").unwrap();
+    std::fs::write(log_dir.join("requests.jsonl"), "legacy\n").unwrap();
+    std::fs::write(log_dir.join("op-counter"), "2\n").unwrap();
+    std::fs::write(log_dir.join("lock"), "1234\n").unwrap();
+    std::fs::write(log_dir.join("pending_uploads.json"), "{}\n").unwrap();
 
     let undo_record = serde_json::json!({
         "record_kind": "fs",
@@ -3055,20 +2088,6 @@ async fn legacy_undo_state_still_loads_and_sheds_its_blobs() {
         "timestamp_ms": 1,
     });
     std::fs::write(log_dir.join("operations.jsonl"), format!("{undo_record}\n")).unwrap();
-    // A stored terminal result of the removed operation must still deserialize.
-    let old_result = serde_json::json!({
-        "request_id": "old-undo",
-        "status": "done",
-        "result_done": {
-            "request_id": "old-undo",
-            "type": "undo",
-            "operation_id": "op-2",
-            "restored_hash": hash_of("restored\n"),
-            "new_hash": hash_of("restored\n"),
-        },
-        "op": "undo",
-    });
-    std::fs::write(log_dir.join("requests.jsonl"), format!("{old_result}\n")).unwrap();
 
     let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
     h.send(&req("hist", RequestBody::History { limit: None }));
@@ -3082,23 +2101,23 @@ async fn legacy_undo_state_still_loads_and_sheds_its_blobs() {
         }
         other => panic!("legacy undo record must load: {other:?}"),
     }
-    assert!(!blobs_dir.exists(), "legacy blobs must be reclaimed");
 
-    // New mutations continue past the legacy id.
-    h.send(&req(
-        "w",
-        RequestBody::Create {
-            path: "new.txt".into(),
-            content: "x".into(),
-        },
-    ));
+    h.send(&req("gc", RequestBody::Gc { keep: Some(10) }));
     match h.recv().await {
         ServerMessage::Result {
-            result: ResultBody::Mutation(w),
+            result: ResultBody::Gc(g),
             ..
-        } => assert_eq!(w.operation_id, "op-3"),
+        } => {
+            assert_eq!(g.retained_operations, 1);
+        }
         other => panic!("unexpected: {other:?}"),
     }
+    assert!(!blobs_dir.exists(), "legacy blobs must be reclaimed");
+    assert!(!log_dir.join("requests.jsonl").exists());
+    assert!(!log_dir.join("op-counter").exists());
+    assert!(!log_dir.join("lock").exists());
+    assert!(!log_dir.join("pending_uploads.json").exists());
+    assert!(!log_dir.join("operations.jsonl").exists());
 }
 
 // ---- idle timeout ----
@@ -3296,13 +2315,13 @@ async fn stdin_eof_is_recorded_as_its_own_exit_reason() {
     assert_eq!(exit["reason"], "stdin_eof");
 }
 
-// A refused start is the moment a workspace looks occupied, so it has to leave
-// a trace on the remote naming who held the lock.
 #[tokio::test]
-async fn a_refused_start_is_recorded_with_the_holder() {
+async fn multi_session_servers_share_root_and_state_dir_concurrently() {
     let root = tempfile::tempdir().unwrap();
     let state_dir = root.path().join(".remote-workspace");
-    let holder = Server::new(ServerOptions {
+
+    // Zero startup writes to ops/ or pending_uploads/.
+    let s0 = Server::new(ServerOptions {
         root: root.path().to_path_buf(),
         state_dir: state_dir.clone(),
         config_path: None,
@@ -3311,30 +2330,125 @@ async fn a_refused_start_is_recorded_with_the_holder() {
         idle_timeout: None,
     })
     .unwrap();
+    assert!(!state_dir.join("ops").exists());
+    assert!(!state_dir.join("pending_uploads").exists());
+    assert!(!state_dir.join("lock").exists());
+    drop(s0);
 
-    let refused = Server::new(ServerOptions {
-        root: root.path().to_path_buf(),
-        state_dir: state_dir.clone(),
-        config_path: None,
-        history_limit: None,
-        scratch_max_age: None,
-        idle_timeout: None,
-    });
-    let message = refused
-        .expect_err("second server must be refused")
-        .to_string();
-    assert!(message.contains("locked"), "unexpected error: {message}");
+    // Two live servers running simultaneously on the exact same root + state_dir.
+    let mut h1 = harness_at_with(root.path(), state_dir.clone(), None).await;
+    let mut h2 = harness_at_with(root.path(), state_dir.clone(), None).await;
 
-    let denied = session_events(&state_dir)
-        .into_iter()
-        .find(|e| e["event"] == "lock_denied")
-        .expect("refusal must be recorded");
+    h1.send(&req(
+        "c1",
+        RequestBody::Create {
+            path: "shared.txt".into(),
+            content: "v1\n".into(),
+        },
+    ));
+    let base_hash = match h1.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::Mutation(m),
+            ..
+        } => m.new_hash,
+        other => panic!("h1 create failed: {other:?}"),
+    };
+
+    h2.send(&req(
+        "c2",
+        RequestBody::Create {
+            path: "peer.txt".into(),
+            content: "from-h2\n".into(),
+        },
+    ));
+    assert!(matches!(h2.recv().await, ServerMessage::Result { .. }));
+
+    // Concurrent exec on h2 while h1 reads history.
+    h2.send(&req(
+        "e2",
+        RequestBody::Exec {
+            argv: platform_script("printf ok", "[Console]::Out.Write('ok')"),
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(10_000),
+        },
+    ));
+    let exec_msgs = h2.recv_all_for("e2").await;
+    assert!(matches!(
+        &exec_msgs[0],
+        ServerMessage::Result {
+            result: ResultBody::Exec(_),
+            ..
+        }
+    ));
+
+    // Both servers see all 3 operations across both live shards.
+    h1.send(&req("hist1", RequestBody::History { limit: None }));
+    match h1.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::History { operations },
+            ..
+        } => assert_eq!(operations.len(), 3),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // Concurrent conflicting edits on shared.txt with the same base_hash:
+    // exactly one succeeds and the other returns STALE_FILE.
+    h1.send(&req(
+        "race1",
+        RequestBody::Edit {
+            path: "shared.txt".into(),
+            base_hash: base_hash.clone(),
+            edits: Vec::new(),
+            replace_content: Some("from-h1\n".into()),
+        },
+    ));
+    h2.send(&req(
+        "race2",
+        RequestBody::Edit {
+            path: "shared.txt".into(),
+            base_hash: base_hash.clone(),
+            edits: Vec::new(),
+            replace_content: Some("from-h2-conflict\n".into()),
+        },
+    ));
+    let r1 = h1.recv().await;
+    let r2 = h2.recv().await;
+    let mut ok_count = 0;
+    let mut stale_count = 0;
+    for msg in [r1, r2] {
+        match msg {
+            ServerMessage::Result {
+                result: ResultBody::Mutation(_),
+                ..
+            } => ok_count += 1,
+            ServerMessage::Error { error, .. } if error.code == ErrorCode::StaleFile => {
+                stale_count += 1;
+            }
+            other => panic!("unexpected race outcome: {other:?}"),
+        }
+    }
+    assert_eq!(ok_count, 1, "exactly one conflicting edit must win");
     assert_eq!(
-        denied["holder_pid"].as_str().unwrap(),
-        std::process::id().to_string(),
-        "the recorded holder must be the process actually holding the lock"
+        stale_count, 1,
+        "losing conflicting edit must get STALE_FILE"
     );
-    drop(holder);
+
+    // Gc on h1 while h2 is still live must NOT delete h2's live shard.
+    h1.send(&req("gc1", RequestBody::Gc { keep: Some(10) }));
+    assert!(matches!(
+        h1.recv().await,
+        ServerMessage::Result {
+            result: ResultBody::Gc(GcResult {
+                retained_operations: 4,
+                ..
+            }),
+            ..
+        }
+    ));
+
+    h1.shutdown().await;
+    h2.shutdown().await;
 }
 
 // A client closing its end of the pipe does not mean it stopped listening --
@@ -3619,15 +2733,7 @@ async fn a_request_split_across_idle_expiries_is_not_truncated() {
     writer.write_all(busy.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
 
-    let line = serde_json::to_string(&req(
-        "split",
-        RequestBody::Read {
-            path: "f.txt".into(),
-            offset: None,
-            limit: None,
-        },
-    ))
-    .unwrap();
+    let line = serde_json::to_string(&req("split", read_body("f.txt", None, None))).unwrap();
     let (head, tail) = line.split_at(line.len() / 2);
     writer.write_all(head.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
@@ -3788,5 +2894,148 @@ async fn a_request_line_that_is_not_utf8_is_refused_without_stopping_the_server(
     assert!(
         matches!(&second, ServerMessage::Result { request_id, .. } if request_id == "good"),
         "{second:?}"
+    );
+}
+
+#[tokio::test]
+async fn server_info_reports_metadata_sorted_profiles_and_unknown_profile_hint() {
+    let cfg = r#"
+default_profile = "gpu"
+
+[profiles.zeta]
+setup = ""
+
+[profiles.alpha]
+setup = ""
+
+[profiles.gpu]
+setup = ""
+"#;
+    let mut h = harness_with_config(Some(cfg)).await;
+    h.send(&req("info", RequestBody::ServerInfo {}));
+    match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::ServerInfo(info),
+            ..
+        } => {
+            assert_eq!(info.protocol_version, PROTOCOL_VERSION);
+            assert_eq!(info.software_version, env!("CARGO_PKG_VERSION"));
+            assert_eq!(
+                info.platform,
+                format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+            );
+            assert_eq!(info.default_profile.as_deref(), Some("gpu"));
+            assert_eq!(info.profiles, vec!["alpha", "gpu", "zeta"]);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    h.send(&req(
+        "bad-prof",
+        RequestBody::Exec {
+            argv: vec!["true".into()],
+            cwd: None,
+            profile: Some("missing".into()),
+            timeout_ms: Some(10_000),
+        },
+    ));
+    match h.recv().await {
+        ServerMessage::Error { error, .. } => {
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "unknown profile 'missing'; available profiles: alpha, gpu, zeta (default: gpu)"
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn wire_read_line_tail_and_edit_replace_content() {
+    let mut h = harness().await;
+    h.send(&req(
+        "c",
+        RequestBody::Create {
+            path: "notes.txt".into(),
+            content: "one\ntwo\nthree\nfour\n".into(),
+        },
+    ));
+    let h1 = match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::Mutation(m),
+            ..
+        } => m.new_hash,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    // Line mode via wire.
+    h.send(&req(
+        "rl",
+        ReadOptions {
+            start_line: Some(2),
+            max_lines: Some(2),
+            ..Default::default()
+        }
+        .into_request_body("notes.txt".into()),
+    ));
+    match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::Read(r),
+            ..
+        } => {
+            assert_eq!(r.content, "two\nthree\n");
+            assert_eq!(r.start_line, Some(2));
+            assert_eq!(r.end_line, Some(3));
+            assert_eq!(r.total_lines, Some(4));
+            assert_eq!(r.next_line, Some(4));
+            assert!(r.truncated);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // Tail mode via wire.
+    h.send(&req(
+        "rt",
+        ReadOptions {
+            tail_lines: Some(2),
+            ..Default::default()
+        }
+        .into_request_body("notes.txt".into()),
+    ));
+    match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::Read(r),
+            ..
+        } => {
+            assert_eq!(r.content, "three\nfour\n");
+            assert!(r.truncated);
+            assert_eq!(r.next_offset, None);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // Whole-file replace_content via wire.
+    h.send(&req(
+        "rep",
+        RequestBody::Edit {
+            path: "notes.txt".into(),
+            base_hash: h1,
+            edits: Vec::new(),
+            replace_content: Some("brand new\n".into()),
+        },
+    ));
+    match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::Mutation(m),
+            ..
+        } => {
+            assert_eq!(m.new_hash, hash_of("brand new\n"));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(h.root_path.join("notes.txt")).unwrap(),
+        "brand new\n"
     );
 }

@@ -1,14 +1,11 @@
 use std::process::Stdio;
 use std::sync::Arc;
 
-// EditSpec is re-exported: callers build an `edit` without having to depend on
-// the protocol crate directly.
-pub use remote_workspace_protocol::EditSpec;
+pub use remote_workspace_protocol::{EditSpec, ReadOptions, ServerInfoResult};
 
 use remote_workspace_protocol::{
     ErrorCode, ExecResult, FileEntry, ListResult, MutationResult, OperationDetails, ProtocolError,
-    ReadResult, Request, RequestBody, RequestId, RequestStatusResult, ServerMessage, WaitResult,
-    WAIT_CHECK_TIMEOUT_MS,
+    ReadResult, Request, RequestBody, RequestId, ServerMessage, WaitResult, WAIT_CHECK_TIMEOUT_MS,
 };
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -420,17 +417,30 @@ impl Client {
         self.send(body, timeout, true).await
     }
 
-    /// A round trip that shows the connection works. It is left out of the
-    /// client log, whose counts are of the calls the agent made.
-    pub async fn probe(&self) -> Result<(), ClientError> {
+    /// Unlogged health and metadata round-trip; omitted from the client log so
+    /// connection setup does not inflate agent tool-call counts.
+    pub async fn probe(&self) -> Result<ServerInfoResult, ClientError> {
         let (_, msg) = self
-            .send(
-                RequestBody::Stat { path: ".".into() },
-                DEFAULT_REQUEST_TIMEOUT,
-                false,
-            )
+            .send(RequestBody::ServerInfo {}, DEFAULT_REQUEST_TIMEOUT, false)
             .await?;
-        Self::unpack(msg).map(|_| ())
+        match Self::unpack(msg)? {
+            remote_workspace_protocol::ResultBody::ServerInfo(info) => Ok(info),
+            _ => Err(ClientError::Server(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "unexpected result body for server_info",
+            ))),
+        }
+    }
+
+    pub async fn server_info(&self) -> Result<ServerInfoResult, ClientError> {
+        let (_, msg) = self.send_request(RequestBody::ServerInfo {}).await?;
+        match Self::unpack(msg)? {
+            remote_workspace_protocol::ResultBody::ServerInfo(info) => Ok(info),
+            _ => Err(ClientError::Server(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "unexpected result body for server_info",
+            ))),
+        }
     }
 
     async fn send(
@@ -570,12 +580,24 @@ impl Client {
         offset: Option<u64>,
         limit: Option<u64>,
     ) -> Result<ReadResult, ClientError> {
-        let (_, msg) = self
-            .send_request(RequestBody::Read {
-                path: path.into(),
+        self.read_with(
+            path,
+            ReadOptions {
                 offset,
                 limit,
-            })
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn read_with(
+        &self,
+        path: &str,
+        opts: ReadOptions,
+    ) -> Result<ReadResult, ClientError> {
+        let (_, msg) = self
+            .send_request(opts.into_request_body(path.into()))
             .await?;
         match Self::unpack(msg)? {
             remote_workspace_protocol::ResultBody::Read(r) => Ok(r),
@@ -603,21 +625,38 @@ impl Client {
         }
     }
 
-    /// Apply exact text replacements to an existing file, in order, each to
-    /// the result of the one before it. `base_hash` is required for optimistic
-    /// concurrency and pins the content the first replacement is stated
-    /// against.
     pub async fn edit(
         &self,
         path: &str,
         base_hash: &str,
         edits: Vec<EditSpec>,
     ) -> Result<MutationResult, ClientError> {
+        self.edit_with(path, base_hash, edits, None).await
+    }
+
+    pub async fn replace(
+        &self,
+        path: &str,
+        base_hash: &str,
+        content: &str,
+    ) -> Result<MutationResult, ClientError> {
+        self.edit_with(path, base_hash, Vec::new(), Some(content.into()))
+            .await
+    }
+
+    pub async fn edit_with(
+        &self,
+        path: &str,
+        base_hash: &str,
+        edits: Vec<EditSpec>,
+        replace_content: Option<String>,
+    ) -> Result<MutationResult, ClientError> {
         let (_, msg) = self
             .send_request(RequestBody::Edit {
                 path: path.into(),
                 base_hash: base_hash.into(),
                 edits,
+                replace_content,
             })
             .await?;
         match Self::unpack(msg)? {
@@ -831,21 +870,6 @@ impl Client {
             _ => Err(ClientError::Server(ProtocolError::new(
                 ErrorCode::InvalidRequest,
                 "unexpected result body for gc",
-            ))),
-        }
-    }
-
-    pub async fn request_status(&self, target: &str) -> Result<RequestStatusResult, ClientError> {
-        let (_, msg) = self
-            .send_request(RequestBody::RequestStatus {
-                target: target.into(),
-            })
-            .await?;
-        match Self::unpack(msg)? {
-            remote_workspace_protocol::ResultBody::RequestStatus(r) => Ok(r),
-            _ => Err(ClientError::Server(ProtocolError::new(
-                ErrorCode::InvalidRequest,
-                "unexpected result body for request_status",
             ))),
         }
     }

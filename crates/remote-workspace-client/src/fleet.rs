@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::deploy::DeployError;
-use crate::{ArgvTransport, Client, Endpoint, RemoteShell};
+use crate::{ArgvTransport, Client, Endpoint, RemoteShell, ServerInfoResult};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,9 +37,8 @@ pub struct Workspace {
     pub label: Option<String>,
 }
 
-/// Parse and validate a fleet config. Rejects two
-/// workspaces addressing the same (host, root): they would contend for the
-/// same server-side state lock and one of them would always fail.
+/// Parse and validate a fleet config. Rejects two workspaces addressing the
+/// same (host, root).
 pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Workspace>> {
     let file: FleetFile = toml::from_str(text)?;
     let mut seen: BTreeMap<(Option<String>, String), String> = BTreeMap::new();
@@ -47,10 +46,7 @@ pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Workspace>> {
     let mut out = BTreeMap::new();
     for (name, entry) in file.workspaces {
         if let Some(prev) = seen.insert((entry.host.clone(), entry.root.clone()), name.clone()) {
-            anyhow::bail!(
-                "workspaces '{prev}' and '{name}' address the same host and root; \
-                 they would contend for the same server state lock"
-            );
+            anyhow::bail!("workspaces '{prev}' and '{name}' address the same host and root");
         }
         let bin = entry
             .bin
@@ -109,12 +105,10 @@ pub fn load_fleet(path: &Path) -> anyhow::Result<BTreeMap<String, Workspace>> {
     parse_fleet(&text).with_context(|| format!("invalid fleet config {path:?}"))
 }
 
-/// One-shot health probe of a workspace: spawn its server and do a real
-/// round-trip. Single attempt, no retries -- this is a diagnostic, not the
-/// resilient tool-call path. The error text starts with a stable code:
-/// `connect_failed` (transport/spawn) or `probe_failed` (server reached but the
-/// round-trip failed, e.g. bad root or a locked state directory).
-pub async fn check_workspace(endpoint: &Endpoint) -> Result<(), String> {
+/// One-shot health probe of a workspace: spawn its server and run an unlogged
+/// `server_info` round-trip. Error text starts with a stable code:
+/// `connect_failed` or `probe_failed`.
+pub async fn check_workspace(endpoint: &Endpoint) -> Result<ServerInfoResult, String> {
     let transport = ArgvTransport {
         argv: endpoint.one_shot_control_argv(),
         serial: endpoint.is_powershell_ssh(),
@@ -122,10 +116,7 @@ pub async fn check_workspace(endpoint: &Endpoint) -> Result<(), String> {
     match Client::connect(transport, None).await {
         Err(e) => Err(format!("connect_failed: {e}")),
         Ok(c) => {
-            let result = match c.stat(".").await {
-                Ok(_) => Ok(()),
-                Err(e) => Err(format!("probe_failed: {e}")),
-            };
+            let result = c.probe().await.map_err(|e| format!("probe_failed: {e}"));
             c.close().await;
             result
         }
@@ -177,7 +168,7 @@ pub fn check_addable(text: &str, entry: &NewEntry) -> Result<(), DeployError> {
                 "duplicate_workspace_target",
                 format!(
                     "workspace '{existing_name}' already targets {}:{}; \
-                     they would contend for the same server state lock",
+                     both entries address the same host and root",
                     entry.host, entry.root
                 ),
             ));
@@ -246,6 +237,70 @@ pub fn add_workspace_entry(fleet_path: &Path, entry: &NewEntry) -> Result<(), De
 
     let new_text = doc.to_string();
     // Full-schema validation before anything touches disk.
+    parse_fleet(&new_text).map_err(|e| {
+        DeployError::new(
+            "fleet_write_failed",
+            format!("refusing to write an invalid fleet config: {e}"),
+        )
+    })?;
+
+    write_atomic(fleet_path, &new_text)
+}
+
+pub fn remove_workspace_entry(fleet_path: &Path, name: &str) -> Result<(), DeployError> {
+    let dir = fleet_path.parent().unwrap_or_else(|| Path::new("."));
+    if !dir.exists() {
+        return Err(DeployError::new(
+            "unknown_workspace",
+            format!("'{name}' is not in {fleet_path:?}; available: (none)"),
+        ));
+    }
+
+    let _lock = acquire_fleet_lock(fleet_path)?;
+
+    let text = match std::fs::read_to_string(fleet_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(DeployError::new(
+                "fleet_write_failed",
+                format!("read {fleet_path:?}: {e}"),
+            ))
+        }
+    };
+
+    let mut doc = parse_document(&text)?;
+    let removed = match doc
+        .get_mut("workspaces")
+        .and_then(|w| w.as_table_like_mut())
+    {
+        Some(workspaces) => {
+            if workspaces.remove(name).is_some() {
+                true
+            } else {
+                let mut names: Vec<&str> = workspaces.iter().map(|(k, _)| k).collect();
+                names.sort_unstable();
+                let available = if names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    names.join(", ")
+                };
+                return Err(DeployError::new(
+                    "unknown_workspace",
+                    format!("'{name}' is not in {fleet_path:?}; available: {available}"),
+                ));
+            }
+        }
+        None => false,
+    };
+    if !removed {
+        return Err(DeployError::new(
+            "unknown_workspace",
+            format!("'{name}' is not in {fleet_path:?}; available: (none)"),
+        ));
+    }
+
+    let new_text = doc.to_string();
     parse_fleet(&new_text).map_err(|e| {
         DeployError::new(
             "fleet_write_failed",
@@ -423,6 +478,38 @@ mod tests {
         assert_eq!(dup_target.code, "duplicate_workspace_target");
         // A genuinely new entry is fine.
         check_addable(text, &entry("c", "h3", "/r3")).unwrap();
+    }
+
+    #[test]
+    fn remove_entry_preserves_rest_and_rejects_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.toml");
+        std::fs::write(
+            &path,
+            "[workspaces.a]\nhost = \"h1\"\nroot = \"/r1\"\n\n# keep comment\n[workspaces.b]\nhost = \"h2\"\nroot = \"/r2\"\n",
+        )
+        .unwrap();
+
+        let missing = remove_workspace_entry(&path, "nope").unwrap_err();
+        assert_eq!(missing.code, "unknown_workspace");
+        assert!(missing.message.contains("a, b"), "{}", missing.message);
+
+        remove_workspace_entry(&path, "a").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep comment"));
+        assert!(!text.contains("[workspaces.a]"));
+        assert!(text.contains("[workspaces.b]"));
+        let parsed = parse_fleet(&text).unwrap();
+        assert_eq!(parsed.keys().cloned().collect::<Vec<_>>(), vec!["b"]);
+
+        remove_workspace_entry(&path, "b").unwrap();
+        assert!(parse_fleet(&std::fs::read_to_string(&path).unwrap())
+            .unwrap()
+            .is_empty());
+
+        let missing_dir = dir.path().join("no-such-dir").join("workspaces.toml");
+        let err = remove_workspace_entry(&missing_dir, "a").unwrap_err();
+        assert_eq!(err.code, "unknown_workspace");
     }
 
     #[test]

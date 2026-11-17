@@ -94,22 +94,44 @@ Interactive sessions (PTY, REPL, persistent shell) are out of scope.
 ## Operations
 
 ```text
-list  stat  read  create  edit  delete  exec
-history  operation_get  request_status  gc
+server_info  list  stat  read  create  edit  delete  exec  wait
+history  operation_get  gc
 upload_prepare  upload_commit  upload_abort  download_record   (transfer control plane)
 ```
 
+`server_info` returns `software_version`, `protocol_version`, `platform`,
+configured `profiles`, and optional `default_profile`. The client uses it as the
+unlogged connection probe, and the MCP server caches the result to expose profile
+and platform metadata in `list_workspaces` once a workspace is warm.
+
+Blocking filesystem and store operations run on Tokio's blocking pool
+(`spawn_blocking`), so concurrent requests multiplexed over one connection do
+not stall the async reader/writer loop.
+
 ### Reads and hashes
 
-`read` returns content plus a hash over the file's raw bytes. Only the
-requested window is read, so paging through a multi-gigabyte exec log costs the
-page, not the file. The hash exists to be handed back as `edit`'s `base_hash`,
-and `edit` refuses files above 4 MiB, so above that size it is omitted rather
-than re-derived per page from content nothing can edit:
+`read` supports three mutually exclusive window modes over UTF-8 text files,
+returning `start_offset`, `end_offset`, `total_bytes`, `trailing_newline`,
+`truncated`, and (for files <= 4 MiB) `hash` over the file's raw bytes:
+
+1. **Byte paging** (`offset` / `limit`, up to 64 KiB): seeks directly on files
+   above 4 MiB so paging a multi-gigabyte log costs the page, not the file, and
+   extends up to 3 bytes past `limit` when needed to finish a multi-byte UTF-8
+   codepoint.
+2. **Line range** (`start_line` / `max_lines`, 1-based, up to 2,000 lines and
+   64 KiB, for files <= 4 MiB): returns `start_line`, `end_line`, `total_lines`,
+   and `next_line` (plus `next_offset` if a single line exceeds 64 KiB).
+3. **Tail** (`tail_lines` up to 2,000, or `tail_bytes` up to 64 KiB): seeks near
+   EOF so it works on multi-gigabyte logs as well as small files, snapping past
+   any leading UTF-8 continuation bytes.
+
+The hash exists to be handed back as `edit`'s `base_hash`; because `edit`
+refuses files above 4 MiB, `hash` is omitted above that size rather than
+recomputing SHA-256 over content nothing can edit:
 
 ```json
-{"request_id":"r1","op":"read","path":"src/main.py","offset":0,"limit":65536}
-{"request_id":"r1","type":"read","content":"...","hash":"sha256:abc","truncated":true,"next_offset":65536}
+{"request_id":"r1","op":"read","path":"src/main.py","start_line":1,"max_lines":200}
+{"request_id":"r1","type":"read","content":"...","total_bytes":1200,"start_offset":0,"end_offset":1200,"trailing_newline":true,"start_line":1,"end_line":48,"total_lines":48,"hash":"sha256:abc","truncated":false}
 ```
 
 ### Mutations: one intent, one operation
@@ -120,41 +142,35 @@ canonical way to perform each:
 * `create` makes a NEW text file and fails with `ALREADY_EXISTS` if the path
   exists (installed with an atomic no-clobber rename, so even a concurrent
   creator cannot be clobbered).
-* `edit` modifies an EXISTING text file by exact text replacement, the
-  editing semantics coding models already know: `old_text` must match the
-  current content exactly; zero occurrences fail with `NO_MATCH`, several
-  with `AMBIGUOUS_MATCH` unless `replace_all` is set; an empty `new_text`
-  deletes the matched text. A full-file rewrite passes the entire current
-  content as `old_text`, keeping destructive replacement explicit.
-
-  One `edit` carries a **list** of replacements, applied in order, each to the
-  result of the one before it, so a replacement may match text an earlier one
-  produced and its match count is taken against that content. The list is one
-  operation -- three separate `edit` calls are three separately interruptible
-  mutations, and a failure in the third leaves the file in a state no caller
-  asked for. Errors name the failing position (`edit 2 of 3`) when there is more
-  than one. Replacements
-  that cancel out are refused: a record whose before and after hashes are equal
-  is one recovery must read as "the rename never happened". Bounded at 100
-  replacements per call.
-
-  Creating a file is still `create` alone: an empty `old_text` is a bad
-  argument here, not a shorthand for "write this file".
+* `edit` modifies an EXISTING text file gated by `base_hash`, via either ordered
+  exact replacements (`edits`) or atomic whole-file replacement
+  (`replace_content`), never both:
+  * `edits` carries 1..=100 replacements applied in order, each to the result of
+    the one before it, so a replacement may match text an earlier one produced.
+    `old_text` must match exactly: zero occurrences fail with `NO_MATCH`,
+    several with `AMBIGUOUS_MATCH` unless `replace_all` is set; an empty
+    `new_text` deletes the matched text; an empty `old_text` is rejected. Errors
+    locate the failing position (`edit 2 of 3`) when there is more than one.
+  * `replace_content` atomically replaces the entire file content (<= 4 MiB)
+    without shipping the old body over the wire as `old_text`, while keeping the
+    same `base_hash` optimistic concurrency check and existing-file requirement.
+  * Mutations whose net effect leaves the file byte-for-byte unchanged are
+    refused.
 
 ```json
 {"request_id":"r2","op":"edit","path":"src/main.py","base_hash":"sha256:abc","edits":[{"old_text":"x = 1","new_text":"x = 2"},{"old_text":"def f(","new_text":"def g("}]}
 {"request_id":"r2","type":"write","operation_id":"op-7","old_hash":"sha256:abc","new_hash":"sha256:def"}
 ```
 
-`edit` requires a `base_hash`, compared against the bytes actually read and
-re-checked with the replacement already staged, so a write landing in between
-is refused with `STALE_FILE` (carrying `expected_hash`/`actual_hash`) rather
-than discarded. The complete new content is built, then renamed into place
-preserving file mode, so an edit that fails before the rename leaves the file
-byte-for-byte unchanged. Only a durability failure after it can report an error
-with the new bytes already installed; the next start reconciles that. Success returns an `operation_id` plus `old_hash`/`new_hash`.
-Inputs, the edited file, and the result are bounded at 4 MiB; larger or binary
-files use the transfer path.
+`edit` compares `base_hash` against the bytes read, stages the new content to a
+sibling temp file with a single `fdatasync` (`sync_data`) so power loss never
+leaves a zero-filled or torn target, and then under a short-lived per-workspace
+`mutate.lock` re-verifies the target's hash and atomically renames the temp file
+into place preserving file mode. Conflicting concurrent edits across sessions
+therefore fail deterministically with `STALE_FILE` (carrying
+`expected_hash`/`actual_hash`) instead of racing a silent clobber. Inputs, the
+edited file, and the result are bounded at 4 MiB; larger or binary files use the
+transfer path.
 
 The earlier line-based `patch` operation was removed rather than kept as a
 second editing mechanism; logs recorded by older servers still load.
@@ -208,9 +224,12 @@ agent, so the scheduler-specific knowledge stays in commands rather than in
 per-scheduler code here.
 
 A wait only observes, so like the reads it is neither recorded in the operation
-log nor replayed by request id; asking again answers with the state as it is
-now. The check must therefore not change state. A long wait from Claude Code is
-moved to the background after two minutes and reported when it returns.
+log nor deduplicated by request id; asking again answers with the state as it is
+now. The check must therefore not change state. Agents pass a bounded
+`timeout_ms` (typically 60-120 s) so any MCP host receives periodic turns to
+inspect progress, and check commands can print log tail lines on exit 0 or a
+saved exit code on exit 1 so `last_check` returns progress or outcome in the
+same round-trip.
 
 ### File transfer
 
@@ -226,9 +245,9 @@ remote-workspace-server --transfer-receive <staging> --expect-size N   # stdin -
 remote-workspace-server --transfer-send <path> --root R [--state-base B]  # header JSON, raw bytes, trailer JSON -> stdout
 ```
 
-These raw modes never open the operation store, so they cannot conflict with
-the resident server's state lock. `--transfer-send` re-validates the path with
-the same workspace/`@scratch` boundary rules as every other operation.
+These raw modes never open the operation store. `--transfer-send` re-validates
+the path with the same workspace/`@scratch` boundary rules as every other
+operation.
 
 Uploads are three-phase on the control plane: `upload_prepare` validates the
 target (parent must exist; existing targets refused unless `overwrite`) and
@@ -237,9 +256,10 @@ the target's directory; `upload_commit` verifies the staged size, installs
 atomically (rename for overwrite, hard-link-then-unlink for race-free
 no-replace), fsyncs, and appends the operation record; `upload_abort` deletes
 the staging file after a failure. The staging path travels only between the
-server and the client and is never shown to the agent. It is registered in an
-atomically replaced `pending_uploads.json`, which is what lets commit run in a
-different server process than prepare.
+server and the client and is never shown to the agent. Each prepared upload is
+persisted in its own `pending_uploads/<transfer_id>.json` file (synced and
+atomically renamed), which lets commit run in a different server process than
+prepare without cross-session contention on a shared registry file.
 Downloads verify size and SHA-256 against the sender's framing, install
 locally via temp file + (no-clobber) rename, then append a `download_record`.
 
@@ -301,30 +321,37 @@ the canonical root path:
 
 ```text
 ~/.remote-workspace/state/<rootname>-<hash>/
-|-- operations.jsonl      fs, exec, and transfer records, plus prepared/aborted markers
-|-- requests.jsonl        request idempotency table
-|-- pending_uploads.json  cross-process upload registry
-|-- scratch/              agent-visible runtime artifacts (`@scratch/...`)
-|-- scratch-swept         marker limiting the scratch sweep to once a day
-|-- lock                  single-writer flock
-|-- server.jsonl          server lifecycle: start, lock refusal, exit reason
-`-- op-counter            id high-water mark (prevents reuse after pruning)
+|-- ops/*.jsonl               per-session append-only operation shards
+|-- pending_uploads/*.json    per-transfer cross-process upload metadata
+|-- mutate.lock               short-lived lock serializing file CAS + rename
+|-- scratch/                  agent-visible runtime artifacts (`@scratch/...`)
+|-- scratch-swept             marker limiting the scratch sweep to once a day
+`-- server.jsonl              server lifecycle: start and exit reason
 ```
 
 The workspace stays untouched -- nothing for `git status`, nothing a
 destructive command inside the workspace can destroy along with itself.
 `--state-base` swaps the base directory while keeping per-root keying (for
 hosts where home is nearly full). State is per-workspace, not per-session:
-sessions are just connections, and cross-session features (history, replay
-after reconnect) are exactly the reason the state must outlive them.
+sessions are just connections, and cross-session history outlives individual
+processes while allowing concurrent sessions to share the workspace cleanly.
 
-* **Server log = execution truth.** Every operation is recorded with hashes,
-  argv, and exit codes. Appends are fsync'd. Mutations are
-  write-ahead: `prepared` before the rename, `committed` after, so a crash in
-  between is reconciled on restart instead of leaving a phantom operation.
-  On Windows, file contents are flushed but there is no stable directory-fsync
-  equivalent; rename/delete metadata durability therefore relies on the NTFS
-  journal and is weaker than the POSIX guarantee.
+* **Concurrent multi-session store.** There is no workspace-wide exclusive lock.
+  Each server session lazily opens its own append-only shard
+  `ops/<ts>-<pid>-<rand>.jsonl` and holds an advisory byte-range lock on that
+  shard (at offset `2^32`, well past EOF so Windows mandatory byte-range
+  locking never blocks readers scanning `0..len`) purely as a liveness marker.
+  Operation IDs (`op-<ts>-<pid>-<seq>`) embed monotonic millisecond timestamps,
+  PID, and a per-millisecond counter so IDs sort chronologically without a
+  shared counter file. `history` and `operation_get` merge committed records
+  across shards (plus any legacy `operations.jsonl`).
+* **Server log = execution truth.** Every completed mutation, command, and
+  transfer appends a JSONL record to the session's shard (rolling back via
+  `set_len` if a write fails mid-line). Workspace file staging (`create`/`edit`)
+  performs a single `fdatasync` on the temp file before atomic rename, keeping
+  per-edit latency low while preventing torn or zero-filled files on crash.
+  On Windows, file contents are flushed while rename/delete metadata durability
+  relies on the NTFS journal.
 * **Client log = interaction truth.** Optional JSONL log of every request
   sent and every response/event received (including truncation flags), i.e.
   what the agent actually saw. `remote-workspace-mcp --log-dir DIR` writes one
@@ -335,18 +362,16 @@ after reconnect) are exactly the reason the state must outlive them.
   answers. Off by default: a request line carries the full content of a
   `create_file` or `edit_file`.
 * **Session log = lifecycle truth.** `server.jsonl` records one line per
-  server start, refused start (with the pid holding the lock), and exit (with
-  the reason). The server's stderr goes to whoever is attached over SSH, and
-  the case worth diagnosing -- a server still running after its client
-  vanished -- is precisely the case where nobody is. This file is what remains
-  on the remote to answer it. Trimmed to its newest lines at startup once past
-  256 KiB. The server logs at `info` by default rather than requiring
-  `RUST_LOG`, which cannot be set through `ssh host '<binary> ...'` anyway.
-* **Bounded growth.** At startup the server prunes to the newest
-  `--history-limit` operations (default 1000; 0 disables), dropping older
-  records and request entries no longer referenced. The `gc` operation does the
-  same on demand. A pruned operation id returns `OPERATION_NOT_FOUND`; pruned
-  ids are never reallocated.
+  server start and exit (with the reason, uptime, and request count), trimmed
+  to its newest lines at startup once past 256 KiB. The server logs at `info`
+  by default rather than requiring `RUST_LOG`, which cannot be set through
+  `ssh host '<binary> ...'` anyway.
+* **Bounded growth.** `gc` compacts all closed shards (shards whose liveness
+  lock is free, plus any legacy `operations.jsonl`) down to a single closed
+  shard retaining at most `--history-limit` newest operations (default 1000; 0
+  disables) across live and closed shards, leaving active sessions' open shards
+  untouched. Startup runs the same compaction opportunistically once shard count
+  exceeds 64. A pruned operation id returns `OPERATION_NOT_FOUND`.
 * **Scratch expires.** Files idle -- neither written nor read -- beyond
   `--scratch-max-age-days` (default 7; 0 disables) are deleted, and `gc`
   reports what scratch holds. An entry that cannot be read or removed does not
@@ -362,35 +387,23 @@ after reconnect) are exactly the reason the state must outlive them.
   Age is the only criterion: a size cap evicts the wrong files, and what
   belongs in scratch is a matter of kind, not bytes, which the agent guidance
   covers (working material yes, results no).
-* **Single writer.** The state directory is protected by an exclusive flock
-  held for the server's lifetime (auto-released by the kernel on death). A
-  second server on the same root fails fast with a clear error; reconnects
-  get a short grace period while the predecessor shuts down.
-* **The server outlives no one.** Stdin EOF is the ordinary exit, but a
-  suspended laptop or dropped VPN can leave the SSH session undetected for
-  hours, holding the lock while the client has long reconnected. So the server
+* **The server outlives no one.** Stdin EOF is the ordinary exit, and the server
   also exits after `--idle-timeout-secs` (default 900; 0 disables) with no
-  request arriving *and none running* -- an hour-long `exec` is not idleness.
-  Reconnecting costs the next call one SSH connect.
+  request arriving *and none running* -- an hour-long `exec` is not idleness --
+  so a dropped VPN or suspended laptop does not leave idle remote processes
+  around. Reconnecting costs the next call one SSH connect.
 
 ## Idempotency and reconnect
 
-Every request has a globally unique `request_id`. The server persists the
-results of operation-producing requests (`create`, `edit`, `delete`, `exec`,
-`upload_commit`, `download_record`, `gc`) in `requests.jsonl` and reloads them
-on restart, so resending the same `request_id` returns the stored result
-without re-executing, and `request_status` reports what became of one.
-Read-only requests and the upload `prepare`/`abort` steps are not stored:
-re-running them is harmless, and storing reads would keep file contents on the
-remote disk for nothing.
-
-No shipped client replays yet: the MCP generates a fresh id per send and never
-retries, so the table enables replay rather than performing it. `exec` is never
-auto-retried, since re-running a command may not be safe.
-
-The replay window equals the retention window: request entries older than the
-newest `--history-limit` operations are pruned along with them. Reconnect
-recovery happens minutes after a drop, far inside any reasonable window.
+Every request carries a unique `request_id`. Each server session maintains a
+bounded in-memory deduplication cache (up to 1,024 finished operation-producing
+requests: `create`, `edit`, `delete`, `exec`, `upload_commit`,
+`download_record`, `gc`), rejecting a duplicate `request_id` that is still in
+flight and replaying the stored response if the same `request_id` is resent on
+that session. Read-only requests, `wait`, and `upload_prepare`/`upload_abort`
+run directly without caching. Across a dropped connection, the client opens a
+fresh server session and never auto-retries a failed call (`exec` in particular
+may already have produced side effects).
 
 ## Workspace boundary
 
@@ -438,18 +451,22 @@ a new release is a separate verb:
 
 ```bash
 remote-workspace workspace upgrade [<name>]
+remote-workspace workspace list
+remote-workspace workspace rm <name>
 ```
 
-It installs once per SSH identity however many workspaces share it, leaves
+`upgrade` installs once per SSH identity however many workspaces share it, leaves
 user-managed binaries alone, and never edits the fleet file -- upgrading a
-server changes no authorization, so it needs none of `add`'s transaction.
+server changes no authorization, so it needs none of `add`'s transaction. `list`
+and `rm` inspect and prune local fleet entries, and `-w` / `--workspace <name>`
+lets any CLI command use a configured workspace directly.
 
 Two version fields are reported by `remote-workspace-server --version-json`, a
 stable probe that mutates nothing, needs no config, and never starts the JSONL
 server:
 
 ```json
-{"software_version": "0.7.1", "protocol_version": 4}
+{"software_version": "0.7.1", "protocol_version": 5}
 ```
 
 `software_version` identifies the release and its CI artifact;
@@ -489,8 +506,7 @@ Doing the compare-and-swap inside one locked process is what makes concurrent
 installers safe; an equal or newer server is kept and the upload deleted.
 Replacing an executable path does not disturb processes already running from
 the old inode, so live sessions continue unaffected and no session registry is
-needed -- the workspace state lock already prevents two servers from sharing a
-root.
+needed.
 
 The fleet file is only written after remote installation and a real protocol
 round-trip against the target root both succeed (reusing the `--check` probe
@@ -530,16 +546,29 @@ call can never land on the wrong machine because a default silently filled
 in. Results echo the workspace name, since operation and request IDs are
 only unique within one workspace.
 
-`history`, `operation_get` and `request_status` stay CLI-only: across ~3,000
-logged calls agents used `history` three times and the others never (request
-ids are not even visible to the agent). `list_directory` is rarely called too,
-but stays as the only file discovery that enforces the workspace boundary.
+`history` and `operation_get` stay CLI-only: across ~3,000 logged calls agents
+used `history` three times and `operation_get` never. `list_directory` is rarely
+called too, but stays as the only file discovery that enforces the workspace
+boundary.
+
+`AGENT_GUIDANCE.md` is kept strictly under 4,096 bytes so MCP hosts with small
+instruction budgets (such as Claude Code) never truncate it, while critical
+tool-specific invariants (`run_command` never shell-splitting `argv`,
+`read_file`'s metadata header above `---` and three read modes, `edit_file`'s
+`edits` vs `replace_content`, `wait_while`'s bounded `timeout_ms`) live directly
+in the tool and parameter descriptions as well. Tools also publish MCP
+`ToolAnnotations` (`readOnlyHint`, `destructiveHint`) so hosts can distinguish
+read-only inspection (`list_workspaces`, `list_directory`, `read_file`,
+`wait_while`), additive creation (`create_file`), and mutating or arbitrary
+operations (`edit_file`, `delete_file`, `run_command`, transfers).
 
 The MCP process keeps one independent, lazily-opened connection per
-workspace, so a dead machine costs only its own calls, and the fleet needs
-no server-side coordination at all -- there is no cross-workspace operation
-(file movement between workspaces goes through a local file via
-`download_file` + `upload_file`).
+workspace, caching the server's `server_info` (`platform`, `profiles`,
+`default_profile`) on probe so `list_workspaces` surfaces it once warm. A dead
+machine costs only its own calls, and the fleet needs no server-side
+coordination at all -- there is no cross-workspace operation (file movement
+between workspaces goes through a local file via `download_file` +
+`upload_file`).
 
 * Protocol errors map to MCP `isError` results, so failures are visible to
   the agent.
@@ -580,9 +609,8 @@ no server-side coordination at all -- there is no cross-workspace operation
   tool call (retries with backoff, probed with a real round-trip), while a
   call that dies mid-flight surfaces as an error and is never auto-retried.
   `initialize` never blocks on connecting. On Linux the transport child
-  carries PDEATHSIG so a killed MCP cannot orphan its ssh (which would keep
-  the remote server -- and the state lock -- alive); a dead *link* is covered
-  from the far end by the server's idle timeout.
+  carries PDEATHSIG so a killed MCP cannot orphan its ssh; a dead *link* is
+  covered from the far end by the server's idle timeout.
 * The transport child's stderr is captured, not inherited, and its tail is
   attached to `server closed connection`. A server that refuses to start says
   why and exits; inheriting that text scatters it into the MCP host's log,
@@ -618,15 +646,5 @@ that drive the real `remote-workspace-mcp` binary.
 
 Deliberately out of scope, so the primitives stay small and predictable:
 workspace sync or cloning, resident daemons, reversal of any operation,
-multi-file transactions, multi-agent merging, job scheduling, and interactive
-PTYs (REPLs, persistent shells).
-
-**Concurrent sessions on one workspace.** The state directory's flock admits
-exactly one server per root, so a second agent session against the same
-workspace fails to connect while the first holds it (after a short grace for a
-predecessor still shutting down). This is a real limitation, not an oversight:
-the alternative is a multi-process operation log -- per-append locking, id
-allocation through the counter file, and in-memory tables demoted to caches
-with invalidation -- which puts the WAL and idempotency core at risk to serve a
-case with a simple workaround. Point the second session at a different root, or
-wait for the first to exit (bounded by the idle timeout).
+multi-file transactions, multi-agent semantic merging, job scheduling, and
+interactive PTYs (REPLs, persistent shells).

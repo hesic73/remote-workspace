@@ -171,7 +171,7 @@ already exist.</p>
   Remote platform        linux-x86_64
   Workspace root         valid
   Server                 installed 0.7.1
-  Protocol               4
+  Protocol               5
   Workspace probe        passed
   Fleet configuration    updated
 Workspace 'robot' is ready.</code></pre>
@@ -202,9 +202,10 @@ application after registering, since MCP servers are loaded at startup.</p>
 <h3>Claude Code</h3>
 <pre><code>claude mcp add --scope user remote-workspace -- remote-workspace-mcp</code></pre>
 
-<h3>Claude Desktop</h3>
-<p>In <code>claude_desktop_config.json</code>. Use an absolute path, because a GUI app
-does not inherit your shell's <code>PATH</code>.</p>
+<h3>Antigravity / Claude Desktop</h3>
+<p>In <code>~/.gemini/antigravity/mcp_config.json</code> or
+<code>claude_desktop_config.json</code>. Use an absolute path when configuring a
+GUI app that does not inherit your shell's <code>PATH</code>.</p>
 <pre><code>{
   "mcpServers": {
     "remote-workspace": {
@@ -322,10 +323,6 @@ your agent writes.</p>
   <tr>
     <td><code>connect_failed</code></td>
     <td>SSH itself cannot reach the host. Try <code>ssh &lt;host&gt; true</code>. Anything needing a password prompt fails rather than hanging.</td>
-  </tr>
-  <tr>
-    <td><code>probe_failed</code>, <em>state directory is locked</em></td>
-    <td>Another session is using that workspace; one server serves a root at a time. A server orphaned by a dropped connection releases the lock about fifteen minutes after its last activity (longer if a command is still running). <code>server.jsonl</code> in the state directory records when each server started and stopped.</td>
   </tr>
   <tr>
     <td><code>server_too_old</code>, <code>client_too_old</code></td>

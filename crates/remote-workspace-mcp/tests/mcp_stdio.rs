@@ -142,6 +142,19 @@ impl Drop for McpSession {
     }
 }
 
+fn split_read(text: &str) -> (&str, &str) {
+    text.split_once("\n---\n")
+        .unwrap_or_else(|| panic!("read_file output missing header separator: {text}"))
+}
+
+fn header_field<'a>(header: &'a str, key: &str) -> Option<&'a str> {
+    let trimmed = header.strip_prefix('[')?.strip_suffix(']')?;
+    let prefix = format!("{key}=");
+    trimmed
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix(&prefix))
+}
+
 #[test]
 fn mcp_initialize_and_server_info() {
     let dir = tempfile::tempdir().unwrap();
@@ -156,10 +169,13 @@ fn mcp_initialize_and_server_info() {
         }),
     );
     assert_eq!(resp["result"]["serverInfo"]["name"], "remote-workspace-mcp");
-    assert_eq!(
-        resp["result"]["instructions"],
-        include_str!("../AGENT_GUIDANCE.md")
+    let guidance = include_str!("../AGENT_GUIDANCE.md");
+    assert!(
+        guidance.len() < 4096,
+        "AGENT_GUIDANCE.md must stay < 4096 bytes, got {}",
+        guidance.len()
     );
+    assert_eq!(resp["result"]["instructions"], guidance);
     // Agent-facing conventions have one canonical source; the docs must point
     // at it instead of restating (and drifting from) it.
     for doc in [
@@ -385,6 +401,12 @@ fn mcp_tools_list_has_expected_tools() {
         for opt in [
             "offset",
             "limit",
+            "start_line",
+            "max_lines",
+            "tail_lines",
+            "tail_bytes",
+            "edits",
+            "replace_content",
             "cwd",
             "profile",
             "timeout_ms",
@@ -395,6 +417,27 @@ fn mcp_tools_list_has_expected_tools() {
                 !required.contains(&opt),
                 "{name}.{opt} is optional but was marked required"
             );
+        }
+
+        let ann = &t["annotations"];
+        assert!(ann.is_object(), "{name} must publish tool annotations: {t}");
+        match name {
+            "list_workspaces" | "list_directory" | "read_file" | "wait_while" => {
+                assert_eq!(ann["readOnlyHint"], true, "{name}: {ann}");
+                assert_eq!(ann["destructiveHint"], false, "{name}: {ann}");
+            }
+            "create_file" => {
+                assert_eq!(ann["readOnlyHint"], false, "{name}: {ann}");
+                assert_eq!(ann["destructiveHint"], false, "{name}: {ann}");
+            }
+            "delete_file" | "run_command" => {
+                assert_eq!(ann["readOnlyHint"], false, "{name}: {ann}");
+                assert_eq!(ann["destructiveHint"], true, "{name}: {ann}");
+            }
+            "edit_file" | "upload_file" | "download_file" => {
+                assert_eq!(ann["readOnlyHint"], false, "{name}: {ann}");
+            }
+            other => panic!("unhandled tool {other}"),
         }
     }
 }
@@ -436,7 +479,8 @@ fn mcp_optional_parameters_are_accepted() {
         serde_json::json!({"workspace": "test", "path": "a.txt", "offset": 2, "limit": 2}),
     );
     assert!(!e, "read_file with offset/limit: {text}");
-    assert!(text.starts_with('y'), "offset/limit not applied: {text}");
+    let (_, body) = split_read(&text);
+    assert_eq!(body, "y\n", "offset/limit not applied: {text}");
 
     let (e, text) = s.tool(
         "list_directory",
@@ -465,7 +509,25 @@ fn mcp_integer_parameters_accept_numeric_strings() {
         serde_json::json!({"workspace": "test", "path": "a.txt", "offset": "2", "limit": "2"}),
     );
     assert!(!e, "read_file with stringified offset/limit: {text}");
-    assert!(text.starts_with('y'), "offset/limit not applied: {text}");
+    let (_, body) = split_read(&text);
+    assert_eq!(body, "y\n", "offset/limit not applied: {text}");
+
+    let (e, text) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "a.txt", "start_line": "2", "max_lines": "1"}),
+    );
+    assert!(
+        !e,
+        "read_file with stringified start_line/max_lines: {text}"
+    );
+    assert_eq!(split_read(&text).1, "y\n");
+
+    let (e, text) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "a.txt", "tail_lines": "1"}),
+    );
+    assert!(!e, "read_file with stringified tail_lines: {text}");
+    assert_eq!(split_read(&text).1, "y\n");
 
     let (e, text) = s.tool(
         "run_command",
@@ -770,18 +832,17 @@ fn mcp_full_tool_surface() {
     assert!(e, "re-creating an existing file must be isError=true");
     assert!(text.contains("ALREADY_EXISTS"), "unexpected text: {text}");
 
-    // read_file returns the hash edit_file needs as base_hash.
+    // read_file returns the hash edit_file needs as base_hash in the header,
+    // never appended to the raw body.
     let (e, text) = s.tool(
         "read_file",
         serde_json::json!({"workspace": "test", "path": "f.txt"}),
     );
     assert!(!e, "read failed: {text}");
-    let hash = text
-        .split("[hash: ")
-        .nth(1)
-        .expect("read result must carry the hash")
-        .trim_end_matches(']')
-        .trim()
+    let (header, body) = split_read(&text);
+    assert_eq!(body, "l1\nl2\n");
+    let hash = header_field(header, "hash")
+        .expect("read header must carry hash")
         .to_string();
 
     // A non-matching old_text is a structured NO_MATCH error.
@@ -809,21 +870,18 @@ fn mcp_full_tool_surface() {
         serde_json::json!({"workspace": "test", "path": "f.txt"}),
     );
     assert!(!e);
-    assert!(text.starts_with("l1\nL2\n"), "edit not applied: {text}");
+    assert_eq!(split_read(&text).1, "l1\nL2\n", "edit not applied: {text}");
 
     // Several replacements in one call, applied in order and landing together.
     let hash_of = |s: &mut McpSession| -> String {
-        s.tool(
+        let (_, text) = s.tool(
             "read_file",
             serde_json::json!({"workspace": "test", "path": "f.txt"}),
-        )
-        .1
-        .rsplit_once("[hash: ")
-        .expect("read result must carry the hash")
-        .1
-        .trim_end_matches(']')
-        .trim()
-        .to_string()
+        );
+        let (hdr, _) = split_read(&text);
+        header_field(hdr, "hash")
+            .expect("read header must carry hash")
+            .to_string()
     };
     let hash = hash_of(&mut s);
     let (e, text) = s.tool(
@@ -843,7 +901,11 @@ fn mcp_full_tool_surface() {
         "read_file",
         serde_json::json!({"workspace": "test", "path": "f.txt"}),
     );
-    assert!(text.starts_with("L1\nL2!\n"), "edits not applied: {text}");
+    assert_eq!(
+        split_read(&text).1,
+        "L1\nL2!\n",
+        "edits not applied: {text}"
+    );
 
     // One bad replacement rejects the whole call, leaving the file as it was.
     // The base_hash is current, so this fails on the replacement itself rather
@@ -866,10 +928,54 @@ fn mcp_full_tool_surface() {
         "read_file",
         serde_json::json!({"workspace": "test", "path": "f.txt"}),
     );
-    assert!(
-        after.starts_with("L1\nL2!\n"),
+    assert_eq!(
+        split_read(&after).1,
+        "L1\nL2!\n",
         "rejected list must not partially apply: {after}"
     );
+
+    // Whole-file replacement via replace_content, and mutual exclusion with edits.
+    let hash = hash_of(&mut s);
+    let (e, both_err) = s.tool(
+        "edit_file",
+        serde_json::json!({
+            "workspace": "test",
+            "path": "f.txt",
+            "base_hash": hash,
+            "edits": [],
+            "replace_content": "whole\n",
+        }),
+    );
+    assert!(e && both_err.contains("mutually exclusive"), "{both_err}");
+
+    let (e, neither_err) = s.tool(
+        "edit_file",
+        serde_json::json!({
+            "workspace": "test",
+            "path": "f.txt",
+            "base_hash": hash,
+        }),
+    );
+    assert!(
+        e && neither_err.contains("INVALID_REQUEST"),
+        "{neither_err}"
+    );
+
+    let (e, repl_text) = s.tool(
+        "edit_file",
+        serde_json::json!({
+            "workspace": "test",
+            "path": "f.txt",
+            "base_hash": hash,
+            "replace_content": "replaced-all\n",
+        }),
+    );
+    assert!(!e, "replace_content failed: {repl_text}");
+    let (_, after_repl) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt"}),
+    );
+    assert_eq!(split_read(&after_repl).1, "replaced-all\n");
 
     // Delete, then verify it is gone.
     let (e, text) = s.tool(
@@ -1114,4 +1220,220 @@ fn mcp_transfer_tools_roundtrip_and_errors() {
         }),
     );
     assert!(e, "missing local source must be isError=true, got: {text}");
+}
+
+#[test]
+fn mcp_list_workspaces_exposes_server_info_once_warm() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let cfg = dir.path().join("server-config.toml");
+    std::fs::write(
+        &cfg,
+        "default_profile = \"dev\"\n[profiles.dev]\nsetup = \"\"\n[profiles.raw]\nsetup = \"\"\n",
+    )
+    .unwrap();
+    let fleet = dir.path().join(".fleet.toml");
+    std::fs::write(
+        &fleet,
+        format!(
+            "{}config = {:?}\n",
+            fleet_entry("test", root),
+            cfg.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let mut s = McpSession::spawn_fleet(&fleet);
+    s.initialize();
+
+    // Cold: not yet connected, so server_info fields are omitted.
+    let (e, cold_text) = s.tool("list_workspaces", serde_json::json!({}));
+    assert!(!e, "{cold_text}");
+    let cold: serde_json::Value = serde_json::from_str(&cold_text).unwrap();
+    assert_eq!(cold[0]["connection"], "not_connected");
+    assert!(cold[0].get("platform").is_none(), "{cold_text}");
+    assert!(cold[0].get("profiles").is_none(), "{cold_text}");
+    assert!(cold[0].get("default_profile").is_none(), "{cold_text}");
+
+    // Warm the connection with a real call.
+    let (e, _) = s.tool(
+        "list_directory",
+        serde_json::json!({"workspace": "test", "path": "."}),
+    );
+    assert!(!e);
+
+    let (e, warm_text) = s.tool("list_workspaces", serde_json::json!({}));
+    assert!(!e, "{warm_text}");
+    let warm: serde_json::Value = serde_json::from_str(&warm_text).unwrap();
+    assert_eq!(warm[0]["connection"], "connected");
+    assert!(
+        warm[0]["platform"].as_str().is_some_and(|p| !p.is_empty()),
+        "{warm_text}"
+    );
+    assert_eq!(warm[0]["profiles"], serde_json::json!(["dev", "raw"]));
+    assert_eq!(warm[0]["default_profile"], "dev");
+}
+
+#[test]
+fn mcp_read_file_line_and_tail_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = McpSession::spawn(dir.path().to_str().unwrap());
+    s.initialize();
+
+    // Five lines, deliberately without a final newline.
+    let (e, _) = s.tool(
+        "create_file",
+        serde_json::json!({
+            "workspace": "test",
+            "path": "log.txt",
+            "content": "l1\nl2\nl3\nl4\nl5",
+        }),
+    );
+    assert!(!e);
+
+    let (e, line_page) = s.tool(
+        "read_file",
+        serde_json::json!({
+            "workspace": "test",
+            "path": "log.txt",
+            "start_line": 2,
+            "max_lines": 2,
+        }),
+    );
+    assert!(!e, "{line_page}");
+    let (hdr, body) = split_read(&line_page);
+    assert_eq!(body, "l2\nl3\n");
+    assert_eq!(header_field(hdr, "lines"), Some("2..3/5"));
+    assert_eq!(header_field(hdr, "trailing_newline"), Some("true"));
+    assert_eq!(header_field(hdr, "truncated"), Some("true"));
+    assert_eq!(header_field(hdr, "next_line"), Some("4"));
+    assert!(header_field(hdr, "hash").is_some_and(|h| h.starts_with("sha256:")));
+
+    let (e, tail_l) = s.tool(
+        "read_file",
+        serde_json::json!({
+            "workspace": "test",
+            "path": "log.txt",
+            "tail_lines": 2,
+        }),
+    );
+    assert!(!e, "{tail_l}");
+    let (hdr, body) = split_read(&tail_l);
+    assert_eq!(body, "l4\nl5");
+    assert_eq!(header_field(hdr, "lines"), Some("4..5/5"));
+    assert_eq!(header_field(hdr, "trailing_newline"), Some("false"));
+    assert_eq!(header_field(hdr, "truncated"), Some("true"));
+    assert!(header_field(hdr, "next_line").is_none());
+
+    let (e, tail_b) = s.tool(
+        "read_file",
+        serde_json::json!({
+            "workspace": "test",
+            "path": "log.txt",
+            "tail_bytes": 5,
+        }),
+    );
+    assert!(!e, "{tail_b}");
+    let (hdr, body) = split_read(&tail_b);
+    assert_eq!(body, "l4\nl5");
+    assert_eq!(header_field(hdr, "trailing_newline"), Some("false"));
+    assert_eq!(header_field(hdr, "truncated"), Some("true"));
+
+    let (e, mixed) = s.tool(
+        "read_file",
+        serde_json::json!({
+            "workspace": "test",
+            "path": "log.txt",
+            "offset": 0,
+            "start_line": 1,
+        }),
+    );
+    assert!(e && mixed.contains("mutually exclusive"), "{mixed}");
+}
+
+#[test]
+fn mcp_two_sessions_concurrently_share_one_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let fleet = dir.path().join(".fleet.toml");
+    std::fs::write(&fleet, fleet_entry("shared", root)).unwrap();
+
+    let mut s1 = McpSession::spawn_fleet(&fleet);
+    let mut s2 = McpSession::spawn_fleet(&fleet);
+    s1.initialize();
+    s2.initialize();
+
+    let t1 = std::thread::spawn(move || {
+        for i in 0..8 {
+            let path = format!("s1-{i}.txt");
+            let (e, text) = s1.tool(
+                "create_file",
+                serde_json::json!({"workspace": "shared", "path": path, "content": "v0\n"}),
+            );
+            assert!(!e, "s1 create {i}: {text}");
+            let (e, read_out) = s1.tool(
+                "read_file",
+                serde_json::json!({"workspace": "shared", "path": path}),
+            );
+            assert!(!e, "s1 read {i}: {read_out}");
+            let hash = header_field(split_read(&read_out).0, "hash")
+                .unwrap()
+                .to_string();
+            let (e, ed) = s1.tool(
+                "edit_file",
+                serde_json::json!({
+                    "workspace": "shared",
+                    "path": path,
+                    "base_hash": hash,
+                    "replace_content": format!("s1-{i}-done\n"),
+                }),
+            );
+            assert!(!e, "s1 edit {i}: {ed}");
+        }
+        s1
+    });
+
+    let t2 = std::thread::spawn(move || {
+        for i in 0..8 {
+            let path = format!("s2-{i}.txt");
+            let (e, text) = s2.tool(
+                "create_file",
+                serde_json::json!({"workspace": "shared", "path": path, "content": "v0\n"}),
+            );
+            assert!(!e, "s2 create {i}: {text}");
+            let (e, read_out) = s2.tool(
+                "read_file",
+                serde_json::json!({"workspace": "shared", "path": path}),
+            );
+            assert!(!e, "s2 read {i}: {read_out}");
+            let hash = header_field(split_read(&read_out).0, "hash")
+                .unwrap()
+                .to_string();
+            let (e, ed) = s2.tool(
+                "edit_file",
+                serde_json::json!({
+                    "workspace": "shared",
+                    "path": path,
+                    "base_hash": hash,
+                    "edits": [{"old_text": "v0\n", "new_text": format!("s2-{i}-done\n")}],
+                }),
+            );
+            assert!(!e, "s2 edit {i}: {ed}");
+        }
+        s2
+    });
+
+    let mut s1 = t1.join().unwrap();
+    let mut s2 = t2.join().unwrap();
+    let (e, listing1) = s1.tool(
+        "list_directory",
+        serde_json::json!({"workspace": "shared", "path": "."}),
+    );
+    assert!(!e, "{listing1}");
+    let (e, listing2) = s2.tool(
+        "list_directory",
+        serde_json::json!({"workspace": "shared", "path": "."}),
+    );
+    assert!(!e, "{listing2}");
+    assert!(listing1.contains("s2-7.txt") && listing2.contains("s1-7.txt"));
 }

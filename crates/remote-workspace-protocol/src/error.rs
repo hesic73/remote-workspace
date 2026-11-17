@@ -16,10 +16,9 @@ pub enum ErrorCode {
     IoError,
     ExecFailed,
     OperationNotFound,
+    /// Legacy codes from removed operations (`request_status`, line-based
+    /// `patch`, `undo`). Kept so historical operation logs still deserialize.
     RequestNotFound,
-    /// Legacy codes from the removed line-based patch and undo operations. No
-    /// longer produced, kept so request logs written by older servers
-    /// deserialize.
     PatchFailed,
     UndoConflict,
     AlreadyExists,

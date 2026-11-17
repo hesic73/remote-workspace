@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use remote_workspace_client::{ArgvTransport, Client, ClientLog, RemoteShell};
-use remote_workspace_protocol::{ExecOutput, ExecTermination, ListKind};
+use remote_workspace_client::{ArgvTransport, Client, ClientLog, Endpoint, RemoteShell};
+use remote_workspace_protocol::{ExecOutput, ExecTermination, ListKind, ReadOptions};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -14,22 +14,32 @@ use tracing_subscriber::EnvFilter;
     about = "Client for remote-workspace remote workspaces"
 )]
 struct Cli {
-    /// SSH host (as resolvable via ~/.ssh/config). Required unless --local is
-    /// given.
+    /// Configured workspace name from the fleet file. Mutually exclusive with
+    /// explicit target flags (--host, --root, --local, --config, --state-base,
+    /// --remote-bin, --remote-shell).
+    #[arg(short = 'w', long)]
+    workspace: Option<String>,
+
+    /// Fleet config file (TOML). Defaults to ~/.remote-workspace/workspaces.toml.
+    #[arg(long, global = true)]
+    fleet: Option<PathBuf>,
+
+    /// SSH host (as resolvable via ~/.ssh/config). Required unless --local or
+    /// --workspace is given.
     #[arg(long)]
     host: Option<String>,
 
-    /// Path to the remote `remote-workspace-server` binary. Defaults to expecting
-    /// it on the remote PATH.
-    #[arg(long, default_value = "remote-workspace-server")]
-    remote_bin: String,
+    /// Path to the remote `remote-workspace-server` binary. Defaults to
+    /// `remote-workspace-server` on the remote PATH.
+    #[arg(long)]
+    remote_bin: Option<String>,
 
-    /// Shell used by the SSH server to interpret remote commands.
-    #[arg(long, value_enum, default_value_t)]
-    remote_shell: RemoteShell,
+    /// Shell used by the SSH server to interpret remote commands (default: posix).
+    #[arg(long, value_enum)]
+    remote_shell: Option<RemoteShell>,
 
-    /// Workspace root on the remote host. Required for the connect-based
-    /// commands; not used by `workspace add`, which takes its own --root.
+    /// Workspace root on the remote host. Required unless --workspace is given;
+    /// not used by `workspace` subcommands.
     #[arg(long)]
     root: Option<String>,
 
@@ -67,13 +77,21 @@ enum Command {
     },
     /// Stat a file or directory.
     Stat { path: String },
-    /// Read a file.
+    /// Read a file (byte paging, line range, or tail).
     Cat {
         path: String,
         #[arg(long)]
         offset: Option<u64>,
         #[arg(long)]
         limit: Option<u64>,
+        #[arg(long)]
+        start_line: Option<u64>,
+        #[arg(long)]
+        max_lines: Option<u64>,
+        #[arg(long)]
+        tail_lines: Option<u64>,
+        #[arg(long)]
+        tail_bytes: Option<u64>,
     },
     /// Create a new file with content from --file or stdin. Fails if the
     /// target already exists; modify existing files with `edit`.
@@ -82,18 +100,20 @@ enum Command {
         #[arg(long)]
         file: Option<PathBuf>,
     },
-    /// Replace an exact occurrence of --old-text with --new-text in an
-    /// existing file.
+    /// Modify an existing file via exact text replacement (--old-text and
+    /// --new-text) or full-file replacement (--replace-file).
     Edit {
         path: String,
         #[arg(long)]
         base_hash: String,
         #[arg(long)]
-        old_text: String,
+        old_text: Option<String>,
         #[arg(long)]
-        new_text: String,
+        new_text: Option<String>,
         #[arg(long)]
         replace_all: bool,
+        #[arg(long)]
+        replace_file: Option<PathBuf>,
     },
     /// Execute a command remotely.
     Exec {
@@ -116,8 +136,6 @@ enum Command {
     },
     /// Show details of one operation.
     Op { operation_id: String },
-    /// Query the status of a previously-issued request.
-    Status { request_id: String },
     /// Prune stored history down to the most recent operations.
     Gc {
         /// How many operations to keep. Defaults to the server's
@@ -169,9 +187,15 @@ enum WorkspaceCmd {
         /// Override remote-shell detection.
         #[arg(long, value_enum)]
         remote_shell: Option<RemoteShell>,
-        /// Fleet config file to update. Defaults to ~/.remote-workspace/workspaces.toml.
-        #[arg(long)]
-        fleet: Option<PathBuf>,
+    },
+    /// List configured workspaces in the fleet.
+    List,
+    /// Remove a workspace entry from the fleet file (does not touch the remote
+    /// host or its server state).
+    #[command(visible_alias = "remove")]
+    Rm {
+        /// Workspace name to remove.
+        name: String,
     },
     /// Install or upgrade the managed server for workspaces already in the
     /// fleet. One install per SSH identity, however many workspaces share it.
@@ -179,9 +203,6 @@ enum WorkspaceCmd {
     Upgrade {
         /// Workspace to upgrade. Omit to upgrade every workspace in the fleet.
         name: Option<String>,
-        /// Fleet config file to read. Defaults to ~/.remote-workspace/workspaces.toml.
-        #[arg(long)]
-        fleet: Option<PathBuf>,
     },
 }
 
@@ -201,15 +222,137 @@ fn default_log_dir() -> Result<PathBuf> {
     Ok(remote_workspace_client::home_dir("--log-dir")?.join(".remote-workspace/log"))
 }
 
+enum PreparedEdit {
+    Edits(Vec<remote_workspace_protocol::EditSpec>),
+    Replace(String),
+}
+
+fn prepare_edit(
+    old_text: Option<String>,
+    new_text: Option<String>,
+    replace_all: bool,
+    replace_file: Option<PathBuf>,
+) -> Result<PreparedEdit> {
+    if let Some(p) = replace_file {
+        if old_text.is_some() || new_text.is_some() || replace_all {
+            anyhow::bail!(
+                "--replace-file cannot be combined with --old-text, --new-text, or --replace-all"
+            );
+        }
+        let content = std::fs::read_to_string(&p).with_context(|| format!("read {p:?}"))?;
+        return Ok(PreparedEdit::Replace(content));
+    }
+    let (Some(old_text), Some(new_text)) = (old_text, new_text) else {
+        anyhow::bail!("edit requires either --old-text and --new-text, or --replace-file");
+    };
+    Ok(PreparedEdit::Edits(vec![
+        remote_workspace_protocol::EditSpec {
+            old_text,
+            new_text,
+            replace_all,
+        },
+    ]))
+}
+
+fn resolve_endpoint(cli: &Cli) -> Result<Endpoint> {
+    if let Some(ws_name) = &cli.workspace {
+        let mut conflicting = Vec::new();
+        if cli.host.is_some() {
+            conflicting.push("--host");
+        }
+        if cli.root.is_some() {
+            conflicting.push("--root");
+        }
+        if cli.local {
+            conflicting.push("--local");
+        }
+        if cli.config.is_some() {
+            conflicting.push("--config");
+        }
+        if cli.state_base.is_some() {
+            conflicting.push("--state-base");
+        }
+        if cli.remote_bin.is_some() {
+            conflicting.push("--remote-bin");
+        }
+        if cli.remote_shell.is_some() {
+            conflicting.push("--remote-shell");
+        }
+        if !conflicting.is_empty() {
+            anyhow::bail!(
+                "--workspace cannot be combined with {}; workspace connection settings come from the fleet config",
+                conflicting.join(", ")
+            );
+        }
+
+        let fleet_path = match &cli.fleet {
+            Some(p) => p.clone(),
+            None => remote_workspace_client::fleet::default_fleet_path()?,
+        };
+        let workspaces = remote_workspace_client::fleet::load_fleet(&fleet_path)?;
+        let ws = workspaces.get(ws_name).ok_or_else(|| {
+            let available = if workspaces.is_empty() {
+                "(none)".to_string()
+            } else {
+                workspaces.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            anyhow!(
+                "unknown_workspace: '{ws_name}' is not in {fleet_path:?}; available: {available}"
+            )
+        })?;
+        return Ok(ws.endpoint.clone());
+    }
+
+    if cli.fleet.is_some() {
+        anyhow::bail!("--fleet requires --workspace (or a `workspace` subcommand)");
+    }
+
+    let remote_bin = cli
+        .remote_bin
+        .clone()
+        .unwrap_or_else(|| "remote-workspace-server".into());
+    let remote_shell = cli.remote_shell.unwrap_or_default();
+    let root = cli
+        .root
+        .clone()
+        .ok_or_else(|| anyhow!("--root is required (or pass -w/--workspace <NAME>)"))?;
+    if cli.local {
+        Ok(Endpoint::Local {
+            server_bin: remote_bin,
+            root,
+            state_base: cli.state_base.clone(),
+            config: cli.config.clone(),
+        })
+    } else {
+        let host = cli.host.clone().ok_or_else(|| {
+            anyhow!("--host is required (or use --local or -w/--workspace <NAME>)")
+        })?;
+        Ok(Endpoint::Ssh {
+            host,
+            remote_shell,
+            remote_bin,
+            root,
+            state_base: cli.state_base.clone(),
+            config: cli.config.clone(),
+        })
+    }
+}
+
 async fn async_main_real() -> Result<()> {
     let cli = Cli::parse();
 
     // Admin commands do not connect to a server; handle them before the
-    // connect-based dispatch that requires --host/--root.
+    // connect-based dispatch.
     if let Command::Workspace { cmd } = &cli.command {
-        return handle_workspace(cmd).await;
+        if cli.workspace.is_some() {
+            anyhow::bail!("--workspace cannot be used with `workspace` subcommands");
+        }
+        return handle_workspace(cmd, cli.fleet).await;
     }
     if let Command::Stats { log_dir } = &cli.command {
+        if cli.workspace.is_some() {
+            anyhow::bail!("--workspace cannot be used with `stats`");
+        }
         let dir = match log_dir {
             Some(d) => d.clone(),
             None => default_log_dir()?,
@@ -228,6 +371,8 @@ async fn async_main_real() -> Result<()> {
         return Ok(());
     }
 
+    let endpoint = resolve_endpoint(&cli)?;
+
     let log = match &cli.log {
         Some(p) => Some(
             ClientLog::open(p.clone())
@@ -237,35 +382,25 @@ async fn async_main_real() -> Result<()> {
         None => None,
     };
 
-    let root = cli
-        .root
-        .clone()
-        .ok_or_else(|| anyhow!("--root is required"))?;
-    let endpoint = if cli.local {
-        remote_workspace_client::Endpoint::Local {
-            server_bin: cli.remote_bin.clone(),
-            root,
-            state_base: cli.state_base.clone(),
-            config: cli.config.clone(),
-        }
-    } else {
-        let host = cli.host.clone().ok_or_else(|| {
-            anyhow!("--host is required (or use --local to run the server locally)")
-        })?;
-        remote_workspace_client::Endpoint::Ssh {
-            host,
-            remote_shell: cli.remote_shell,
-            remote_bin: cli.remote_bin.clone(),
-            root,
-            state_base: cli.state_base.clone(),
-            config: cli.config.clone(),
-        }
-    };
-
-    // Read the content before connecting: the one-shot server exits after a
-    // second without a request, so slow stdin would outlive it.
+    // Read local file/stdin inputs before connecting: the one-shot server exits
+    // after a second without a request, so slow stdin would outlive it.
     let create_content = match &cli.command {
         Command::Create { file, .. } => Some(read_input(file.clone())?),
+        _ => None,
+    };
+    let prepared_edit = match &cli.command {
+        Command::Edit {
+            old_text,
+            new_text,
+            replace_all,
+            replace_file,
+            ..
+        } => Some(prepare_edit(
+            old_text.clone(),
+            new_text.clone(),
+            *replace_all,
+            replace_file.clone(),
+        )?),
         _ => None,
     };
 
@@ -307,10 +442,28 @@ async fn async_main_real() -> Result<()> {
             path,
             offset,
             limit,
+            start_line,
+            max_lines,
+            tail_lines,
+            tail_bytes,
         } => {
-            let r = client.read(&path, offset, limit).await?;
+            let r = client
+                .read_with(
+                    &path,
+                    ReadOptions {
+                        offset,
+                        limit,
+                        start_line,
+                        max_lines,
+                        tail_lines,
+                        tail_bytes,
+                    },
+                )
+                .await?;
             print!("{}", r.content);
-            if let Some(next) = r.next_offset {
+            if let Some(next_line) = r.next_line {
+                eprintln!("\n[truncated: use --start-line {next_line}]");
+            } else if let Some(next) = r.next_offset {
                 eprintln!("\n[truncated: use --offset {next}]");
             }
         }
@@ -320,25 +473,14 @@ async fn async_main_real() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
         Command::Edit {
-            path,
-            base_hash,
-            old_text,
-            new_text,
-            replace_all,
+            path, base_hash, ..
         } => {
-            // One replacement per invocation: a shell is the wrong place to
-            // author a list, and the agent-facing surface is the MCP tool.
-            let res = client
-                .edit(
-                    &path,
-                    &base_hash,
-                    vec![remote_workspace_protocol::EditSpec {
-                        old_text,
-                        new_text,
-                        replace_all,
-                    }],
-                )
-                .await?;
+            let res = match prepared_edit.expect("prepared before connecting") {
+                PreparedEdit::Edits(edits) => client.edit(&path, &base_hash, edits).await?,
+                PreparedEdit::Replace(content) => {
+                    client.replace(&path, &base_hash, &content).await?
+                }
+            };
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
         Command::Exec {
@@ -376,10 +518,6 @@ async fn async_main_real() -> Result<()> {
             let d = client.operation_get(&operation_id).await?;
             println!("{}", serde_json::to_string_pretty(&d)?);
         }
-        Command::Status { request_id } => {
-            let r = client.request_status(&request_id).await?;
-            println!("{}", serde_json::to_string_pretty(&r)?);
-        }
         Command::Gc { keep } => {
             let r = client.gc(keep).await?;
             println!("{}", serde_json::to_string_pretty(&r)?);
@@ -390,7 +528,7 @@ async fn async_main_real() -> Result<()> {
     Ok(())
 }
 
-async fn handle_workspace(cmd: &WorkspaceCmd) -> Result<()> {
+async fn handle_workspace(cmd: &WorkspaceCmd, fleet: Option<PathBuf>) -> Result<()> {
     match cmd {
         WorkspaceCmd::Add {
             name,
@@ -401,7 +539,6 @@ async fn handle_workspace(cmd: &WorkspaceCmd) -> Result<()> {
             state_base,
             remote_bin,
             remote_shell,
-            fleet,
         } => {
             workspace_add(WorkspaceAddParams {
                 name,
@@ -412,14 +549,59 @@ async fn handle_workspace(cmd: &WorkspaceCmd) -> Result<()> {
                 state_base: state_base.as_deref(),
                 remote_bin: remote_bin.as_deref(),
                 remote_shell: *remote_shell,
-                fleet: fleet.clone(),
+                fleet,
             })
             .await
         }
-        WorkspaceCmd::Upgrade { name, fleet } => {
-            workspace_upgrade(name.as_deref(), fleet.clone()).await
+        WorkspaceCmd::List => workspace_list(fleet),
+        WorkspaceCmd::Rm { name } => workspace_rm(name, fleet),
+        WorkspaceCmd::Upgrade { name } => workspace_upgrade(name.as_deref(), fleet).await,
+    }
+}
+
+fn workspace_list(fleet: Option<PathBuf>) -> Result<()> {
+    use remote_workspace_client::fleet;
+
+    let fleet_path = match fleet {
+        Some(path) => path,
+        None => fleet::default_fleet_path()?,
+    };
+    let workspaces = fleet::load_fleet(&fleet_path)?;
+    if workspaces.is_empty() {
+        println!("No workspaces configured.");
+        return Ok(());
+    }
+    let rows: Vec<(&str, &str, &str, Option<&str>)> = workspaces
+        .iter()
+        .map(|(name, ws)| {
+            let (host, root) = match &ws.endpoint {
+                Endpoint::Ssh { host, root, .. } => (host.as_str(), root.as_str()),
+                Endpoint::Local { root, .. } => ("(local)", root.as_str()),
+            };
+            (name.as_str(), host, root, ws.label.as_deref())
+        })
+        .collect();
+    let name_w = rows.iter().map(|(n, ..)| n.len()).max().unwrap_or(0);
+    let host_w = rows.iter().map(|(_, h, ..)| h.len()).max().unwrap_or(0);
+    for (name, host, root, label) in rows {
+        match label {
+            Some(l) => println!("{name:<name_w$}  {host:<host_w$}  {root}  {l}"),
+            None => println!("{name:<name_w$}  {host:<host_w$}  {root}"),
         }
     }
+    Ok(())
+}
+
+fn workspace_rm(name: &str, fleet: Option<PathBuf>) -> Result<()> {
+    use remote_workspace_client::fleet;
+
+    let fleet_path = match fleet {
+        Some(path) => path,
+        None => fleet::default_fleet_path()?,
+    };
+    fleet::remove_workspace_entry(&fleet_path, name)?;
+    println!("Removed workspace '{name}'.");
+    Ok(())
 }
 
 /// Upgrade the managed server behind already-registered workspaces. `add`
@@ -664,6 +846,40 @@ fn read_input(file: Option<PathBuf>) -> Result<String> {
             let mut s = String::new();
             std::io::stdin().read_to_string(&mut s)?;
             Ok(s)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn workspace_flag_rejects_explicit_connection_flags() {
+        for extra in [
+            vec!["--host", "h"],
+            vec!["--root", "/r"],
+            vec!["--local"],
+            vec!["--config", "/c.toml"],
+            vec!["--state-base", "/s"],
+            vec!["--remote-bin", "/bin/srv"],
+            vec!["--remote-shell", "posix"],
+        ] {
+            let mut argv = vec!["remote-workspace", "-w", "ws"];
+            argv.extend(extra.iter().copied());
+            argv.extend(["ls", "."]);
+            let cli = Cli::try_parse_from(&argv).unwrap();
+            let err = resolve_endpoint(&cli).unwrap_err().to_string();
+            assert!(
+                err.contains("--workspace cannot be combined with"),
+                "{argv:?} -> {err}"
+            );
         }
     }
 }

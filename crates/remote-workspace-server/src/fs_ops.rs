@@ -1,11 +1,12 @@
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use remote_workspace_protocol::{
-    ErrorCode, FileEntry, ListEntry, ListKind, MutationResult, OperationKind, ProtocolError,
-    ReadResult, ResultBody,
+    ErrorCode, FileEntry, FsOperationRecord, ListEntry, ListKind, MutationResult, OperationKind,
+    ProtocolError, ReadOptions, ReadResult, ResultBody,
 };
-use tokio::sync::MutexGuard;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::hash::hash_file;
 use crate::store::OperationStore;
@@ -16,12 +17,16 @@ pub const LIST_MAX_LIMIT: usize = 1000;
 /// Upper bound on create/edit text inputs, on the file being edited, and on
 /// the resulting file. Larger or binary files go through upload_file.
 pub const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
-/// Upper bound on replacements in one `edit`. Each is separately bounded by
-/// MAX_TEXT_BYTES; this bounds the request as a whole.
 pub const MAX_EDITS: usize = 100;
-/// Mode of a file this server creates; temp files start out 0600.
+pub const READ_DEFAULT_LIMIT: u64 = 65536;
+pub const READ_MAX_LIMIT: u64 = 64 * 1024;
+pub const READ_MAX_LINES: u64 = 2000;
 #[cfg(unix)]
 pub(crate) const NEW_FILE_MODE: u32 = 0o644;
+
+const UTF8_TAIL_SLACK: u64 = 3;
+const FILE_ABSENT_HASH: &str = "sha256:";
+const MUTATE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn list(
     ws: &Workspace,
@@ -57,13 +62,11 @@ pub fn list(
     for entry in std::fs::read_dir(&abs).map_err(list_failed)? {
         let entry = entry.map_err(list_failed)?;
         let name = entry.file_name().to_string_lossy().to_string();
-        // The server's own state directory, when the root is its home.
         if abs == ws.root && name == ".remote-workspace" {
             continue;
         }
         let meta = match entry.metadata() {
             Ok(meta) => meta,
-            // Removed since the directory was read.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(list_failed(e)),
         };
@@ -106,22 +109,7 @@ pub fn stat(ws: &Workspace, path: &str) -> Result<ResultBody, ProtocolError> {
     Ok(ResultBody::Stat { stat: entry })
 }
 
-fn check_offset(start: u64, file_len: u64) -> Result<(), ProtocolError> {
-    if start > file_len {
-        return Err(ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            format!("offset {start} is past end of file ({file_len} bytes)"),
-        ));
-    }
-    Ok(())
-}
-
-pub fn read(
-    ws: &Workspace,
-    path: &str,
-    offset: Option<u64>,
-    limit: Option<u64>,
-) -> Result<ResultBody, ProtocolError> {
+pub fn read(ws: &Workspace, path: &str, opts: ReadOptions) -> Result<ResultBody, ProtocolError> {
     let abs = ws.resolve(path)?;
     let meta = std::fs::metadata(&abs).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -139,6 +127,55 @@ pub fn read(
     if !meta.is_file() {
         return Err(not_a_regular_file(path));
     }
+
+    let has_byte = opts.offset.is_some() || opts.limit.is_some();
+    let has_line = opts.start_line.is_some() || opts.max_lines.is_some();
+    let has_tail_lines = opts.tail_lines.is_some();
+    let has_tail_bytes = opts.tail_bytes.is_some();
+    if has_tail_lines && has_tail_bytes {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "tail_lines and tail_bytes are mutually exclusive",
+        ));
+    }
+    let mode_count = usize::from(has_byte)
+        + usize::from(has_line)
+        + usize::from(has_tail_lines || has_tail_bytes);
+    if mode_count > 1 {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "read modes are mutually exclusive: choose byte (offset/limit), line (start_line/max_lines), or tail (tail_lines or tail_bytes)",
+        ));
+    }
+
+    let result = if has_line {
+        read_line_mode(&abs, meta.len(), opts.start_line, opts.max_lines)?
+    } else if let Some(tb) = opts.tail_bytes {
+        read_tail_bytes_mode(&abs, meta.len(), tb)?
+    } else if let Some(tl) = opts.tail_lines {
+        read_tail_lines_mode(&abs, meta.len(), tl)?
+    } else {
+        read_byte_mode(&abs, meta.len(), opts.offset, opts.limit)?
+    };
+    Ok(ResultBody::Read(result))
+}
+
+fn check_offset(start: u64, file_len: u64) -> Result<(), ProtocolError> {
+    if start > file_len {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("offset {start} is past end of file ({file_len} bytes)"),
+        ));
+    }
+    Ok(())
+}
+
+fn read_byte_mode(
+    abs: &Path,
+    meta_len: u64,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<ReadResult, ProtocolError> {
     let limit = limit.unwrap_or(READ_DEFAULT_LIMIT);
     if limit == 0 || limit > READ_MAX_LIMIT {
         return Err(ProtocolError::new(
@@ -146,94 +183,416 @@ pub fn read(
             format!("read limit must be between 1 and {READ_MAX_LIMIT} bytes"),
         ));
     }
-    let start = offset.unwrap_or(0);
+    let start_offset = offset.unwrap_or(0);
 
-    // The hash exists to be passed back as `edit`'s base_hash, and `edit`
-    // refuses files above MAX_TEXT_BYTES, so only those files get one. It must
-    // be the hash of the bytes this page came from -- hashing a second read
-    // would pair this content with whatever the file holds by then -- so such
-    // a file is read once, whole. A larger one has only the requested window
-    // (plus enough slack to finish a codepoint straddling its end) read:
-    // paging through a multi-GB exec log is the documented way to read large
-    // output, so cost per page must depend on the page, not on the file.
-    let mut file = std::fs::File::open(&abs).map_err(io_read_error)?;
-    let (file_len, mut window, hash) = if meta.len() <= MAX_TEXT_BYTES as u64 {
+    let mut file = std::fs::File::open(abs).map_err(io_read_error)?;
+    let (total_bytes, mut window, hash) = if meta_len <= MAX_TEXT_BYTES as u64 {
         let mut whole = Vec::new();
         file.read_to_end(&mut whole).map_err(io_read_error)?;
-        let file_len = whole.len() as u64;
-        check_offset(start, file_len)?;
-        let end = whole.len().min((start + limit + UTF8_TAIL_SLACK) as usize);
-        let window = whole[start as usize..end].to_vec();
-        (file_len, window, Some(crate::hash::hash_bytes(&whole)))
+        let total_bytes = whole.len() as u64;
+        check_offset(start_offset, total_bytes)?;
+        let end = whole.len().min(
+            start_offset
+                .saturating_add(limit)
+                .saturating_add(UTF8_TAIL_SLACK) as usize,
+        );
+        let window = whole[start_offset as usize..end].to_vec();
+        (total_bytes, window, Some(crate::hash::hash_bytes(&whole)))
     } else {
-        let file_len = meta.len();
-        check_offset(start, file_len)?;
-        file.seek(std::io::SeekFrom::Start(start))
+        let total_bytes = meta_len;
+        check_offset(start_offset, total_bytes)?;
+        file.seek(SeekFrom::Start(start_offset))
             .map_err(io_read_error)?;
         let mut window = Vec::new();
         file.take(limit + UTF8_TAIL_SLACK)
             .read_to_end(&mut window)
             .map_err(io_read_error)?;
-        (file_len, window, None)
+        (total_bytes, window, None)
     };
 
-    // offset/limit are BYTE positions but must land on UTF-8 char boundaries.
-    // In valid UTF-8 a boundary is any byte that is not a continuation byte;
-    // content that is not valid UTF-8 is rejected below. Reject (not truncate)
-    // a non-boundary offset so a bad request cannot yield mojibake.
     if window.first().is_some_and(|b| is_continuation(*b)) {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
-            format!("offset {start} is not on a UTF-8 character boundary"),
+            format!("offset {start_offset} is not on a UTF-8 character boundary"),
         ));
     }
-    // Cut at `limit`, then walk FORWARD to the next char boundary. If we
-    // instead rounded down, a multi-byte first codepoint with a tiny limit
-    // would produce an empty page with truncated=true forever (the caller could
-    // never make progress). Rounding up guarantees at least one codepoint is
-    // returned whenever data remains and limit > 0.
     let mut end = window.len().min(limit as usize);
     while end < window.len() && is_continuation(window[end]) {
         end += 1;
     }
     window.truncate(end);
-    // Reject non-UTF-8 content rather than silently returning a lossy
-    // conversion: a coding agent should not edit a binary file through a
-    // text-oriented API.
-    let content = String::from_utf8(window).map_err(|_| {
-        ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            "file is not valid UTF-8; binary reads are not supported",
-        )
-    })?;
-    let next_offset = start + end as u64;
-    let truncated = next_offset < file_len;
-    Ok(ResultBody::Read(ReadResult {
+    let content = String::from_utf8(window).map_err(|_| non_utf8_read_error())?;
+    let end_offset = start_offset + content.len() as u64;
+    let truncated = end_offset < total_bytes;
+    let trailing_newline = content.ends_with('\n');
+    Ok(ReadResult {
         content,
+        total_bytes,
+        start_offset,
+        end_offset,
+        trailing_newline,
+        start_line: None,
+        end_line: None,
+        total_lines: None,
+        next_line: None,
         hash,
         truncated,
-        next_offset: truncated.then_some(next_offset),
-    }))
+        next_offset: truncated.then_some(end_offset),
+    })
 }
 
-/// Extra bytes read past `limit` so a page ending mid-codepoint can be
-/// extended to the next boundary; a UTF-8 sequence is at most 4 bytes.
-const UTF8_TAIL_SLACK: u64 = 3;
+fn read_line_mode(
+    abs: &Path,
+    meta_len: u64,
+    start_line: Option<u64>,
+    max_lines: Option<u64>,
+) -> Result<ReadResult, ProtocolError> {
+    let start_line = start_line.unwrap_or(1);
+    if start_line == 0 {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "start_line must be >= 1",
+        ));
+    }
+    let raw_max_lines = max_lines.unwrap_or(READ_MAX_LINES);
+    if raw_max_lines == 0 {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "max_lines must be >= 1",
+        ));
+    }
+    let max_lines = raw_max_lines.min(READ_MAX_LINES);
+
+    let too_large = || {
+        ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "file exceeds {MAX_TEXT_BYTES} bytes; use byte offset or tail_lines/tail_bytes for files > 4 MiB"
+            ),
+        )
+    };
+    if meta_len > MAX_TEXT_BYTES as u64 {
+        return Err(too_large());
+    }
+    let whole = std::fs::read(abs).map_err(io_read_error)?;
+    if whole.len() > MAX_TEXT_BYTES {
+        return Err(too_large());
+    }
+    let total_bytes = whole.len() as u64;
+    let hash = Some(crate::hash::hash_bytes(&whole));
+    let text = String::from_utf8(whole).map_err(|_| non_utf8_read_error())?;
+
+    if text.is_empty() {
+        if start_line > 1 {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                format!("start_line {start_line} is past end of file (0 lines)"),
+            ));
+        }
+        return Ok(ReadResult {
+            content: String::new(),
+            total_bytes: 0,
+            start_offset: 0,
+            end_offset: 0,
+            trailing_newline: false,
+            start_line: None,
+            end_line: None,
+            total_lines: Some(0),
+            next_line: None,
+            hash,
+            truncated: false,
+            next_offset: None,
+        });
+    }
+
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let total_lines = lines.len() as u64;
+    if start_line > total_lines {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("start_line {start_line} is past end of file ({total_lines} lines)"),
+        ));
+    }
+
+    let start_idx = (start_line - 1) as usize;
+    let start_offset: u64 = lines[..start_idx].iter().map(|l| l.len() as u64).sum();
+    let first = lines[start_idx];
+    if first.len() > READ_MAX_LIMIT as usize {
+        let mut cut = READ_MAX_LIMIT as usize;
+        while !first.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let content = first[..cut].to_string();
+        let end_offset = start_offset + content.len() as u64;
+        let trailing_newline = content.ends_with('\n');
+        return Ok(ReadResult {
+            content,
+            total_bytes,
+            start_offset,
+            end_offset,
+            trailing_newline,
+            start_line: Some(start_line),
+            end_line: Some(start_line),
+            total_lines: Some(total_lines),
+            next_line: None,
+            hash,
+            truncated: true,
+            next_offset: Some(end_offset),
+        });
+    }
+
+    let end_bound = start_idx
+        .saturating_add(max_lines as usize)
+        .min(lines.len());
+    let mut byte_len = 0usize;
+    let mut count = 0u64;
+    for line in &lines[start_idx..end_bound] {
+        if byte_len + line.len() > READ_MAX_LIMIT as usize {
+            break;
+        }
+        byte_len += line.len();
+        count += 1;
+    }
+    let content = text[start_offset as usize..start_offset as usize + byte_len].to_string();
+    let end_offset = start_offset + byte_len as u64;
+    let end_line = start_line + count - 1;
+    let truncated = end_line < total_lines;
+    let trailing_newline = content.ends_with('\n');
+    Ok(ReadResult {
+        content,
+        total_bytes,
+        start_offset,
+        end_offset,
+        trailing_newline,
+        start_line: Some(start_line),
+        end_line: Some(end_line),
+        total_lines: Some(total_lines),
+        next_line: truncated.then_some(end_line + 1),
+        hash,
+        truncated,
+        next_offset: truncated.then_some(end_offset),
+    })
+}
+
+fn read_tail_bytes_mode(
+    abs: &Path,
+    meta_len: u64,
+    tail_bytes: u64,
+) -> Result<ReadResult, ProtocolError> {
+    if tail_bytes == 0 || tail_bytes > READ_MAX_LIMIT {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("tail_bytes must be between 1 and {READ_MAX_LIMIT} bytes"),
+        ));
+    }
+
+    let (total_bytes, raw_start, buf, hash) = if meta_len <= MAX_TEXT_BYTES as u64 {
+        let whole = std::fs::read(abs).map_err(io_read_error)?;
+        let total_bytes = whole.len() as u64;
+        let hash = Some(crate::hash::hash_bytes(&whole));
+        let raw_start = total_bytes.saturating_sub(tail_bytes);
+        (
+            total_bytes,
+            raw_start,
+            whole[raw_start as usize..].to_vec(),
+            hash,
+        )
+    } else {
+        let mut file = std::fs::File::open(abs).map_err(io_read_error)?;
+        let raw_start = meta_len.saturating_sub(tail_bytes);
+        file.seek(SeekFrom::Start(raw_start))
+            .map_err(io_read_error)?;
+        let mut buf = Vec::new();
+        file.take(tail_bytes)
+            .read_to_end(&mut buf)
+            .map_err(io_read_error)?;
+        let total_bytes = raw_start + buf.len() as u64;
+        (total_bytes, raw_start, buf, None)
+    };
+
+    let skip = if raw_start > 0 {
+        leading_continuation_count(&buf)
+    } else {
+        0
+    };
+    let content = std::str::from_utf8(&buf[skip..])
+        .map_err(|_| non_utf8_read_error())?
+        .to_string();
+    let start_offset = raw_start + skip as u64;
+    let end_offset = start_offset + content.len() as u64;
+    let truncated = start_offset > 0;
+    let trailing_newline = content.ends_with('\n');
+    Ok(ReadResult {
+        content,
+        total_bytes,
+        start_offset,
+        end_offset,
+        trailing_newline,
+        start_line: None,
+        end_line: None,
+        total_lines: None,
+        next_line: None,
+        hash,
+        truncated,
+        next_offset: None,
+    })
+}
+
+fn read_tail_lines_mode(
+    abs: &Path,
+    meta_len: u64,
+    tail_lines: u64,
+) -> Result<ReadResult, ProtocolError> {
+    if tail_lines == 0 || tail_lines > READ_MAX_LINES {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("tail_lines must be between 1 and {READ_MAX_LINES} lines"),
+        ));
+    }
+
+    if meta_len <= MAX_TEXT_BYTES as u64 {
+        let whole = std::fs::read(abs).map_err(io_read_error)?;
+        if whole.len() <= MAX_TEXT_BYTES {
+            let total_bytes = whole.len() as u64;
+            let hash = Some(crate::hash::hash_bytes(&whole));
+            let text = String::from_utf8(whole).map_err(|_| non_utf8_read_error())?;
+            if text.is_empty() {
+                return Ok(ReadResult {
+                    content: String::new(),
+                    total_bytes: 0,
+                    start_offset: 0,
+                    end_offset: 0,
+                    trailing_newline: false,
+                    start_line: None,
+                    end_line: None,
+                    total_lines: Some(0),
+                    next_line: None,
+                    hash,
+                    truncated: false,
+                    next_offset: None,
+                });
+            }
+            let lines: Vec<&str> = text.split_inclusive('\n').collect();
+            let total_lines = lines.len() as u64;
+            let (content, first_idx) = slice_tail_lines(&text, &lines, tail_lines as usize);
+            let start_offset = total_bytes - content.len() as u64;
+            let trailing_newline = content.ends_with('\n');
+            return Ok(ReadResult {
+                content,
+                total_bytes,
+                start_offset,
+                end_offset: total_bytes,
+                trailing_newline,
+                start_line: Some(first_idx as u64 + 1),
+                end_line: Some(total_lines),
+                total_lines: Some(total_lines),
+                next_line: None,
+                hash,
+                truncated: start_offset > 0,
+                next_offset: None,
+            });
+        }
+    }
+
+    // Read 64 KiB + 4 bytes so after skipping at most 3 UTF-8 continuation
+    // bytes, `window_str.len() > READ_MAX_LIMIT`: `lines[0]` (any partial
+    // leading line) can never fit when >= 2 lines exist in the window.
+    let window_cap = READ_MAX_LIMIT + UTF8_TAIL_SLACK + 1;
+    let mut file = std::fs::File::open(abs).map_err(io_read_error)?;
+    let raw_start = meta_len.saturating_sub(window_cap);
+    file.seek(SeekFrom::Start(raw_start))
+        .map_err(io_read_error)?;
+    let mut buf = Vec::new();
+    file.take(window_cap)
+        .read_to_end(&mut buf)
+        .map_err(io_read_error)?;
+    let total_bytes = raw_start + buf.len() as u64;
+    let skip = if raw_start > 0 {
+        leading_continuation_count(&buf)
+    } else {
+        0
+    };
+    let window_str = std::str::from_utf8(&buf[skip..]).map_err(|_| non_utf8_read_error())?;
+    if window_str.is_empty() {
+        return Ok(ReadResult {
+            content: String::new(),
+            total_bytes,
+            start_offset: total_bytes,
+            end_offset: total_bytes,
+            trailing_newline: false,
+            start_line: None,
+            end_line: None,
+            total_lines: None,
+            next_line: None,
+            hash: None,
+            truncated: total_bytes > 0,
+            next_offset: None,
+        });
+    }
+    let lines: Vec<&str> = window_str.split_inclusive('\n').collect();
+    let (content, _) = slice_tail_lines(window_str, &lines, tail_lines as usize);
+    let start_offset = total_bytes - content.len() as u64;
+    let trailing_newline = content.ends_with('\n');
+    Ok(ReadResult {
+        content,
+        total_bytes,
+        start_offset,
+        end_offset: total_bytes,
+        trailing_newline,
+        start_line: None,
+        end_line: None,
+        total_lines: None,
+        next_line: None,
+        hash: None,
+        truncated: start_offset > 0,
+        next_offset: None,
+    })
+}
+
+fn slice_tail_lines(text: &str, lines: &[&str], tail_lines: usize) -> (String, usize) {
+    let last_idx = lines.len() - 1;
+    if lines[last_idx].len() > READ_MAX_LIMIT as usize {
+        let raw = &text.as_bytes()[text.len() - READ_MAX_LIMIT as usize..];
+        let skip = leading_continuation_count(raw);
+        let s = std::str::from_utf8(&raw[skip..]).expect("slice of valid UTF-8 after char snap");
+        return (s.to_string(), last_idx);
+    }
+    let min_idx = lines.len().saturating_sub(tail_lines);
+    let mut byte_len = 0usize;
+    let mut first_idx = last_idx;
+    for i in (min_idx..=last_idx).rev() {
+        if byte_len + lines[i].len() > READ_MAX_LIMIT as usize {
+            break;
+        }
+        byte_len += lines[i].len();
+        first_idx = i;
+    }
+    (text[text.len() - byte_len..].to_string(), first_idx)
+}
+
+fn leading_continuation_count(buf: &[u8]) -> usize {
+    let mut skip = 0usize;
+    while skip < 3 && skip < buf.len() && is_continuation(buf[skip]) {
+        skip += 1;
+    }
+    skip
+}
 
 fn is_continuation(byte: u8) -> bool {
     byte & 0xC0 == 0x80
+}
+
+fn non_utf8_read_error() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::InvalidRequest,
+        "file is not valid UTF-8; binary reads are not supported",
+    )
 }
 
 fn io_read_error(e: std::io::Error) -> ProtocolError {
     ProtocolError::new(ErrorCode::IoError, format!("read failed: {e}"))
 }
 
-pub const READ_DEFAULT_LIMIT: u64 = 65536;
-pub const READ_MAX_LIMIT: u64 = 64 * 1024;
-
-/// True for a hash in the form this server issues. A caller that invents a
-/// placeholder ("auto", "sha256:REPLACE") must not be told the file is stale:
-/// that sends it to re-read and retry a call that will fail identically.
 fn is_well_formed_hash(hash: &str) -> bool {
     match hash.strip_prefix("sha256:") {
         Some(hex) => hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -241,12 +600,6 @@ fn is_well_formed_hash(hash: &str) -> bool {
     }
 }
 
-/// The content the caller decided to overwrite still being what is on disk.
-/// Taken as late as possible -- with the replacement already staged -- because
-/// everything before it (reading, building the result, appending to the log) is
-/// time in which `exec`, which deliberately runs without the mutation guard, or
-/// any process on the host can write to the same path. Once the rename lands,
-/// that write is gone.
 fn verify_unchanged(abs: &Path, expected: &str, client_path: &str) -> Result<(), ProtocolError> {
     let now = hash_file(abs)?;
     if now.as_deref() != Some(expected) {
@@ -262,16 +615,6 @@ fn verify_unchanged(abs: &Path, expected: &str, client_path: &str) -> Result<(),
     Ok(())
 }
 
-/// Stands in for "no file" where a hash is expected.
-const FILE_ABSENT_HASH: &str = "sha256:";
-
-/// A replacement written to a temp file beside its target, ready to be renamed
-/// over it.
-///
-/// Staging is separate from installing so the caller can take its last look at
-/// the target with the new content already on disk: only the rename then
-/// separates that look from the write it authorizes. It also makes each failure
-/// unambiguous -- everything up to `install` leaves the workspace untouched.
 struct StagedWrite {
     tmp: tempfile::NamedTempFile,
     new_hash: String,
@@ -284,17 +627,14 @@ fn write_temp(dir: &Path) -> std::io::Result<tempfile::NamedTempFile> {
         .tempfile_in(dir)
 }
 
-/// Data must be durable before the rename that publishes it: otherwise a
-/// crash right after can leave the new name pointing at an empty file, which
-/// is neither the old content nor the new.
+/// Sync file data (`fdatasync`) before atomic rename so a power loss never
+/// leaves a zero-filled or torn target file.
 fn write_synced(tmp: &tempfile::NamedTempFile, content: &[u8]) -> std::io::Result<()> {
     let mut file = tmp.as_file();
     file.write_all(content)?;
-    file.sync_all()
+    file.sync_data()
 }
 
-/// Write `content` to a temp file in the target's directory, preserving the
-/// target's mode (so a 0755 script stays 0755).
 fn stage_write(abs: &Path, content: &[u8]) -> Result<StagedWrite, ProtocolError> {
     let parent = abs
         .parent()
@@ -323,257 +663,89 @@ fn stage_write(abs: &Path, content: &[u8]) -> Result<StagedWrite, ProtocolError>
     })
 }
 
-/// The `create` half of the write-ahead sequence: record the intent, install
-/// exclusively, record the result. Returns the operation id and the hash.
-fn write_ahead_create(
-    store: &OperationStore,
-    request_id: &str,
-    path: &str,
-    abs: &Path,
-    content: &[u8],
-) -> Result<(String, String), ProtocolError> {
-    let new_hash = crate::hash::hash_bytes(content);
-    let op_id = store.prepare_fs_record(
-        request_id,
-        OperationKind::Create,
-        path,
-        None,
-        new_hash.clone(),
-    )?;
-    if let Err(f) = atomic_create_bytes(abs, content, path) {
-        // The path being empty right now is not a reason to leave the marker:
-        // by the time recovery runs, another writer may have put the requested
-        // bytes there, and recovery cannot tell them from this create's own.
-        if !f.changed {
-            store.abort_prepared(&op_id)?;
-        }
-        return Err(f.error);
-    }
-    store.commit_fs_record(
-        &op_id,
-        request_id,
-        OperationKind::Create,
-        path,
-        None,
-        new_hash.clone(),
-    )?;
-    Ok((op_id, new_hash))
-}
-
-/// The `delete` half of the write-ahead sequence. Returns the operation id.
-fn write_ahead_delete(
-    store: &OperationStore,
-    request_id: &str,
-    path: &str,
-    abs: &Path,
-    before_hash: &Option<String>,
-) -> Result<String, ProtocolError> {
-    let op_id = store.prepare_fs_record(
-        request_id,
-        OperationKind::Delete,
-        path,
-        before_hash.clone(),
-        FILE_ABSENT_HASH.into(),
-    )?;
-    if let Err(e) = std::fs::remove_file(abs) {
-        // Withdrawn whatever went wrong: an absent file reads as success for a
-        // delete marker, so a removal someone else did would be credited to
-        // this request.
-        store.abort_prepared(&op_id)?;
-        return Err(ProtocolError::new(
-            ErrorCode::IoError,
-            format!("remove failed: {e}"),
-        ));
-    }
-    if let Some(parent) = abs.parent() {
-        crate::fsync::fsync_dir(parent).map_err(|e| {
-            ProtocolError::new(ErrorCode::IoError, format!("fsync after delete: {e}"))
-        })?;
-    }
-    store.commit_fs_record(
-        &op_id,
-        request_id,
-        OperationKind::Delete,
-        path,
-        before_hash.clone(),
-        FILE_ABSENT_HASH.into(),
-    )?;
-    Ok(op_id)
-}
-
-/// The `edit` half: record the intent, take the last look, install, record the
-/// result. The order of these four is the whole correctness argument, and they
-/// are one function so the unwinding stays with them. Returns the operation id
-/// and the installed hash.
-fn write_ahead_install(
-    store: &OperationStore,
-    request_id: &str,
-    path: &str,
-    abs: &Path,
-    before: &str,
-    staged: StagedWrite,
-) -> Result<(String, String), ProtocolError> {
-    let new_hash = staged.new_hash.clone();
-    let op_id = store.prepare_fs_record(
-        request_id,
-        OperationKind::Edit,
-        path,
-        Some(before.to_string()),
-        new_hash.clone(),
-    )?;
-    // The last look, with the replacement already staged: one syscall stands
-    // between it and the rename. It cannot be made atomic -- POSIX offers no
-    // "rename only if the target still hashes to X", and the writers this
-    // guards against (`exec`, anything else on the host) hold no lock to
-    // coordinate with -- so this narrows the window to its floor rather than
-    // closing it.
-    if let Err(e) = verify_unchanged(abs, before, path) {
-        store.abort_prepared(&op_id)?;
-        return Err(e);
-    }
-    if let Err(f) = staged.install(abs) {
-        // A durability failure after the rename keeps its marker for the next
-        // start to re-hash: committing here would claim a change survived a
-        // crash when the sync guaranteeing that is what failed. Such a marker
-        // is exempt from pruning, so a disk whose fsync keeps failing grows the
-        // log by a line per attempt until restart.
-        if !f.changed {
-            store.abort_prepared(&op_id)?;
-        }
-        return Err(f.error);
-    }
-    store.commit_fs_record(
-        &op_id,
-        request_id,
-        OperationKind::Edit,
-        path,
-        Some(before.to_string()),
-        new_hash.clone(),
-    )?;
-    Ok((op_id, new_hash))
-}
-
-/// A failed install, and whether it left the workspace changed.
-///
-/// This decides the prepared marker's fate, and neither mistake is recoverable
-/// from: a marker kept for a mutation that never happened can be matched later
-/// against a file some other writer produced and synthesized into a commit that
-/// never occurred, while a marker withdrawn for a mutation that DID happen
-/// loses the record of a real change. So the failing step has to say which.
-#[derive(Debug)]
-struct InstallFailure {
-    changed: bool,
-    error: ProtocolError,
-}
-
 impl StagedWrite {
-    /// Rename into place, then sync the parent so the rename survives a crash
-    /// on journaling/COW filesystems.
-    fn install(self, abs: &Path) -> Result<String, InstallFailure> {
-        self.tmp.persist(abs).map_err(|e| InstallFailure {
-            changed: false,
-            error: ProtocolError::new(ErrorCode::IoError, format!("atomic persist failed: {e}")),
-        })?;
-        crate::fsync::fsync_file_or_dir(abs).map_err(|e| InstallFailure {
-            changed: true,
-            error: ProtocolError::new(ErrorCode::IoError, format!("fsync after write failed: {e}")),
+    fn install(self, abs: &Path) -> Result<String, ProtocolError> {
+        self.tmp.persist(abs).map_err(|e| {
+            ProtocolError::new(ErrorCode::IoError, format!("atomic persist failed: {e}"))
         })?;
         Ok(self.new_hash)
     }
 }
 
-/// Atomically install a NEW file at abs without ever replacing an existing
-/// one: temp file in the same directory, then a no-clobber persist (which
-/// fails with AlreadyExists instead of clobbering, even against a concurrent
-/// creator such as a command run in the workspace). A hard link would do the
-/// same on Unix, but on Windows would keep the temp file's TEMPORARY
-/// attribute, which only `persist` clears.
+/// Serialize the `verify_unchanged` + `persist` window across concurrent server
+/// processes sharing `state_dir` so conflicting edits deterministically fail
+/// with `STALE_FILE` instead of racing a clobber.
+fn with_mutation_lock<T>(
+    state_dir: &Path,
+    f: impl FnOnce() -> Result<T, ProtocolError>,
+) -> Result<T, ProtocolError> {
+    let lock_path = state_dir.join("mutate.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("open mutate lock: {e}")))?;
+    let deadline = Instant::now() + MUTATE_LOCK_TIMEOUT;
+    loop {
+        if crate::locking::try_lock_exclusive(&lock_file, 0)
+            .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("mutate lock: {e}")))?
+        {
+            let result = f();
+            crate::locking::unlock(&lock_file, 0);
+            return result;
+        }
+        if Instant::now() >= deadline {
+            return Err(ProtocolError::new(
+                ErrorCode::IoError,
+                "timed out acquiring workspace mutation lock",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn atomic_create_bytes(
     abs: &Path,
     content: &[u8],
     client_path: &str,
-) -> Result<(), InstallFailure> {
-    // Only the link creates the FILE, and only the sync after it can fail with
-    // the file already there -- which is what the marker's fate turns on. Note
-    // that a failure before the link can still leave parent directories behind:
-    // they are made unconditionally, and removing them again would race every
-    // other writer that may have started using them.
-    let not_yet = |e: ProtocolError| InstallFailure {
-        changed: false,
-        error: e,
-    };
-    let parent = abs.parent().ok_or_else(|| {
-        not_yet(ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            "path has no parent",
-        ))
-    })?;
-    // The highest directory this create is about to make, if any.
-    let first_new = parent
-        .ancestors()
-        .take_while(|dir| matches!(dir.try_exists(), Ok(false)))
-        .last()
-        .map(Path::to_path_buf);
-    std::fs::create_dir_all(parent).map_err(|e| {
-        not_yet(ProtocolError::new(
-            ErrorCode::IoError,
-            format!("mkdir failed: {e}"),
-        ))
-    })?;
+) -> Result<String, ProtocolError> {
+    let parent = abs
+        .parent()
+        .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidRequest, "path has no parent"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("mkdir failed: {e}")))?;
     let tmp = write_temp(parent).map_err(|e| {
-        not_yet(ProtocolError::new(
-            ErrorCode::IoError,
-            format!("temp file create failed: {e}"),
-        ))
+        ProtocolError::new(ErrorCode::IoError, format!("temp file create failed: {e}"))
     })?;
-    write_synced(&tmp, content).map_err(|e| {
-        not_yet(ProtocolError::new(
-            ErrorCode::IoError,
-            format!("temp write failed: {e}"),
-        ))
-    })?;
+    write_synced(&tmp, content)
+        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("temp write failed: {e}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(NEW_FILE_MODE))
             .map_err(|e| {
-                not_yet(ProtocolError::new(
-                    ErrorCode::IoError,
-                    format!("chmod temp failed: {e}"),
-                ))
+                ProtocolError::new(ErrorCode::IoError, format!("chmod temp failed: {e}"))
             })?;
     }
     tmp.persist_noclobber(abs).map_err(|e| {
         let e = e.error;
-        not_yet(if e.kind() == std::io::ErrorKind::AlreadyExists {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
             ProtocolError::new(
                 ErrorCode::AlreadyExists,
                 format!("already exists: {client_path}; modify existing files with edit"),
             )
         } else {
             ProtocolError::new(ErrorCode::IoError, format!("install failed: {e}"))
-        })
+        }
     })?;
-    let synced = crate::fsync::fsync_file_or_dir(abs).and_then(|()| match &first_new {
-        Some(top) => crate::fsync::fsync_new_dirs(parent, top),
-        None => Ok(()),
-    });
-    synced.map_err(|e| InstallFailure {
-        changed: true,
-        error: ProtocolError::new(
-            ErrorCode::IoError,
-            format!("fsync after create failed: {e}"),
-        ),
-    })?;
-    Ok(())
+    Ok(crate::hash::hash_bytes(content))
 }
 
-/// Create a new text file. Refuses to touch an existing path: existing files
-/// are modified only through `edit`, so there is exactly one editing path.
 pub fn create(
     ws: &Workspace,
     store: &OperationStore,
-    _guard: &MutexGuard<'_, ()>,
+    _guard: &OwnedMutexGuard<()>,
     request_id: &str,
     path: &str,
     content: &str,
@@ -595,7 +767,17 @@ pub fn create(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let (op_id, new_hash) = write_ahead_create(store, request_id, path, &abs, content.as_bytes())?;
+    let new_hash = atomic_create_bytes(&abs, content.as_bytes(), path)?;
+    let op_id = store.next_operation_id();
+    store.append_fs_record(FsOperationRecord {
+        operation_id: op_id.clone(),
+        request_id: request_id.to_string(),
+        kind: OperationKind::Create,
+        path: path.to_string(),
+        before_hash: None,
+        after_hash: new_hash.clone(),
+        timestamp_ms: now_ms(),
+    })?;
     Ok(ResultBody::Mutation(MutationResult {
         operation_id: op_id,
         old_hash: None,
@@ -603,8 +785,6 @@ pub fn create(
     }))
 }
 
-/// Position of a replacement in the list, for error messages. A lone
-/// replacement needs no index and reads better without one.
 fn edit_prefix(index: usize, total: usize) -> String {
     if total == 1 {
         String::new()
@@ -613,60 +793,70 @@ fn edit_prefix(index: usize, total: usize) -> String {
     }
 }
 
-/// Apply exact text replacements to an existing UTF-8 file.
-///
-/// The replacements are applied in order, each to the result of the one before
-/// it, and the complete new content is built and validated before anything is
-/// written. One atomic rename installs it, so a failure at any position leaves
-/// the file byte-for-byte unchanged and the whole list is one operation.
+#[allow(clippy::too_many_arguments)]
 pub fn edit(
     ws: &Workspace,
     store: &OperationStore,
-    _guard: &MutexGuard<'_, ()>,
+    _guard: &OwnedMutexGuard<()>,
     request_id: &str,
     path: &str,
     base_hash: &str,
     edits: &[remote_workspace_protocol::EditSpec],
+    replace_content: Option<&str>,
 ) -> Result<ResultBody, ProtocolError> {
-    if edits.is_empty() {
+    if !edits.is_empty() && replace_content.is_some() {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
-            "edits must not be empty",
+            "edits and replace_content are mutually exclusive",
         ));
     }
-    if edits.len() > MAX_EDITS {
+    if edits.is_empty() && replace_content.is_none() {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
-            format!("edits must not exceed {MAX_EDITS} replacements"),
+            "edits must not be empty (or pass replace_content)",
         ));
     }
-    // Every argument is checked before the file is touched at all, so a
-    // malformed replacement late in the list costs nothing.
-    for (i, e) in edits.iter().enumerate() {
-        let at = edit_prefix(i, edits.len());
-        if e.old_text.is_empty() {
+
+    if let Some(replacement) = replace_content {
+        if replacement.len() > MAX_TEXT_BYTES {
             return Err(ProtocolError::new(
                 ErrorCode::InvalidRequest,
-                format!("{at}old_text must not be empty"),
+                format!(
+                    "replace_content exceeds {MAX_TEXT_BYTES} bytes; use upload_file for large files"
+                ),
             ));
         }
-        if e.old_text == e.new_text {
+    } else {
+        if edits.len() > MAX_EDITS {
             return Err(ProtocolError::new(
                 ErrorCode::InvalidRequest,
-                format!("{at}old_text and new_text are identical; nothing to change"),
+                format!("edits must not exceed {MAX_EDITS} replacements"),
             ));
         }
-        if e.old_text.len() > MAX_TEXT_BYTES || e.new_text.len() > MAX_TEXT_BYTES {
-            return Err(ProtocolError::new(
-                ErrorCode::InvalidRequest,
-                format!("{at}old_text/new_text exceed {MAX_TEXT_BYTES} bytes"),
-            ));
+        for (i, e) in edits.iter().enumerate() {
+            let at = edit_prefix(i, edits.len());
+            if e.old_text.is_empty() {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("{at}old_text must not be empty"),
+                ));
+            }
+            if e.old_text == e.new_text {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("{at}old_text and new_text are identical; nothing to change"),
+                ));
+            }
+            if e.old_text.len() > MAX_TEXT_BYTES || e.new_text.len() > MAX_TEXT_BYTES {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("{at}old_text/new_text exceed {MAX_TEXT_BYTES} bytes"),
+                ));
+            }
         }
     }
+
     let abs = ws.resolve(path)?;
-    // Enforce the size cap from metadata, before hashing or reading: a file
-    // above the cap is rejected either way, and reading it first is precisely
-    // the cost the cap exists to avoid.
     match std::fs::metadata(&abs) {
         Ok(meta) if !meta.is_file() => return Err(not_a_regular_file(path)),
         Ok(meta) if meta.len() > MAX_TEXT_BYTES as u64 => {
@@ -696,11 +886,6 @@ pub fn edit(
     }
     let original = std::fs::read(&abs)
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("read failed: {e}")))?;
-    // base_hash is checked against the bytes actually read, not against a
-    // separate hash of the file. Hashing it separately would leave a gap in
-    // which the content could change and change back, so the replacements
-    // would be built from a version the caller never pinned and the check
-    // would still pass.
     let current = crate::hash::hash_bytes(&original);
     if current != base_hash {
         return Err(
@@ -714,73 +899,81 @@ pub fn edit(
             "file is not valid UTF-8; editing binary files is unsupported",
         )
     })?;
-    // Each replacement sees what the previous ones produced, so a later one
-    // may legitimately match text an earlier one introduced -- and its match
-    // count must be taken against that content, not the original.
-    let mut new_content = original_str;
-    for (i, e) in edits.iter().enumerate() {
-        let at = edit_prefix(i, edits.len());
-        let matches = new_content.matches(&e.old_text).count();
-        if matches == 0 {
-            return Err(ProtocolError::new(
-                ErrorCode::NoMatch,
-                format!(
-                    "{at}old_text not found in {path}; re-read the file and copy the current \
-                     text exactly"
-                ),
-            ));
-        }
-        if matches > 1 && !e.replace_all {
-            return Err(ProtocolError::new(
-                ErrorCode::AmbiguousMatch,
-                format!(
-                    "{at}old_text occurs {matches} times in {path}; extend it with surrounding \
-                     context to make it unique, or pass replace_all=true"
-                ),
-            ));
-        }
-        // Checked BEFORE allocating, not after: replacements compound, so a
-        // handful of growing ones (`a` -> `aa`, replace_all) reaches terabytes
-        // long before a check on the result could reject it. The count is
-        // exact, so this is the size the replacement would produce.
-        let replaced = if e.replace_all { matches } else { 1 };
-        let projected = new_content
-            .len()
-            .saturating_sub(replaced.saturating_mul(e.old_text.len()))
-            .saturating_add(replaced.saturating_mul(e.new_text.len()));
-        if projected > MAX_TEXT_BYTES {
+
+    let staged = if let Some(replacement) = replace_content {
+        if crate::hash::hash_bytes(replacement.as_bytes()) == current {
             return Err(ProtocolError::new(
                 ErrorCode::InvalidRequest,
-                format!("{at}resulting file would exceed {MAX_TEXT_BYTES} bytes"),
+                format!("replace_content leaves {path} unchanged; nothing to do"),
             ));
         }
-        new_content = if e.replace_all {
-            new_content.replace(&e.old_text, &e.new_text)
-        } else {
-            new_content.replacen(&e.old_text, &e.new_text, 1)
-        };
-    }
-    // A single replacement from a value to itself is already refused as
-    // nothing to change; replacements that undo each other are the same
-    // request spelled across several entries, and refusing them keeps a
-    // guarantee the WAL cannot otherwise express. A record whose before and
-    // after hashes are equal is one recovery has to read as "the rename never
-    // happened", so an edit that DID land would be dropped from history and
-    // its request handed back for retry.
-    if crate::hash::hash_bytes(new_content.as_bytes()) == current {
-        return Err(ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            format!("the replacements leave {path} unchanged; nothing to do"),
-        ));
-    }
-    // Staged before the marker is written, so a failure to even write the
-    // replacement leaves nothing behind to interpret.
-    let staged = stage_write(&abs, new_content.as_bytes())?;
-    let (op_id, new_hash) = write_ahead_install(store, request_id, path, &abs, &current, staged)?;
-    let old_hash = Some(current);
+        stage_write(&abs, replacement.as_bytes())?
+    } else {
+        let mut new_content = original_str;
+        for (i, e) in edits.iter().enumerate() {
+            let at = edit_prefix(i, edits.len());
+            let matches = new_content.matches(&e.old_text).count();
+            if matches == 0 {
+                return Err(ProtocolError::new(
+                    ErrorCode::NoMatch,
+                    format!(
+                        "{at}old_text not found in {path}; re-read the file and copy the current \
+                         text exactly"
+                    ),
+                ));
+            }
+            if matches > 1 && !e.replace_all {
+                return Err(ProtocolError::new(
+                    ErrorCode::AmbiguousMatch,
+                    format!(
+                        "{at}old_text occurs {matches} times in {path}; extend it with surrounding \
+                         context to make it unique, or pass replace_all=true"
+                    ),
+                ));
+            }
+            let replaced = if e.replace_all { matches } else { 1 };
+            let projected = new_content
+                .len()
+                .saturating_sub(replaced.saturating_mul(e.old_text.len()))
+                .saturating_add(replaced.saturating_mul(e.new_text.len()));
+            if projected > MAX_TEXT_BYTES {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("{at}resulting file would exceed {MAX_TEXT_BYTES} bytes"),
+                ));
+            }
+            new_content = if e.replace_all {
+                new_content.replace(&e.old_text, &e.new_text)
+            } else {
+                new_content.replacen(&e.old_text, &e.new_text, 1)
+            };
+        }
+        if crate::hash::hash_bytes(new_content.as_bytes()) == current {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                format!("the replacements leave {path} unchanged; nothing to do"),
+            ));
+        }
+        stage_write(&abs, new_content.as_bytes())?
+    };
+
+    let new_hash = with_mutation_lock(store.state_dir(), || {
+        verify_unchanged(&abs, &current, path)?;
+        staged.install(&abs)
+    })?;
+    let op_id = store.next_operation_id();
+    store.append_fs_record(FsOperationRecord {
+        operation_id: op_id.clone(),
+        request_id: request_id.to_string(),
+        kind: OperationKind::Edit,
+        path: path.to_string(),
+        before_hash: Some(current.clone()),
+        after_hash: new_hash.clone(),
+        timestamp_ms: now_ms(),
+    })?;
     Ok(ResultBody::Mutation(MutationResult {
         operation_id: op_id,
-        old_hash,
+        old_hash: Some(current),
         new_hash,
     }))
 }
@@ -788,13 +981,11 @@ pub fn edit(
 pub fn delete(
     ws: &Workspace,
     store: &OperationStore,
-    _guard: &MutexGuard<'_, ()>,
+    _guard: &OwnedMutexGuard<()>,
     request_id: &str,
     path: &str,
 ) -> Result<ResultBody, ProtocolError> {
     let abs = ws.resolve(path)?;
-    // `resolve` follows a symlink to its target, and removing that would
-    // delete the file the link points to while the link itself stays.
     if ws.is_symlink(path)? {
         return Err(ProtocolError::new(
             ErrorCode::NotAFile,
@@ -819,8 +1010,18 @@ pub fn delete(
         Err(e) => return Err(e.into()),
     }
     let before_hash = hash_file(&abs)?;
-    // A delete's "expected after" is the absent-file sentinel.
-    let op_id = write_ahead_delete(store, request_id, path, &abs, &before_hash)?;
+    std::fs::remove_file(&abs)
+        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("remove failed: {e}")))?;
+    let op_id = store.next_operation_id();
+    store.append_fs_record(FsOperationRecord {
+        operation_id: op_id.clone(),
+        request_id: request_id.to_string(),
+        kind: OperationKind::Delete,
+        path: path.to_string(),
+        before_hash: before_hash.clone(),
+        after_hash: FILE_ABSENT_HASH.into(),
+        timestamp_ms: now_ms(),
+    })?;
     Ok(ResultBody::Mutation(MutationResult {
         operation_id: op_id,
         old_hash: before_hash,
@@ -849,12 +1050,9 @@ fn entry_for(
     meta: &std::fs::Metadata,
     symlink: bool,
 ) -> Result<FileEntry, ProtocolError> {
-    // Only `edit` consumes a hash, and it refuses files above the cap:
-    // hashing a multi-GB file here would read all of it for nothing.
     let hash = if meta.is_file() && meta.len() <= MAX_TEXT_BYTES as u64 {
         match hash_file(abs) {
             Ok(hash) => hash,
-            // No hash to give; `mode.readable` reports why.
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
             Err(e) => {
                 return Err(ProtocolError::new(
@@ -896,17 +1094,18 @@ fn file_mode(meta: &std::fs::Metadata) -> remote_workspace_protocol::FileMode {
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .expect("system clock is set before 1970")
+}
+
 #[cfg(test)]
 mod write_tests {
     use super::*;
-    use remote_workspace_protocol::AnyOperationRecord;
     use tempfile::tempdir;
 
-    // The guarantee `edit` rests on: between deciding what to overwrite and the
-    // rename that does it, a write can land from `exec` or any host process.
-    // Only a check taken with the replacement already staged can still refuse.
-    // Reachable only from inside the crate -- from outside, the base_hash check
-    // rejects a changed file long before this point.
     #[test]
     fn a_target_that_changed_under_a_staged_write_is_refused() {
         let dir = tempdir().unwrap();
@@ -915,18 +1114,15 @@ mod write_tests {
         let expected = crate::hash::hash_file(&path).unwrap().unwrap();
 
         let staged = stage_write(&path, b"the edit\n").unwrap();
-        // Someone else got there first, after the replacement was staged.
         std::fs::write(&path, "written by something else\n").unwrap();
 
         let err = verify_unchanged(&path, &expected, "f.txt")
             .expect_err("must refuse to overwrite a file that changed");
         assert_eq!(err.code, ErrorCode::StaleFile);
-        // Refusing means not installing; the staged file is simply dropped.
         drop(staged);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "written by something else\n",
-            "the concurrent write must survive"
+            "written by something else\n"
         );
     }
 
@@ -955,145 +1151,6 @@ mod write_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
     }
 
-    // Drives the real refusal path -- `write_ahead_install`, exactly as `edit`
-    // calls it -- rather than re-enacting the sequence: the point is that the
-    // marker is withdrawn by THAT code, so removing the withdrawal must break
-    // this test.
-    #[test]
-    fn a_refused_install_withdraws_its_prepared_marker() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().join("ws");
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("f.txt");
-        std::fs::write(&path, "v1\n").unwrap();
-        let before = crate::hash::hash_bytes(b"v1\n");
-        let store = OperationStore::new(dir.path().join("state")).unwrap();
-
-        let staged = stage_write(&path, b"v2\n").unwrap();
-        // The other writer left exactly what this install intended, which is
-        // the content recovery cannot tell apart from a completed rename.
-        std::fs::write(&path, "v2\n").unwrap();
-
-        let err = write_ahead_install(&store, "req-1", "f.txt", &path, &before, staged)
-            .expect_err("must refuse to install over a changed file");
-        assert_eq!(err.code, ErrorCode::StaleFile);
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "v2\n",
-            "the other writer's content must survive"
-        );
-
-        // Reopening replays the log: the marker must come back withdrawn, so
-        // recovery has nothing to synthesize.
-        drop(store);
-        let ws = Workspace::new(root, dir.path().join("scratch")).unwrap();
-        let reopened = OperationStore::new(dir.path().join("state")).unwrap();
-        let actions = reopened.recover(&ws).unwrap();
-        assert!(
-            actions.is_empty(),
-            "a withdrawn marker must give recovery nothing to do: {actions:?}"
-        );
-        assert!(
-            reopened.history(None).is_empty(),
-            "a refused install must not appear in history"
-        );
-    }
-
-    /// A store and workspace over one temp dir, reopened by `recovered_after`.
-    fn store_at(dir: &std::path::Path) -> OperationStore {
-        OperationStore::new(dir.join("state")).unwrap()
-    }
-
-    /// Replay the log into a fresh store and run recovery, which is the only
-    /// time markers are reloaded -- and the moment a marker left behind by a
-    /// failed mutation would be turned into a phantom operation.
-    fn recovered_after(dir: &std::path::Path, store: OperationStore) -> Vec<AnyOperationRecord> {
-        drop(store);
-        let ws = Workspace::new(dir.join("ws"), dir.join("scratch")).unwrap();
-        let reopened = store_at(dir);
-        reopened.recover(&ws).unwrap();
-        reopened.history(None)
-    }
-
-    fn ws_dir() -> tempfile::TempDir {
-        let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
-        dir
-    }
-
-    // Losing the create race to another process that wrote the SAME bytes is
-    // the case recovery cannot tell apart from this request's own completed
-    // create. Called directly because through `create` the early existence
-    // check wins first; the branch that matters is the one after the marker.
-    #[test]
-    fn a_create_that_lost_the_race_withdraws_its_marker() {
-        let dir = ws_dir();
-        let abs = dir.path().join("ws/f.txt");
-        std::fs::write(&abs, "same bytes\n").unwrap();
-        let store = store_at(dir.path());
-
-        let err = write_ahead_create(&store, "req-1", "f.txt", &abs, b"same bytes\n")
-            .expect_err("must lose to the existing file");
-        assert_eq!(err.code, ErrorCode::AlreadyExists);
-
-        assert!(
-            recovered_after(dir.path(), store).is_empty(),
-            "a create that never happened must not appear in history"
-        );
-    }
-
-    // A delete that failed because the file was already gone leaves recovery
-    // looking at an absent file -- which for a delete marker reads as success.
-    #[test]
-    fn a_delete_that_failed_withdraws_its_marker() {
-        let dir = ws_dir();
-        let abs = dir.path().join("ws/gone.txt");
-        let store = store_at(dir.path());
-
-        let err = write_ahead_delete(
-            &store,
-            "req-1",
-            "gone.txt",
-            &abs,
-            &Some(crate::hash::hash_bytes(b"whatever\n")),
-        )
-        .expect_err("removing a file that is not there must fail");
-        assert_eq!(err.code, ErrorCode::IoError);
-
-        assert!(
-            recovered_after(dir.path(), store).is_empty(),
-            "a delete that never happened must not appear in history"
-        );
-    }
-
-    // The companion: a delete that DID happen is still recovered, so the
-    // withdrawal above cannot be blamed for losing real work.
-    #[test]
-    fn a_delete_interrupted_after_the_removal_is_still_recovered() {
-        let dir = ws_dir();
-        let abs = dir.path().join("ws/f.txt");
-        std::fs::write(&abs, "doomed\n").unwrap();
-        let store = store_at(dir.path());
-        let op_id = store
-            .prepare_fs_record(
-                "req-1",
-                OperationKind::Delete,
-                "f.txt",
-                Some(crate::hash::hash_bytes(b"doomed\n")),
-                FILE_ABSENT_HASH.into(),
-            )
-            .unwrap();
-        // The removal landed; the commit did not.
-        std::fs::remove_file(&abs).unwrap();
-
-        let history = recovered_after(dir.path(), store);
-        assert!(
-            history.iter().any(|r| r.operation_id() == op_id),
-            "a crash between removal and commit must still be recovered"
-        );
-    }
-
-    // A write must not silently strip an executable bit.
     #[test]
     #[cfg(unix)]
     fn installing_over_a_file_preserves_its_mode() {
@@ -1123,104 +1180,289 @@ mod read_tests {
         (dir, w)
     }
 
+    fn byte_opts(offset: Option<u64>, limit: Option<u64>) -> ReadOptions {
+        ReadOptions {
+            offset,
+            limit,
+            ..Default::default()
+        }
+    }
+
+    fn unpack_read(body: ResultBody) -> ReadResult {
+        match body {
+            ResultBody::Read(r) => r,
+            other => panic!("expected ReadResult, got {other:?}"),
+        }
+    }
+
     #[test]
     fn read_multibyte_offset_on_boundary_works() {
-        // "éx" as UTF-8 is [0xC3,0xA9,0x78]; offset 2 lands on 'x'.
         let (_d, w) = ws_with("f.txt", "éx");
-        let r = read(&w, "f.txt", Some(2), Some(1)).unwrap();
-        match r {
-            ResultBody::Read(r) => assert_eq!(r.content, "x"),
-            _ => panic!("wrong body"),
-        }
+        let r = unpack_read(read(&w, "f.txt", byte_opts(Some(2), Some(1))).unwrap());
+        assert_eq!(r.content, "x");
+        assert_eq!(r.start_offset, 2);
+        assert_eq!(r.end_offset, 3);
+        assert_eq!(r.total_bytes, 3);
+        assert!(!r.trailing_newline);
     }
 
     #[test]
     fn read_multibyte_offset_off_boundary_rejected_not_panic() {
         let (_d, w) = ws_with("f.txt", "éx");
-        // offset 1 is mid-codepoint; must return an error, NOT panic.
-        let res = read(&w, "f.txt", Some(1), Some(1));
-        match res {
-            Err(ProtocolError {
-                code: ErrorCode::InvalidRequest,
-                ..
-            }) => {}
-            other => panic!("expected InvalidRequest, got {other:?}"),
-        }
+        let res = read(&w, "f.txt", byte_opts(Some(1), Some(1)));
+        assert_eq!(res.unwrap_err().code, ErrorCode::InvalidRequest);
     }
 
     #[test]
     fn read_limit_mid_codepoint_snaps_up_to_boundary() {
-        // "aébc": bytes a=1, é=2, b=1, c=1 -> total 5. limit 2 from offset 0
-        // would end mid-é (byte 2); round UP to the next boundary (byte 3,
-        // after 'é') so the page makes progress and never returns empty.
         let (_d, w) = ws_with("f.txt", "aébc");
-        let r = read(&w, "f.txt", Some(0), Some(2)).unwrap();
-        match r {
-            ResultBody::Read(r) => {
-                assert_eq!(r.content, "aé");
-                assert!(r.truncated, "more content remains");
-                assert_eq!(r.next_offset, Some(3));
-            }
-            _ => panic!("wrong body"),
-        }
+        let r = unpack_read(read(&w, "f.txt", byte_opts(Some(0), Some(2))).unwrap());
+        assert_eq!(r.content, "aé");
+        assert!(r.truncated);
+        assert_eq!(r.start_offset, 0);
+        assert_eq!(r.end_offset, 3);
+        assert_eq!(r.next_offset, Some(3));
     }
 
     #[test]
     fn read_huge_offset_rejected_without_overflow() {
         let (_d, w) = ws_with("f.txt", "hi");
-        let res = read(&w, "f.txt", Some(u64::MAX), Some(u64::MAX));
-        assert!(matches!(
-            res,
-            Err(ProtocolError {
-                code: ErrorCode::InvalidRequest,
-                ..
-            })
-        ));
+        let res = read(&w, "f.txt", byte_opts(Some(u64::MAX), Some(u64::MAX)));
+        assert_eq!(res.unwrap_err().code, ErrorCode::InvalidRequest);
     }
 
     #[test]
     fn read_pages_large_file_without_hashing_it() {
-        // Above the edit cap the hash has no consumer, so a page must not pay
-        // for one -- the file is only touched over the requested window.
         let dir = tempdir().unwrap();
         let big = vec![b'x'; MAX_TEXT_BYTES + 1024];
         std::fs::write(dir.path().join("big.log"), &big).unwrap();
         let w = Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
         let offset = MAX_TEXT_BYTES as u64;
-        match read(&w, "big.log", Some(offset), Some(64)).unwrap() {
-            ResultBody::Read(r) => {
-                assert_eq!(r.content.len(), 64);
-                assert_eq!(r.hash, None, "no hash above the edit cap");
-                assert!(r.truncated);
-                assert_eq!(r.next_offset, Some(offset + 64));
-            }
-            _ => panic!("wrong body"),
-        }
+        let r = unpack_read(read(&w, "big.log", byte_opts(Some(offset), Some(64))).unwrap());
+        assert_eq!(r.content.len(), 64);
+        assert_eq!(r.hash, None);
+        assert!(r.truncated);
+        assert_eq!(r.next_offset, Some(offset + 64));
     }
 
     #[test]
     fn read_at_end_of_file_returns_empty_final_page() {
         let (_d, w) = ws_with("f.txt", "hi");
-        match read(&w, "f.txt", Some(2), Some(8)).unwrap() {
-            ResultBody::Read(r) => {
-                assert_eq!(r.content, "");
-                assert!(!r.truncated);
-                assert_eq!(r.next_offset, None);
-            }
-            _ => panic!("wrong body"),
-        }
+        let r = unpack_read(read(&w, "f.txt", byte_opts(Some(2), Some(8))).unwrap());
+        assert_eq!(r.content, "");
+        assert!(!r.truncated);
+        assert_eq!(r.next_offset, None);
     }
 
     #[test]
     fn read_rejects_limit_above_hard_maximum() {
         let (_d, w) = ws_with("f.txt", "hi");
-        let result = read(&w, "f.txt", None, Some(READ_MAX_LIMIT + 1));
-        assert!(matches!(
-            result,
-            Err(ProtocolError {
-                code: ErrorCode::InvalidRequest,
-                ..
-            })
-        ));
+        let result = read(&w, "f.txt", byte_opts(None, Some(READ_MAX_LIMIT + 1)));
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn read_line_mode_preserves_endings_and_paginates() {
+        let (_d, w) = ws_with("f.txt", "l1\r\nl2\nl3");
+        let r1 = unpack_read(
+            read(
+                &w,
+                "f.txt",
+                ReadOptions {
+                    start_line: Some(1),
+                    max_lines: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(r1.content, "l1\r\nl2\n");
+        assert_eq!(r1.start_line, Some(1));
+        assert_eq!(r1.end_line, Some(2));
+        assert_eq!(r1.total_lines, Some(3));
+        assert_eq!(r1.next_line, Some(3));
+        assert!(r1.truncated);
+        assert!(r1.trailing_newline);
+        assert_eq!(r1.start_offset, 0);
+        assert_eq!(r1.end_offset, 7);
+        assert_eq!(r1.next_offset, Some(7));
+
+        let r2 = unpack_read(
+            read(
+                &w,
+                "f.txt",
+                ReadOptions {
+                    start_line: Some(3),
+                    max_lines: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(r2.content, "l3");
+        assert_eq!(r2.start_line, Some(3));
+        assert_eq!(r2.end_line, Some(3));
+        assert_eq!(r2.total_lines, Some(3));
+        assert_eq!(r2.next_line, None);
+        assert!(!r2.truncated);
+        assert!(!r2.trailing_newline);
+        assert_eq!(r2.start_offset, 7);
+        assert_eq!(r2.end_offset, 9);
+
+        let (_de, we) = ws_with("empty.txt", "");
+        let re = unpack_read(
+            read(
+                &we,
+                "empty.txt",
+                ReadOptions {
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(re.content, "");
+        assert_eq!(re.total_lines, Some(0));
+        assert_eq!(re.start_line, None);
+        assert_eq!(re.end_line, None);
+        assert!(!re.truncated);
+    }
+
+    #[test]
+    fn read_line_mode_caps_bytes_at_64kib_and_rejects_above_4mib() {
+        let mut many_lines = String::new();
+        for i in 0..1000 {
+            many_lines.push_str(&format!("line-{i:04}-{}\n", "x".repeat(100)));
+        }
+        let (_d, w) = ws_with("many.txt", &many_lines);
+        let r = unpack_read(
+            read(
+                &w,
+                "many.txt",
+                ReadOptions {
+                    start_line: Some(1),
+                    max_lines: Some(2000),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(r.content.len() <= READ_MAX_LIMIT as usize);
+        assert!(r.truncated);
+        assert!(r.trailing_newline);
+        assert_eq!(r.next_line, Some(r.end_line.unwrap() + 1));
+
+        // Single huge line > 64 KiB is sliced on a UTF-8 char boundary.
+        let single_huge = format!("{}\nsecond\n", "é".repeat(40_000));
+        let (_d2, w2) = ws_with("single.txt", &single_huge);
+        let rs = unpack_read(
+            read(
+                &w2,
+                "single.txt",
+                ReadOptions {
+                    start_line: Some(1),
+                    max_lines: Some(10),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(rs.content.len() <= READ_MAX_LIMIT as usize);
+        assert!(rs.truncated);
+        assert_eq!(rs.start_line, Some(1));
+        assert_eq!(rs.end_line, Some(1));
+        assert_eq!(rs.next_line, None);
+        assert_eq!(rs.next_offset, Some(rs.end_offset));
+
+        // > 4 MiB rejected in line mode.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("big.log"), vec![b'a'; MAX_TEXT_BYTES + 1]).unwrap();
+        let wb = Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
+        let err = read(
+            &wb,
+            "big.log",
+            ReadOptions {
+                start_line: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn read_tail_modes_snap_utf8_and_work_above_4mib() {
+        // '🦀' is 4 bytes; tail_bytes=3 lands on byte 1 of '🦀' and snaps to "ok\n".
+        let (_d, w) = ws_with("crab.txt", "hi🦀ok\n");
+        let rt = unpack_read(
+            read(
+                &w,
+                "crab.txt",
+                ReadOptions {
+                    tail_bytes: Some(5),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(rt.content, "ok\n");
+        assert!(rt.truncated);
+        assert_eq!(rt.next_offset, None);
+        assert!(rt.hash.is_some());
+
+        // > 4 MiB tail_lines seeks near EOF without hashing.
+        let dir = tempdir().unwrap();
+        let mut big = vec![b'x'; MAX_TEXT_BYTES + 5000];
+        big.extend_from_slice(b"\npenultimate\nfinal-line\n");
+        std::fs::write(dir.path().join("big.log"), &big).unwrap();
+        let wb = Workspace::new(dir.path().to_path_buf(), dir.path().join("scratch")).unwrap();
+        let rl = unpack_read(
+            read(
+                &wb,
+                "big.log",
+                ReadOptions {
+                    tail_lines: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(rl.content, "penultimate\nfinal-line\n");
+        assert_eq!(rl.hash, None);
+        assert!(rl.truncated);
+        assert_eq!(rl.end_offset, big.len() as u64);
+        assert_eq!(rl.next_offset, None);
+    }
+
+    #[test]
+    fn read_modes_are_mutually_exclusive() {
+        let (_d, w) = ws_with("f.txt", "a\nb\n");
+        for bad in [
+            ReadOptions {
+                offset: Some(0),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            ReadOptions {
+                limit: Some(10),
+                tail_lines: Some(1),
+                ..Default::default()
+            },
+            ReadOptions {
+                start_line: Some(1),
+                tail_bytes: Some(10),
+                ..Default::default()
+            },
+            ReadOptions {
+                tail_lines: Some(1),
+                tail_bytes: Some(10),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                read(&w, "f.txt", bad).unwrap_err().code,
+                ErrorCode::InvalidRequest
+            );
+        }
     }
 }

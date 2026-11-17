@@ -76,16 +76,33 @@ impl ServerConfig {
         Ok(config)
     }
 
+    pub fn profile_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.profiles.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
     /// The profile a request runs under: the explicitly requested one, else
     /// the configured default, else none (direct spawn of the argv).
     pub fn profile_for(&self, requested: Option<&str>) -> Result<Option<&Profile>, ProtocolError> {
         match requested.or(self.default_profile.as_deref()) {
             None => Ok(None),
             Some(name) => self.profiles.get(name).map(Some).ok_or_else(|| {
-                ProtocolError::new(
-                    ErrorCode::InvalidRequest,
-                    format!("unknown profile: {name}"),
-                )
+                let names = self.profile_names();
+                let message = if names.is_empty() {
+                    format!("unknown profile '{name}'; no profiles are configured")
+                } else if let Some(default) = &self.default_profile {
+                    format!(
+                        "unknown profile '{name}'; available profiles: {} (default: {default})",
+                        names.join(", ")
+                    )
+                } else {
+                    format!(
+                        "unknown profile '{name}'; available profiles: {}",
+                        names.join(", ")
+                    )
+                };
+                ProtocolError::new(ErrorCode::InvalidRequest, message)
             }),
         }
     }
@@ -159,5 +176,34 @@ mod tests {
     fn no_profile_and_no_default_is_direct() {
         let c = ServerConfig::load_from_str("[profiles.p]\nsetup = \"\"\n").unwrap();
         assert!(c.profile_for(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn unknown_profile_error_lists_available_profiles_and_default() {
+        let empty = ServerConfig::default();
+        let err = empty.profile_for(Some("foo")).unwrap_err();
+        assert_eq!(
+            err.message,
+            "unknown profile 'foo'; no profiles are configured"
+        );
+
+        let no_def =
+            ServerConfig::load_from_str("[profiles.b]\nsetup = \"\"\n[profiles.a]\nsetup = \"\"\n")
+                .unwrap();
+        let err = no_def.profile_for(Some("foo")).unwrap_err();
+        assert_eq!(
+            err.message,
+            "unknown profile 'foo'; available profiles: a, b"
+        );
+
+        let with_def = ServerConfig::load_from_str(
+            "default_profile = \"a\"\n[profiles.b]\nsetup = \"\"\n[profiles.a]\nsetup = \"\"\n",
+        )
+        .unwrap();
+        let err = with_def.profile_for(Some("foo")).unwrap_err();
+        assert_eq!(
+            err.message,
+            "unknown profile 'foo'; available profiles: a, b (default: a)"
+        );
     }
 }

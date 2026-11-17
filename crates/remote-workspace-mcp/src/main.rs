@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
                 remote_workspace_client::Endpoint::Local { root, .. } => format!("(local):{root}"),
             };
             match remote_workspace_mcp::check_workspace(&ws.endpoint).await {
-                Ok(()) => println!("{name} [{location}]: ok"),
+                Ok(_) => println!("{name} [{location}]: ok"),
                 Err(e) => {
                     unhealthy += 1;
                     println!("{name} [{location}]: {e}");
@@ -122,10 +122,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // No eager connect: initialize must answer immediately (a blocking retry
-    // loop here makes the MCP host time the server out, e.g. when a session
-    // being resumed briefly overlaps its predecessor on the same state lock).
-    // The first tool call to each workspace connects on demand.
+    // No eager connect: initialize must answer immediately rather than blocking
+    // on slow SSH handshakes. The first tool call to each workspace connects on
+    // demand.
     let mut server = RemoteWorkspaceServer::load(fleet_path)
         .context("fleet config unusable; fix it or pass --fleet")?;
     if let Some(dir) = cli.log_dir {

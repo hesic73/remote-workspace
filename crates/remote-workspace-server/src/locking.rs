@@ -45,3 +45,27 @@ pub(crate) fn try_lock_exclusive(file: &std::fs::File, offset: u64) -> std::io::
         _ => Err(error),
     }
 }
+
+#[cfg(unix)]
+pub(crate) fn unlock(file: &std::fs::File, _offset: u64) {
+    use std::os::fd::AsRawFd;
+
+    unsafe {
+        let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn unlock(file: &std::fs::File, offset: u64) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.Anonymous.Anonymous.Offset = offset as u32;
+    overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    unsafe {
+        let _ = UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped);
+    }
+}

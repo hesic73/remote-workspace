@@ -219,7 +219,7 @@ fn add_installs_probes_and_records() {
 
     // The same directory named differently (trailing slash, `/.`) must also be
     // caught: entries are recorded canonically, so path aliases cannot smuggle
-    // in a second workspace contending for one server state lock.
+    // in a second workspace entry targeting the same host and root.
     for alias in [format!("{proj}/"), format!("{proj}/."), format!("{proj}//")] {
         let dup_alias = env.add("aliased", &alias);
         assert!(
@@ -246,4 +246,113 @@ fn add_installs_probes_and_records() {
     assert!(ok2.status.success());
     let fleet = std::fs::read_to_string(&env.fleet).unwrap();
     assert!(fleet.contains("[workspaces.robot]") && fleet.contains("[workspaces.lab]"));
+}
+
+#[test]
+fn list_and_rm_manage_fleet_entries() {
+    let Some(env) = setup() else { return };
+    let cli = env!("CARGO_BIN_EXE_remote-workspace");
+
+    let empty = Command::new(cli)
+        .args(["workspace", "list", "--fleet"])
+        .arg(&env.fleet)
+        .output()
+        .unwrap();
+    assert!(empty.status.success(), "{empty:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&empty.stdout).trim(),
+        "No workspaces configured."
+    );
+
+    let proj1 = env.home.join("proj1");
+    let proj2 = env.home.join("proj2");
+    std::fs::create_dir_all(&proj1).unwrap();
+    std::fs::create_dir_all(&proj2).unwrap();
+
+    let add_labeled = Command::new(cli)
+        .args([
+            "workspace",
+            "add",
+            "robot",
+            "--host",
+            "robot@ws",
+            "--root",
+            &proj1.to_string_lossy(),
+            "--label",
+            "Robot box",
+            "--fleet",
+        ])
+        .arg(&env.fleet)
+        .env("HOME", &env.home)
+        .env("PATH", &env.path)
+        .env("REMOTE_WORKSPACE_RELEASE_BASE", &env.release)
+        .env_remove("XDG_CACHE_HOME")
+        .output()
+        .unwrap();
+    assert!(add_labeled.status.success(), "{add_labeled:?}");
+    assert!(env.add("lab", &proj2.to_string_lossy()).status.success());
+
+    let listed = Command::new(cli)
+        .args(["workspace", "list", "--fleet"])
+        .arg(&env.fleet)
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout.contains("robot") && stdout.contains("robot@ws") && stdout.contains("Robot box"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("lab") && stdout.contains(&*proj2.to_string_lossy()),
+        "{stdout}"
+    );
+
+    let bad_rm = Command::new(cli)
+        .args(["workspace", "rm", "nope", "--fleet"])
+        .arg(&env.fleet)
+        .output()
+        .unwrap();
+    assert!(!bad_rm.status.success());
+    let stderr = String::from_utf8_lossy(&bad_rm.stderr);
+    assert!(
+        stderr.contains("unknown_workspace") && stderr.contains("lab, robot"),
+        "{stderr}"
+    );
+
+    let rm1 = Command::new(cli)
+        .args(["workspace", "rm", "robot", "--fleet"])
+        .arg(&env.fleet)
+        .output()
+        .unwrap();
+    assert!(rm1.status.success(), "{rm1:?}");
+
+    let after_rm1 = Command::new(cli)
+        .args(["workspace", "list", "--fleet"])
+        .arg(&env.fleet)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&after_rm1.stdout);
+    assert!(
+        !stdout.contains("Robot box") && !stdout.starts_with("robot ") && stdout.contains("lab"),
+        "{stdout}"
+    );
+
+    // Exercise the `remove` alias on the remaining entry.
+    let rm2 = Command::new(cli)
+        .args(["workspace", "remove", "lab", "--fleet"])
+        .arg(&env.fleet)
+        .output()
+        .unwrap();
+    assert!(rm2.status.success(), "{rm2:?}");
+
+    let after_rm2 = Command::new(cli)
+        .args(["workspace", "list", "--fleet"])
+        .arg(&env.fleet)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&after_rm2.stdout).trim(),
+        "No workspaces configured."
+    );
 }

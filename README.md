@@ -86,21 +86,21 @@ Adding workspace 'robot'
   Remote platform        linux-x86_64
   Workspace root         valid
   Server                 installed 0.7.1
-  Protocol               4
+  Protocol               5
   Workspace probe        passed
   Fleet configuration    updated
 Workspace 'robot' is ready.
 ```
 
-The CLI does not read the fleet file; point it at the installed server:
+Run CLI commands against any configured workspace with `-w` / `--workspace`:
 
 ```bash
-BIN=/home/robot/.local/lib/remote-workspace/remote-workspace-server
-remote-workspace --host robot@workstation --root /home/robot/project --remote-bin $BIN ls .
-remote-workspace --host robot@workstation --root /home/robot/project --remote-bin $BIN exec -- pytest -q
+remote-workspace -w robot ls .
+remote-workspace -w robot exec -- pytest -q
 ```
 
-`--local` runs the server as a local subprocess instead of over SSH.
+Or connect directly without a fleet entry via `--host` / `--root` (or `--local`
+to run the server as a local subprocess).
 
 ## Use from a coding agent (MCP)
 
@@ -110,13 +110,26 @@ codex mcp add remote-workspace -- remote-workspace-mcp
 grok mcp add --scope user remote-workspace -- remote-workspace-mcp
 ```
 
+For Antigravity (`~/.gemini/antigravity/mcp_config.json`) or Claude Desktop
+(`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "remote-workspace": {
+      "command": "/home/you/.local/bin/remote-workspace-mcp"
+    }
+  }
+}
+```
+
 One MCP serves the whole fleet. Tools: `list_workspaces`, `list_directory`,
 `read_file`, `create_file`, `edit_file`, `delete_file`, `run_command`,
 `wait_while`, `upload_file`, `download_file`. Search, Git, builds, and tests all
 go through `run_command`; long work runs under tmux or slurm, and `wait_while`
 waits for it to be gone. Every tool except `list_workspaces` takes a **required**
 `workspace` argument, so a call never lands on a machine by default. Inspecting
-history (`history`, `op`, `status`) is a CLI job, not an agent tool.
+history (`history`, `op`) is a CLI job, not an agent tool.
 
 The MCP can be registered before any workspace exists: an empty or missing fleet
 is valid, and workspaces added later are picked up on the next call. Agent
@@ -188,8 +201,8 @@ do not.
 
 ### Server state
 
-History, the idempotency table, and scratch live **outside the workspace**, on
-the remote host:
+Operation shards, pending upload metadata, and scratch live **outside the
+workspace**, on the remote host:
 
 ```
 ~/.remote-workspace/state/<rootname>-<hash>/
@@ -197,35 +210,38 @@ the remote host:
 
 Nothing shows up in `git status`, and a command inside the workspace cannot
 delete the log. `--state-base` relocates it; deleting it is always safe. History
-is bounded by `--history-limit` (default 1000) and `gc`; scratch files idle for
-7 days are swept.
+is compacted to `--history-limit` (default 1000) via `gc` (and opportunistically
+at startup when shard count grows); scratch files idle for 7 days are swept.
 
-One server serves a workspace root at a time; another session is refused with
-the pid holding it. A server exits after `--idle-timeout-secs` (default 900)
-with nothing arriving or running, so a dead SSH session does not hold the lock
-for hours. `<state>/server.jsonl` records each start, refusal, and exit.
+Multiple agent and CLI sessions can share the same workspace root concurrently:
+each session appends to its own operation shard under `ops/`, and conflicting
+concurrent `edit` calls fail cleanly with `STALE_FILE`. An idle server exits
+after `--idle-timeout-secs` (default 900) with nothing arriving or running.
+`<state>/server.jsonl` records each session's start and exit.
 
 ## CLI
 
 | Command | Purpose |
 |---------|---------|
 | `workspace add <name> --host H --root R` | Onboard a new workspace: install the server, record it in the fleet |
+| `workspace list` | List configured workspaces in the fleet |
+| `workspace rm <name>` | Remove a workspace entry from the fleet (alias: `remove`) |
 | `workspace upgrade [<name>]` | Install/upgrade the managed server for workspaces in the fleet |
 | `ls <path>` | List a directory |
 | `stat <path>` | Stat a file or directory |
-| `cat <path>` | Read a file |
+| `cat <path>` | Read a file (`--offset`/`--limit`, `--start-line`/`--max-lines`, `--tail-lines`/`--tail-bytes`) |
 | `create <path> [--file F]` | Create a new file (stdin by default); fails if it exists |
-| `edit <path> --base-hash H --old-text S --new-text S` | Exact text replacement in an existing file |
+| `edit <path> --base-hash H ...` | Edit an existing file (`--old-text S --new-text S` or `--replace-file F`) |
 | `rm <path>` | Delete a file |
 | `exec [--cwd D] [--profile P] -- argv...` | Run a command |
 | `history [--limit N]` | List recorded operations |
 | `op <operation_id>` | Details of one operation |
-| `status <request_id>` | Status of a previously-issued request |
-| `gc [--keep N]` | Prune history, sweep expired scratch, report scratch usage |
+| `gc [--keep N]` | Compact closed history shards, sweep expired scratch, report scratch usage |
 | `stats [--log-dir D]` | Per-tool call and error counts from MCP logs (local only) |
 
-Connection flags: `--host`, `--root`, `--remote-bin`, `--remote-shell`,
-`--config`, `--state-base`, `--local`, `--log <file>`.
+Connection flags: `-w` / `--workspace <name>`, `--fleet <file>`, or explicit
+`--host`, `--root`, `--remote-bin`, `--remote-shell`, `--config`,
+`--state-base`, `--local`, plus `--log <file>`.
 
 ## Upgrades
 

@@ -1,35 +1,29 @@
 # Agent guidance
 
-This server manages zero or more named workspaces, each a directory on a configured machine. Every tool except `list_workspaces` requires a `workspace` argument naming which one to act on. Workspaces are fully isolated from each other: paths and operation IDs are scoped to a single workspace and mean nothing in another.
+Every tool except `list_workspaces` requires `workspace`. Workspaces are isolated: paths and operation IDs apply to one workspace only. If `list_workspaces` returns `[]`, ask the user for a target and onboard it locally with `remote-workspace workspace add <name> --host <host> --root <path>`; never invent a workspace. Fleet edits reload on the next call. In `list_workspaces`, `connection` (`connected`, `connecting`, `not_connected`, `disconnected`) is a local hint, not a health check -- act directly. Warm rows also report `platform`, `profiles`, and `default_profile`.
 
-An empty `list_workspaces` result means no workspaces are configured. Ask the user for a target and add it locally with `remote-workspace workspace add <name> --host <host> --root <path>`. Do not invent a workspace or register the current directory automatically. The running MCP picks up the first workspace on its next call.
+## Files and scratch
 
-The normal workflow:
+- `read_file`: returns `[workspace=... path=... bytes=...]` above `---`, then raw content. Modes (mutually exclusive): byte (`offset`/`limit`, <= 64 KiB; `rg -b` gives byte offsets on >4 MiB files), line (`start_line`/`max_lines`, <= 2000 lines, <= 4 MiB), or tail (`tail_lines` or `tail_bytes`, any size). Files <= 4 MiB include `hash` in the header.
+- `create_file`: new text files only (`ALREADY_EXISTS` if present).
+- `edit_file`: modifies existing text files (<= 4 MiB) gated by `base_hash`. Pass batched ordered `edits` (1..=100 exact replacements in one atomic call) OR `replace_content` (whole-file rewrite), never both. On `STALE_FILE`, retry with the reported hash only if the change since your read was your own edit; otherwise re-read first.
+- `delete_file`: permanent; rely on git.
+- `@scratch/...` maps to transient workspace storage, passed to commands in `REMOTE_WORKSPACE_SCRATCH` (`$REMOTE_WORKSPACE_SCRATCH` / `$env:REMOTE_WORKSPACE_SCRATCH`). Shared across sessions with 7-day idle eviction: keep scripts, logs, and intermediate files there, and put durable results in the workspace or fetch via `download_file`. File tools enforce workspace/scratch roots; `run_command` is not sandboxed.
 
-1. Call `list_workspaces` when the workspace name is unknown. Its `connection` field is only what this process last observed (`connected`, `not_connected`, `disconnected`, `in_use`) -- a hint about which workspaces are already warm, never a promise that one is reachable now. Do not consult it before acting; act, and read the error if there is one.
-2. Inspect with `list_directory` and `read_file`; follow the returned offsets to page through large results.
-3. Use `create_file` only for new text files; it refuses existing paths.
-4. Use `edit_file` for every modification to an existing text file: pass the hash from `read_file` as `base_hash` and copy each `old_text` exactly from the current content. Any other valid hash fails with `STALE_FILE`, whose message shows the current hash: retry with it only when the change since your read is your own edit, and otherwise read again first. Pass every change you have for one file as a list of `edits` in one call: sending them separately is slower and leaves the file half-changed if a later one fails.
-5. Use `delete_file` for deletion. Nothing here reverses a file operation; anything that must survive a mistake belongs in version control.
-6. Use `run_command` for search (`rg`), file discovery (`find`), Git, builds, tests, and running programs.
-7. Use `upload_file`/`download_file` for large or binary files and whenever a file must land on the other machine; their content never enters the model context. Use `read_file` only to reason about content. Never move a file through `create_file`, base64, shell quoting, or pasted-together `read_file` pages.
-8. Never automatically retry `run_command` after an uncertain transport failure, because the command may already have produced side effects.
-9. Wait for long-running work with `wait_while`, never by polling a log or output file (see below).
+## Commands and long-running work
 
-Normal relative paths address the workspace. Paths beginning with `@scratch/` address the workspace's server-managed scratch area; commands receive its physical path in the `REMOTE_WORKSPACE_SCRATCH` environment variable (`$REMOTE_WORKSPACE_SCRATCH` in POSIX shells, `$env:REMOTE_WORKSPACE_SCRATCH` in PowerShell, `%REMOTE_WORKSPACE_SCRATCH%` in cmd).
+`run_command` is synchronous, owns its process tree, and NEVER shell-splits `argv` (use `["bash", "-c", "..."]` for pipes, globs, or redirection). Previews keep the first 4 KiB and last 12 KiB per stream; redirect large output to `$REMOTE_WORKSPACE_SCRATCH/...` and read `@scratch/...`. Descendants holding pipes past exit are killed (`drain_timed_out: true`). Never auto-retry after an uncertain transport drop.
 
-Scratch is transient and shared by every session using that workspace: the place for your own working material (scripts you wrote, intermediate output, command logs) that would otherwise clutter the user's project. It is not storage: files idle for a week are deleted without warning. Results (trained weights, recordings, datasets) belong in the workspace, or on the local machine via `download_file`.
+Run work outliving one call under `tmux` or `slurm` with output in `$REMOTE_WORKSPACE_SCRATCH`. Use a dedicated socket (`tmux -L rw`) or expand `$REMOTE_WORKSPACE_SCRATCH` in the outer shell so an existing tmux server does not drop profile env vars:
 
-`run_command` is synchronous and owns its process tree. The result contains the termination reason, duration, and a bounded preview of each stream (first 4 KiB, last 12 KiB); redirect full output to `$REMOTE_WORKSPACE_SCRATCH` and read the `@scratch/...` file incrementally. After the command exits, output collection waits briefly for the pipes to close; descendants still holding them are killed and the result sets `drain_timed_out`.
+`tmux -L rw new-session -d -s NAME "CMD > \"$REMOTE_WORKSPACE_SCRATCH/NAME.log\" 2>&1; echo \$? > \"$REMOTE_WORKSPACE_SCRATCH/NAME.exit\""`
 
-Work that must outlive one call runs under a remote supervisor (tmux, slurm, or a backgrounded process) with its output redirected to a file. A launcher that exited 0 has not shown that the work started. Wait with `wait_while` on what does the work -- the session, the job, the process -- and never on its log or result file: a result that never appears waits forever, while work that never started is `gone` at the first check (`first_check: true`). Checks that exit 0 while the work exists and 1 once it is gone:
+Await the session, job, or process with `wait_while` (`0` = running, `1` = gone, other = `check_failed`), never its output file (`gone` with `first_check: true` catches work that never started). Use bounded `timeout_ms` (60000-120000) and repeat on `timed_out` after checking progress:
 
-- tmux session: `["tmux", "has-session", "-t", "=NAME"]`. The `=` matches the name exactly; the session closes when its command exits.
-- slurm job: `["bash", "-c", "squeue -h -j ID -o '%T %r' | grep ."]`. It prints the state and pending reason while the job is queued or running.
-- process: `["kill", "-0", "PID"]`.
+- tmux: `["bash", "-c", "tmux -L rw has-session -t =NAME 2>/dev/null && { tail -n 5 \"$REMOTE_WORKSPACE_SCRATCH/NAME.log\"; exit 0; }; cat \"$REMOTE_WORKSPACE_SCRATCH/NAME.exit\" 2>/dev/null; exit 1"]`
+- slurm: `["bash", "-c", "s=$(squeue -h -j ID -o '%T %r' 2>&1); rc=$?; printf '%s\n' \"$s\"; case \"$s\" in *'Invalid job id'*) exit 1;; esac; [ $rc -eq 0 ] || exit 2; [ -n \"$s\" ]"]`
+- process (same OS user; `EPERM` also exits 1): `["kill", "-0", "PID"]`
 
-After `gone`, read the outcome where the work left it: its log, an exit-code file it wrote, or `sacct -j ID`. `timed_out` means the work still exists; read the last check's output and the log before waiting again. Work that exists but makes no progress (stuck in a queue, hung) is never `gone`, so between waits check that it advances.
+## Transfers
 
-Transfers move exactly one regular file between the local machine and one workspace; the destination's parent directory must already exist, and an existing destination is only replaced with `overwrite=true`. They are synchronous: a long-running call means bytes are still flowing, and a transfer that genuinely stops moving fails by itself with `transfer_stalled` and the byte position reached. Do not cancel and re-issue a transfer merely because it is taking a while. After a disconnected transfer, check the destination (e.g. `list_directory` its parent) before deciding whether to retry. To import a file from a URL, run a downloader (`curl -o`) on the remote side via `run_command` instead of transferring through the local machine.
-
-File tools are confined to the workspace and scratch roots. Command execution is not a sandbox and can access anything permitted to the remote server user.
+`upload_file` and `download_file` stream single regular files outside model context; never transfer via `create_file`, base64, shell quoting, or `read_file` pages. Parent directories must exist; pass `overwrite=true` to replace. Genuine stalls fail with `transfer_stalled` and byte position -- do not cancel healthy transfers. After a disconnect, inspect the destination directory before retrying. Use remote `curl -o` via `run_command` for URLs.

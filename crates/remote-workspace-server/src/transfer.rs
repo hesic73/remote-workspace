@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -8,7 +8,7 @@ use remote_workspace_protocol::{
     TransferResult, UploadPrepareResult,
 };
 use sha2::{Digest, Sha256};
-use tokio::sync::MutexGuard;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::store::OperationStore;
 use crate::workspace::Workspace;
@@ -39,79 +39,113 @@ pub struct PendingUpload {
 }
 
 pub struct UploadRegistry {
-    entries: parking_lot::Mutex<HashMap<String, PendingUpload>>,
-    path: PathBuf,
+    dir: PathBuf,
+}
+
+fn is_valid_transfer_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 impl UploadRegistry {
-    pub fn new(state_dir: &Path) -> anyhow::Result<Self> {
-        let path = state_dir.join("pending_uploads.json");
-        let mut entries: HashMap<String, PendingUpload> = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| anyhow::anyhow!("parse pending upload registry {path:?}: {e}"))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "read pending upload registry {path:?}: {e}"
-                ))
-            }
-        };
-        // An entry is only worth keeping while its upload could still be
-        // committed. One left by a client that died mid-upload would otherwise
-        // count as in flight forever and shield its staging file from the
-        // stale-staging sweeps.
-        entries.retain(|_, pending| {
-            std::fs::metadata(&pending.staging)
-                .is_ok_and(|meta| meta.is_file() && !is_stale(&meta, STALE_STAGING_MAX_AGE))
-        });
-        let registry = Self {
-            entries: parking_lot::Mutex::new(entries),
-            path,
-        };
-        registry.persist()?;
-        Ok(registry)
+    pub fn new(state_dir: &Path) -> Self {
+        Self {
+            dir: state_dir.join("pending_uploads"),
+        }
     }
 
-    fn persist(&self) -> anyhow::Result<()> {
-        let entries = self.entries.lock();
-        let bytes = serde_json::to_vec(&*entries)?;
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("pending upload registry has no parent"))?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        temp.write_all(&bytes)?;
-        temp.as_file().sync_all()?;
-        temp.persist(&self.path).map_err(|error| error.error)?;
-        crate::fsync::fsync_dir(parent)?;
-        Ok(())
+    fn entry_path(&self, id: &str) -> Option<PathBuf> {
+        is_valid_transfer_id(id).then(|| self.dir.join(format!("{id}.json")))
     }
 
     fn insert(&self, id: String, pending: PendingUpload) -> Result<(), ProtocolError> {
-        self.entries.lock().insert(id.clone(), pending);
-        if let Err(error) = self.persist() {
-            self.entries.lock().remove(&id);
+        let Some(dest) = self.entry_path(&id) else {
             return Err(ProtocolError::new(
-                ErrorCode::IoError,
-                format!("persist pending upload: {error}"),
+                ErrorCode::InvalidRequest,
+                format!("invalid transfer id: {id}"),
             ));
-        }
+        };
+        std::fs::create_dir_all(&self.dir).map_err(|e| {
+            ProtocolError::new(ErrorCode::IoError, format!("create pending_uploads: {e}"))
+        })?;
+        let bytes = serde_json::to_vec(&pending).map_err(|e| {
+            ProtocolError::new(ErrorCode::IoError, format!("serialize pending upload: {e}"))
+        })?;
+        let mut temp = tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| {
+            ProtocolError::new(
+                ErrorCode::IoError,
+                format!("temp pending upload failed: {e}"),
+            )
+        })?;
+        temp.write_all(&bytes).map_err(|e| {
+            ProtocolError::new(
+                ErrorCode::IoError,
+                format!("write pending upload failed: {e}"),
+            )
+        })?;
+        temp.as_file().sync_data().map_err(|e| {
+            ProtocolError::new(
+                ErrorCode::IoError,
+                format!("sync pending upload failed: {e}"),
+            )
+        })?;
+        temp.persist(&dest).map_err(|e| {
+            ProtocolError::new(
+                ErrorCode::IoError,
+                format!("persist pending upload failed: {}", e.error),
+            )
+        })?;
         Ok(())
     }
 
-    fn get(&self, id: &str) -> Option<PendingUpload> {
-        self.entries.lock().get(id).cloned()
+    fn get(&self, id: &str) -> Result<Option<PendingUpload>, ProtocolError> {
+        let Some(path) = self.entry_path(id) else {
+            return Ok(None);
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(ProtocolError::new(
+                    ErrorCode::IoError,
+                    format!("read pending upload {path:?}: {e}"),
+                ))
+            }
+        };
+        let pending: PendingUpload = serde_json::from_slice(&bytes).map_err(|e| {
+            ProtocolError::new(
+                ErrorCode::IoError,
+                format!("parse pending upload {path:?}: {e}"),
+            )
+        })?;
+        if std::fs::metadata(&pending.staging)
+            .is_ok_and(|meta| is_stale(&meta, STALE_STAGING_MAX_AGE))
+        {
+            let _ = std::fs::remove_file(&path);
+            return Ok(None);
+        }
+        Ok(Some(pending))
     }
 
     fn remove(&self, id: &str) -> Result<Option<PendingUpload>, ProtocolError> {
-        let removed = self.entries.lock().remove(id);
-        self.persist().map_err(|error| {
-            ProtocolError::new(
-                ErrorCode::IoError,
-                format!("persist pending upload removal: {error}"),
-            )
-        })?;
-        Ok(removed)
+        let Some(path) = self.entry_path(id) else {
+            return Ok(None);
+        };
+        let pending = self.get(id)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(ProtocolError::new(
+                    ErrorCode::IoError,
+                    format!("remove pending upload {path:?}: {e}"),
+                ))
+            }
+        }
+        Ok(pending)
     }
 }
 
@@ -123,7 +157,8 @@ fn new_transfer_id() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .expect("system clock is set before 1970");
-    format!("xfer-{ts:016x}-{n:04x}")
+    let pid_low = std::process::id() & 0xFF_FFFF;
+    format!("xfer-{ts:016x}-{pid_low:06x}-{n:04x}")
 }
 
 pub fn upload_prepare(
@@ -234,7 +269,7 @@ pub fn upload_prepare(
 #[allow(clippy::too_many_arguments)]
 pub fn upload_commit(
     store: &OperationStore,
-    _guard: &MutexGuard<'_, ()>,
+    _guard: &OwnedMutexGuard<()>,
     request_id: &str,
     registry: &UploadRegistry,
     transfer_id: &str,
@@ -242,7 +277,7 @@ pub fn upload_commit(
     sha256: &str,
     duration_ms: u64,
 ) -> Result<ResultBody, ProtocolError> {
-    let entry = registry.get(transfer_id).ok_or_else(|| {
+    let entry = registry.get(transfer_id)?.ok_or_else(|| {
         ProtocolError::new(
             ErrorCode::OperationNotFound,
             format!("unknown transfer id: {transfer_id}"),
@@ -291,8 +326,6 @@ pub fn upload_commit(
             ProtocolError::new(ErrorCode::IoError, format!("remove staging failed: {e}"))
         })?;
     }
-    crate::fsync::fsync_file_or_dir(&entry.target)
-        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("fsync target: {e}")))?;
     let operation_id = store.next_operation_id();
     store.append_transfer_record(TransferOperationRecord {
         operation_id: operation_id.clone(),
@@ -358,7 +391,7 @@ pub fn upload_abort(
 pub fn download_record(
     ws: &Workspace,
     store: &OperationStore,
-    _guard: &MutexGuard<'_, ()>,
+    _guard: &OwnedMutexGuard<()>,
     request_id: &str,
     path: &str,
     size: u64,
@@ -387,15 +420,34 @@ pub fn download_record(
     }))
 }
 
-/// Staging paths of uploads currently in flight; the sweeps must never touch
-/// these.
-pub fn in_flight_staging(registry: &UploadRegistry) -> std::collections::HashSet<PathBuf> {
-    registry
-        .entries
-        .lock()
-        .values()
-        .map(|p| p.staging.clone())
-        .collect()
+/// Staging paths of uploads currently in flight; unlinks entries whose staging
+/// file has vanished or aged past `STALE_STAGING_MAX_AGE`.
+pub fn in_flight_staging(registry: &UploadRegistry) -> HashSet<PathBuf> {
+    let entries = match std::fs::read_dir(&registry.dir) {
+        Ok(e) => e,
+        Err(_) => return HashSet::new(),
+    };
+    let mut active = HashSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(pending) = serde_json::from_slice::<PendingUpload>(&bytes) else {
+            continue;
+        };
+        if std::fs::metadata(&pending.staging)
+            .is_ok_and(|meta| meta.is_file() && !is_stale(&meta, STALE_STAGING_MAX_AGE))
+        {
+            active.insert(pending.staging);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    active
 }
 
 /// Best-effort removal of abandoned upload staging files in one directory.
@@ -404,7 +456,7 @@ pub fn in_flight_staging(registry: &UploadRegistry) -> std::collections::HashSet
 /// touches other `.part` files. Returns the number of files removed.
 pub fn sweep_stale_staging_dir(
     dir: &Path,
-    in_flight: &std::collections::HashSet<PathBuf>,
+    in_flight: &HashSet<PathBuf>,
     max_age: std::time::Duration,
 ) -> usize {
     let entries = match std::fs::read_dir(dir) {
@@ -541,7 +593,7 @@ pub fn run_transfer_receive(
     if total != expect_size {
         anyhow::bail!("received {total} bytes but caller declared {expect_size}");
     }
-    file.sync_all()?;
+    file.sync_data()?;
     let meta = ReceiveMetadata {
         size: total,
         sha256: format!("sha256:{}", hex::encode(hasher.finalize())),
@@ -616,8 +668,28 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod sweep_tests {
     use super::*;
-    use std::collections::HashSet;
     use std::time::Duration;
+
+    #[test]
+    fn startup_touches_nothing_and_rejects_traversal_transfer_ids() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = UploadRegistry::new(state.path());
+        assert!(!state.path().join("pending_uploads").exists());
+        assert!(!state.path().join("pending_uploads.json").exists());
+        assert!(registry.get("../escape").unwrap().is_none());
+        assert!(registry.remove("../escape").unwrap().is_none());
+        assert!(registry
+            .insert(
+                "../escape".into(),
+                PendingUpload {
+                    staging: state.path().join("s"),
+                    target: state.path().join("t"),
+                    logical_path: "t".into(),
+                    overwrite: false,
+                },
+            )
+            .is_err());
+    }
 
     #[test]
     fn pending_upload_survives_registry_reload() {
@@ -626,7 +698,7 @@ mod sweep_tests {
         let staging = files.path().join("upload.part");
         let target = files.path().join("target.bin");
         std::fs::write(&staging, b"data").unwrap();
-        let registry = UploadRegistry::new(state.path()).unwrap();
+        let registry = UploadRegistry::new(state.path());
         registry
             .insert(
                 "transfer-1".into(),
@@ -640,15 +712,15 @@ mod sweep_tests {
             .unwrap();
         drop(registry);
 
-        let reloaded = UploadRegistry::new(state.path()).unwrap();
-        let pending = reloaded.get("transfer-1").unwrap();
+        let reloaded = UploadRegistry::new(state.path());
+        let pending = reloaded.get("transfer-1").unwrap().unwrap();
         assert_eq!(pending.staging, staging);
         assert_eq!(pending.target, target);
         reloaded.remove("transfer-1").unwrap();
         drop(reloaded);
         assert!(UploadRegistry::new(state.path())
-            .unwrap()
             .get("transfer-1")
+            .unwrap()
             .is_none());
     }
 
@@ -661,7 +733,7 @@ mod sweep_tests {
         let files = tempfile::tempdir().unwrap();
         let abandoned = files.path().join(".remote-workspace-upload.a.1.part");
         let fresh = files.path().join(".remote-workspace-upload.b.2.part");
-        let registry = UploadRegistry::new(state.path()).unwrap();
+        let registry = UploadRegistry::new(state.path());
         for (id, staging) in [("old", &abandoned), ("new", &fresh)] {
             std::fs::write(staging, b"partial").unwrap();
             registry
@@ -685,9 +757,9 @@ mod sweep_tests {
             .set_modified(two_days_ago)
             .unwrap();
 
-        let reloaded = UploadRegistry::new(state.path()).unwrap();
-        assert!(reloaded.get("old").is_none());
-        assert!(reloaded.get("new").is_some());
+        let reloaded = UploadRegistry::new(state.path());
+        assert!(reloaded.get("old").unwrap().is_none());
+        assert!(reloaded.get("new").unwrap().is_some());
         let removed = sweep_stale_staging_dir(
             files.path(),
             &in_flight_staging(&reloaded),

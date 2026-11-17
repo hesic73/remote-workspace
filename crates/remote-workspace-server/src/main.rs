@@ -43,29 +43,22 @@ struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Keep only this many recent operations (older ones are pruned at startup
-    /// and on gc). 0 disables pruning.
+    /// Keep only this many recent operations on gc. 0 disables pruning.
     #[arg(long, default_value_t = 1000)]
     history_limit: usize,
 
     /// Evict scratch files idle (neither written nor read) for this many days,
-    /// on gc and at most once a day at startup. 0 disables sweeping. Scratch is
-    /// a staging area, not storage: anything worth keeping belongs in the
-    /// workspace or on the local machine.
+    /// on gc and at most once a day at startup. 0 disables sweeping.
     #[arg(long, default_value_t = 7)]
     scratch_max_age_days: u64,
 
-    /// Exit after this many seconds with no request arriving and none running,
-    /// releasing the workspace's state lock. Clients reconnect on demand, so
-    /// the cost of timing out is one SSH connect on the next call; the cost of
-    /// not timing out is a workspace that stays locked for as long as a dead
-    /// SSH session goes unnoticed on this host. 0 disables it.
+    /// Exit after this many seconds with no request arriving and none running.
+    /// 0 disables it.
     #[arg(long, default_value_t = 900)]
     idle_timeout_secs: u64,
 
     /// Internal raw data plane: stream stdin into this staging file (created
-    /// by upload_prepare on the resident server). Does not open the state
-    /// directory, so it cannot conflict with the resident server's lock.
+    /// by upload_prepare).
     #[arg(long, hide = true, value_name = "STAGING_PATH")]
     transfer_receive: Option<PathBuf>,
 
