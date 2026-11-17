@@ -6,8 +6,10 @@ use remote_workspace_client::{Client, Endpoint};
 use remote_workspace_protocol::ListKind;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router, ServerHandler,
+    model::{CallToolResult, Content, ProgressNotificationParam, ServerCapabilities, ServerInfo},
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
 use serde::Deserialize;
 
@@ -542,6 +544,51 @@ fn local_absolute(path: &str) -> Result<std::path::PathBuf, String> {
     std::path::absolute(path).map_err(|e| format!("invalid local path {path:?}: {e}"))
 }
 
+/// MCP hosts abort a tool call that stays silent too long (Claude Code: 1800 s
+/// without a response or progress), which is shorter than the waits these tools
+/// allow. Progress notifications are the only thing that resets that timer.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const PROGRESS_INTERVAL_ENV: &str = "REMOTE_WORKSPACE_PROGRESS_INTERVAL_MS";
+
+fn progress_interval() -> std::time::Duration {
+    match std::env::var(PROGRESS_INTERVAL_ENV) {
+        Err(_) => PROGRESS_INTERVAL,
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(ms) if ms > 0 => std::time::Duration::from_millis(ms),
+            _ => panic!(
+                "{PROGRESS_INTERVAL_ENV} must be a positive number of milliseconds, got {raw:?}"
+            ),
+        },
+    }
+}
+
+/// Runs `work`, reporting elapsed seconds as progress while it is pending. A
+/// request without a progress token gets none: progress is addressed by the
+/// token the client chose.
+async fn with_heartbeat<T>(
+    ctx: &RequestContext<RoleServer>,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    let Some(token) = ctx.meta.get_progress_token() else {
+        return work.await;
+    };
+    tokio::pin!(work);
+    let started = tokio::time::Instant::now();
+    let mut ticks = tokio::time::interval_at(started + progress_interval(), progress_interval());
+    loop {
+        tokio::select! {
+            out = &mut work => return out,
+            _ = ticks.tick() => {
+                let elapsed = started.elapsed().as_secs_f64();
+                let progress = ProgressNotificationParam::new(token.clone(), elapsed);
+                if let Err(e) = ctx.peer.notify_progress(progress).await {
+                    tracing::warn!("progress notification failed: {e}");
+                }
+            }
+        }
+    }
+}
+
 /// Reconnects as any tool call would, so a transfer that outlasts its first
 /// connection finishes on a fresh one.
 struct WorkspaceControl<'a> {
@@ -758,12 +805,13 @@ impl RemoteWorkspaceServer {
             profile,
             timeout_ms,
         }): Parameters<RunCommandInput>,
+        ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        match client.exec(argv, cwd, profile, timeout_ms).await {
+        match with_heartbeat(&ctx, client.exec(argv, cwd, profile, timeout_ms)).await {
             Ok(result) => ok_json_in_workspace(&workspace, &result),
             Err(e) => err(format!("{e}")),
         }
@@ -781,12 +829,13 @@ impl RemoteWorkspaceServer {
             profile,
             timeout_ms,
         }): Parameters<WaitWhileInput>,
+        ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        match client.wait(argv, cwd, profile, timeout_ms).await {
+        match with_heartbeat(&ctx, client.wait(argv, cwd, profile, timeout_ms)).await {
             Ok(result) => ok_json_in_workspace(&workspace, &result),
             Err(e) => err(format!("{e}")),
         }
@@ -803,6 +852,7 @@ impl RemoteWorkspaceServer {
             remote_path,
             overwrite,
         }): Parameters<UploadFileInput>,
+        ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let local_path = match local_absolute(&local_path) {
             Ok(p) => p,
@@ -812,18 +862,18 @@ impl RemoteWorkspaceServer {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        match remote_workspace_client::upload_file(
-            &WorkspaceControl {
-                server: self,
-                workspace: &workspace,
-            },
+        let control = WorkspaceControl {
+            server: self,
+            workspace: &workspace,
+        };
+        let upload = remote_workspace_client::upload_file(
+            &control,
             &handle.endpoint,
             &local_path,
             &remote_path,
             overwrite.unwrap_or(false),
-        )
-        .await
-        {
+        );
+        match with_heartbeat(&ctx, upload).await {
             Ok(r) => ok_json_in_workspace(&workspace, &r),
             Err(e) => err(format!("{e}")),
         }
@@ -840,6 +890,7 @@ impl RemoteWorkspaceServer {
             local_path,
             overwrite,
         }): Parameters<DownloadFileInput>,
+        ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let local_path = match local_absolute(&local_path) {
             Ok(p) => p,
@@ -849,18 +900,18 @@ impl RemoteWorkspaceServer {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        match remote_workspace_client::download_file(
-            &WorkspaceControl {
-                server: self,
-                workspace: &workspace,
-            },
+        let control = WorkspaceControl {
+            server: self,
+            workspace: &workspace,
+        };
+        let download = remote_workspace_client::download_file(
+            &control,
             &handle.endpoint,
             &remote_path,
             &local_path,
             overwrite.unwrap_or(false),
-        )
-        .await
-        {
+        );
+        match with_heartbeat(&ctx, download).await {
             Ok(mut r) => {
                 // For a download the useful path is the local destination; the
                 // server-side record keeps the remote logical path.

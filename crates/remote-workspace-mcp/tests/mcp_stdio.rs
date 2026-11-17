@@ -6,10 +6,7 @@ fn mcp_bin() -> String {
 }
 
 fn server_bin() -> String {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
+    std::path::Path::new(&mcp_bin())
         .parent()
         .unwrap()
         .join(format!(
@@ -58,6 +55,7 @@ impl McpSession {
         );
         let mut child = Command::new(&mcp)
             .args(["--fleet", &fleet_path.to_string_lossy()])
+            .env("REMOTE_WORKSPACE_PROGRESS_INTERVAL_MS", "200")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -608,6 +606,52 @@ fn mcp_wait_while_reports_gone_and_timeout() {
     let r: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(r["outcome"], "timed_out");
     assert_eq!(r["first_check"], false);
+}
+
+#[test]
+fn mcp_long_calls_send_progress_only_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = McpSession::spawn(dir.path().to_str().unwrap());
+    s.initialize();
+
+    let mut wait = |meta: serde_json::Value| {
+        s.id += 1;
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": s.id,
+            "method": "tools/call",
+            "params": {
+                "name": "wait_while",
+                "arguments": {"workspace": "test", "argv": ["true"], "timeout_ms": 1500},
+                "_meta": meta,
+            },
+        });
+        writeln!(s.stdin, "{req}").unwrap();
+        s.stdin.flush().unwrap();
+        let mut progress = Vec::new();
+        loop {
+            let mut line = String::new();
+            s.stdout.read_line(&mut line).expect("read message");
+            let v: serde_json::Value = serde_json::from_str(line.trim()).expect("parse message");
+            if v.get("id").is_some() {
+                assert_eq!(v["result"]["isError"], false, "{v}");
+                return progress;
+            }
+            assert_eq!(v["method"], "notifications/progress", "{v}");
+            progress.push(v["params"].clone());
+        }
+    };
+
+    let progress = wait(serde_json::json!({"progressToken": "tok-1"}));
+    assert!(progress.len() >= 2, "{progress:?}");
+    assert!(progress.iter().all(|p| p["progressToken"] == "tok-1"));
+    let values: Vec<f64> = progress
+        .iter()
+        .map(|p| p["progress"].as_f64().unwrap())
+        .collect();
+    assert!(values.windows(2).all(|w| w[0] < w[1]), "{values:?}");
+
+    assert!(wait(serde_json::json!({})).is_empty());
 }
 
 #[test]

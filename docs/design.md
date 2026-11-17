@@ -545,6 +545,11 @@ no server-side coordination at all -- there is no cross-workspace operation
   the agent.
 * `run_command` returns one synchronous, bounded result (see [Exec](#exec)); no
   streaming output path exists.
+* `run_command`, `wait_while`, and the transfers send an MCP progress
+  notification every 30 s while pending, when the request carried a
+  `progressToken`. Hosts abort a call that stays silent (Claude Code: 30 min
+  for stdio servers), which is shorter than the hour these tools allow. The
+  value is elapsed seconds and says nothing about the remote work.
 * `read_file` returns at most 64 KiB per call; directory listings return at
   most 1,000 entries with `next_offset`. History defaults to 50 records,
   rejects limits above 100, and omits exec preview text.
